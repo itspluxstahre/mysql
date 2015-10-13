@@ -1,6 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2000, 2010, MySQL AB & Innobase Oy. All Rights Reserved.
+   Use is subject to license terms
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +12,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -80,12 +81,13 @@ class ha_innobase: public handler
 
 	uchar*		upd_buf;	/*!< buffer used in updates */
 	ulint		upd_buf_size;	/*!< the size of upd_buf in bytes */
-	uchar		srch_key_val1[REC_VERSION_56_MAX_INDEX_COL_LEN + 2];
-	uchar		srch_key_val2[REC_VERSION_56_MAX_INDEX_COL_LEN + 2];
+	uchar		srch_key_val1[MAX_KEY_LENGTH + MAX_REF_PARTS*2];
+	uchar		srch_key_val2[MAX_KEY_LENGTH + MAX_REF_PARTS*2];
 					/*!< buffers used in converting
 					search key values from MySQL format
-					to InnoDB format. "+ 2" for the two
-					bytes where the length is stored */
+					to InnoDB format. For each column
+					2 bytes are used to store length,
+					hence MAX_REF_PARTS*2. */
 	Table_flags	int_table_flags;
 	uint		primary_key;
 	ulong		start_of_scan;	/*!< this is set to 1 when we are
@@ -133,6 +135,7 @@ class ha_innobase: public handler
 	const key_map* keys_to_use_for_scanning();
 
 	int open(const char *name, int mode, uint test_if_locked);
+	handler* clone(const char *name, MEM_ROOT *mem_root);
 	int close(void);
 	double scan_time();
 	double read_time(uint index, uint ranges, ha_rows rows);
@@ -250,6 +253,18 @@ const char* mysql_bin_log_file_name(void);
  * @return byte offset from the beginning of the binlog
  */
 ulonglong mysql_bin_log_file_pos(void);
+
+/**
+  Get the file name of the mater's binlog.
+  @return the name of the binlog file
+*/
+const char* mysql_master_log_file_name(void);
+
+/**
+  Get the current position of the master's binlog.
+  @return byte offset from the beginning of the binlog
+*/
+ulonglong mysql_master_log_file_pos(void);
 
 /**
   Check if a user thread is a replication slave thread

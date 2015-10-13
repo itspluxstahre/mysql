@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
    
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -154,11 +154,14 @@ Rpl_filter::db_ok(const char* db)
     DBUG_RETURN(1); // Ok to replicate if the user puts no constraints
 
   /*
-    If the user has specified restrictions on which databases to replicate
-    and db was not selected, do not replicate.
+    Previous behaviour "if the user has specified restrictions on which
+    databases to replicate and db was not selected, do not replicate" has
+    been replaced with "do replicate".
+    Since the filtering criteria is not equal to "NULL" the statement should
+    be logged into binlog.
   */
   if (!db)
-    DBUG_RETURN(0);
+    DBUG_RETURN(1);
 
   if (!do_db.is_empty()) // if the do's are not empty
   {

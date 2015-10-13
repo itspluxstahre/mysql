@@ -1,4 +1,5 @@
-/* Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved. & tommy@valley.ne.jp.
+/* Copyright (c) 2002 MySQL AB & tommy@valley.ne.jp
+   Copyright (c) 2005, 2014, Oracle and/or its affiliates. All rights reserved.
    
    This library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Library General Public
@@ -12,8 +13,8 @@
    
    You should have received a copy of the GNU Library General Public
    License along with this library; if not, write to the Free
-   Software Foundation, Inc., 59 Temple Place - Suite 330, Boston,
-   MA 02111-1307, USA */
+   Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+   MA 02110-1301, USA */
 
 /* This file is for Japanese EUC charset, and created based on
 ctype-ujis.c file.

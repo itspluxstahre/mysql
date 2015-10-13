@@ -67,11 +67,15 @@ The following options may be given as the first argument:
  The maximum size of a row-based binary log event in
  bytes. Rows will be grouped into events smaller than this
  size if possible. The value has to be a multiple of 256.
+ --binlog-rows-table-metadata-events 
+ Write Table_metadata events to the binary log.
  --binlog-stmt-cache-size=# 
  The size of the statement cache for updates to
  non-transactional engines for the binary log. If you
  often use statements updating a great number of rows, you
  can increase this to get more performance
+ --binlog-write-user-info 
+ Write user@host to the binary log.
  --bootstrap         Used by mysql installation scripts.
  --bulk-insert-buffer-size=# 
  Size of tree cache used in bulk insert optimisation. Note
@@ -143,7 +147,9 @@ The following options may be given as the first argument:
  --expire-logs-days=# 
  If non-zero, binary logs will be purged after
  expire_logs_days days; possible purges happen at startup
- and at binary log rotation
+ and at binary log rotation. The argument can be expressed
+ as a decimal number where the fractional part represents
+ the fraction of one day.
  --external-locking  Use system (external) locking (disabled by default). 
  With this option enabled you can run myisamchk to test
  (not repair) tables while the MySQL server is running.
@@ -175,7 +181,8 @@ The following options may be given as the first argument:
  GROUP_CONCAT()
  -?, --help          Display this help and exit.
  --ignore-builtin-innodb 
- Disable initialization of builtin InnoDB plugin
+ DEPRECATED. This option will be removed in future
+ releases. Disable initialization of builtin InnoDB plugin
  --init-connect=name Command(s) that are executed for each new connection
  --init-file=name    Read SQL commands from this file at startup
  --init-rpl-role=name 
@@ -341,6 +348,7 @@ The following options may be given as the first argument:
  --min-examined-row-limit=# 
  Don't write queries to slow log that examine fewer rows
  than that
+ --minidump-dir=name Path for minidump files. Defaults to tmpdir.
  --multi-range-count=# 
  Number of key ranges to request at once
  --myisam-block-size=# 
@@ -420,38 +428,6 @@ The following options may be given as the first argument:
  index_merge_sort_union, index_merge_intersection,
  engine_condition_pushdown} and val is one of {on, off,
  default}
- --performance-schema 
- Enable the performance schema.
- --performance-schema-events-waits-history-long-size=# 
- Number of rows in EVENTS_WAITS_HISTORY_LONG.
- --performance-schema-events-waits-history-size=# 
- Number of rows per thread in EVENTS_WAITS_HISTORY.
- --performance-schema-max-cond-classes=# 
- Maximum number of condition instruments.
- --performance-schema-max-cond-instances=# 
- Maximum number of instrumented condition objects.
- --performance-schema-max-file-classes=# 
- Maximum number of file instruments.
- --performance-schema-max-file-handles=# 
- Maximum number of opened instrumented files.
- --performance-schema-max-file-instances=# 
- Maximum number of instrumented files.
- --performance-schema-max-mutex-classes=# 
- Maximum number of mutex instruments.
- --performance-schema-max-mutex-instances=# 
- Maximum number of instrumented MUTEX objects.
- --performance-schema-max-rwlock-classes=# 
- Maximum number of rwlock instruments.
- --performance-schema-max-rwlock-instances=# 
- Maximum number of instrumented RWLOCK objects.
- --performance-schema-max-table-handles=# 
- Maximum number of opened instrumented tables.
- --performance-schema-max-table-instances=# 
- Maximum number of instrumented tables.
- --performance-schema-max-thread-classes=# 
- Maximum number of thread instruments.
- --performance-schema-max-thread-instances=# 
- Maximum number of instrumented threads.
  --pid-file=name     Pid file used by safe_mysqld
  --plugin-dir=name   Directory for plugins
  --plugin-load=name  Optional semicolon-separated list of plugins to load,
@@ -597,7 +573,7 @@ The following options may be given as the first argument:
  master during slave registration
  --rpl-recovery-rank=# 
  Unused, will be removed
- --safe-mode         Skip some optimize stages (for testing).
+ --safe-mode         Skip some optimize stages (for testing). Deprecated.
  --safe-user-create  Don't allow new user creation by the user who has no
  write privileges to the mysql.user table.
  --secure-auth       Disallow authentication for accounts that have old
@@ -637,6 +613,9 @@ The following options may be given as the first argument:
  --slave-load-tmpdir=name 
  The location where the slave should put its temporary
  files when replicating a LOAD DATA INFILE command
+ --slave-max-allowed-packet=# 
+ The maximum packet length to sent successfully from the
+ master to slave.
  --slave-net-timeout=# 
  Number of seconds to wait for more data from a
  master/slave connection before aborting the read
@@ -677,6 +656,9 @@ The following options may be given as the first argument:
  --stored-program-cache=# 
  The soft upper limit for number of cached stored routines
  for one connection.
+ --super-only        Don't allow non-superusers to execute statements.
+ --superuser-connections=# 
+ The number of reserved superuser connections
  -s, --symbolic-links 
  Enable symbolic link support.
  --sync-binlog=#     Synchronously flush binary log to disk after every #th
@@ -710,9 +692,11 @@ The following options may be given as the first argument:
  Define threads usage for handling queries, one of
  one-thread-per-connection, no-threads, loaded-dynamically
  --thread-stack=#    The stack size for each thread
+ --thread-statistics Control TABLE_STATISTICS running, when userstat is
+ enabled
  --time-format=name  The TIME format (ignored)
- --timed-mutexes     Specify whether to time mutexes (only InnoDB mutexes are
- currently supported)
+ --timed-mutexes     Specify whether to time mutexes. Deprecated, has no
+ effect.
  --tmp-table-size=#  If an internal in-memory temporary table exceeds this
  size, MySQL will automatically convert it to an on-disk
  MyISAM table
@@ -727,6 +711,16 @@ The following options may be given as the first argument:
  --transaction-prealloc-size=# 
  Persistent buffer for transactions to be stored in binary
  log
+ --twitter-audit-logging[=#] 
+ Twitter DBA audit logging.
+ --twitter-query-stats[=#] 
+ Collect user query stats.
+ --twitter-query-stats-max[=#] 
+ User query stats hash table size.
+ --twitter-query-throttling-limit[=#] 
+ Start throttling queries if running threads high.
+ --twitter-write-throttling-limit[=#] 
+ Start throttling writes if running mutation queries high.
  --updatable-views-with-limit=name 
  YES = Don't issue an error message (warning only) if a
  VIEW without presence of a key of the underlying table is
@@ -735,6 +729,9 @@ The following options may be given as the first argument:
  of the underlying table and the query uses a LIMIT clause
  (usually get from GUI tools)
  -u, --user=name     Run mysqld daemon as user.
+ --userstat          Control USER_STATISTICS, CLIENT_STATISTICS,
+ THREAD_STATISTICS, INDEX_STATISTICS and TABLE_STATISTICS
+ running
  -v, --verbose       Used with --help option for detailed help.
  -V, --version       Output version information and exit.
  --wait-timeout=#    The number of seconds the server waits for activity on a
@@ -754,7 +751,9 @@ binlog-cache-size 32768
 binlog-direct-non-transactional-updates FALSE
 binlog-format STATEMENT
 binlog-row-event-max-size 1024
+binlog-rows-table-metadata-events FALSE
 binlog-stmt-cache-size 32768
+binlog-write-user-info FALSE
 bulk-insert-buffer-size 8388608
 character-set-client-handshake TRUE
 character-set-filesystem binary
@@ -876,22 +875,6 @@ old-style-user-limits FALSE
 optimizer-prune-level 1
 optimizer-search-depth 62
 optimizer-switch index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,engine_condition_pushdown=on
-performance-schema FALSE
-performance-schema-events-waits-history-long-size 10000
-performance-schema-events-waits-history-size 10
-performance-schema-max-cond-classes 80
-performance-schema-max-cond-instances 1000
-performance-schema-max-file-classes 50
-performance-schema-max-file-handles 32768
-performance-schema-max-file-instances 10000
-performance-schema-max-mutex-classes 200
-performance-schema-max-mutex-instances 1000000
-performance-schema-max-rwlock-classes 30
-performance-schema-max-rwlock-instances 1000000
-performance-schema-max-table-handles 100000
-performance-schema-max-table-instances 50000
-performance-schema-max-thread-classes 50
-performance-schema-max-thread-instances 1000
 plugin-load (No default value)
 port 3306
 port-open-timeout 0
@@ -918,7 +901,7 @@ relay-log-space-limit 0
 replicate-same-server-id FALSE
 report-host (No default value)
 report-password (No default value)
-report-port 3306
+report-port 0
 report-user (No default value)
 rpl-recovery-rank 0
 safe-user-create FALSE
@@ -933,6 +916,7 @@ skip-show-database FALSE
 skip-slave-start FALSE
 slave-compressed-protocol FALSE
 slave-exec-mode STRICT
+slave-max-allowed-packet 1073741824
 slave-net-timeout 3600
 slave-skip-errors (No default value)
 slave-transaction-retries 10
@@ -943,6 +927,8 @@ sort-buffer-size 2097152
 sporadic-binlog-dump-fail FALSE
 sql-mode 
 stored-program-cache 256
+super-only FALSE
+superuser-connections 1
 symbolic-links FALSE
 sync-binlog 0
 sync-frm TRUE
@@ -957,13 +943,20 @@ tc-heuristic-recover COMMIT
 thread-cache-size 0
 thread-handling one-thread-per-connection
 thread-stack 262144
+thread-statistics FALSE
 time-format %H:%i:%s
 timed-mutexes FALSE
 tmp-table-size 16777216
 transaction-alloc-block-size 8192
 transaction-isolation REPEATABLE-READ
 transaction-prealloc-size 4096
+twitter-audit-logging 0
+twitter-query-stats 0
+twitter-query-stats-max 10240
+twitter-query-throttling-limit 0
+twitter-write-throttling-limit 0
 updatable-views-with-limit YES
+userstat FALSE
 verbose TRUE
 wait-timeout 28800
 

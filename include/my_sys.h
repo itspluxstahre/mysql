@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 #ifndef _my_sys_h
 #define _my_sys_h
@@ -210,6 +210,7 @@ extern char curr_dir[];		/* Current directory for user */
 extern void (*error_handler_hook)(uint my_err, const char *str,myf MyFlags);
 extern void (*fatal_error_handler_hook)(uint my_err, const char *str,
 				       myf MyFlags);
+extern void(*sql_print_warning_hook)(const char *format,...);
 extern uint my_file_limit;
 extern ulong my_thread_stack_size;
 
@@ -604,6 +605,7 @@ extern int      my_access(const char *path, int amode);
 
 extern int check_if_legal_filename(const char *path);
 extern int check_if_legal_tablename(const char *path);
+extern my_bool is_filename_allowed(const char *name, size_t length);
 
 #ifdef _WIN32
 extern int nt_share_delete(const char *name,myf MyFlags);
@@ -640,6 +642,7 @@ extern void my_printv_error(uint error, const char *format, myf MyFlags,
                             va_list ap);
 extern int my_error_register(const char** (*get_errmsgs) (),
                              int first, int last);
+extern void my_printf_warning (const char * format, ...);
 extern const char **my_error_unregister(int first, int last);
 extern void my_message(uint my_err, const char *str,myf MyFlags);
 extern void my_message_stderr(uint my_err, const char *str, myf MyFlags);

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -41,28 +41,28 @@ namespace STL = STL_NAMESPACE;
 
     void* operator new(size_t sz, TaoCrypt::new_t)
     {
-    void* ptr = malloc(sz ? sz : 1);
-    if (!ptr) abort();
+        void* ptr = malloc(sz ? sz : 1);
+        if (!ptr) abort();
 
-    return ptr;
+        return ptr;
     }
 
 
     void operator delete(void* ptr, TaoCrypt::new_t)
     {
-    if (ptr) free(ptr);
+        if (ptr) free(ptr);
     }
 
 
     void* operator new[](size_t sz, TaoCrypt::new_t nt)
     {
-    return ::operator new(sz, nt);
+        return ::operator new(sz, nt);
     }
 
 
     void operator delete[](void* ptr, TaoCrypt::new_t nt)
     {
-    ::operator delete(ptr, nt);
+        ::operator delete(ptr, nt);
     }
 
 
@@ -84,23 +84,11 @@ namespace STL = STL_NAMESPACE;
 
     }
 
-#ifdef __sun
-
-// Handler for pure virtual functions
-namespace __Crun {
-    void pure_error() {
-      assert(!"Aborted: pure virtual method called.");
-    }
-}
-
-#endif
-
-#if defined(__ICC) || defined(__INTEL_COMPILER) || (__GNUC__ > 2)
+#if defined(__ICC) || defined(__INTEL_COMPILER)
 
 extern "C" {
 
     int __cxa_pure_virtual() {
-      assert(!"Aborted: pure virtual method called.");
       return 0;
     }
 
@@ -177,6 +165,14 @@ word Crop(word value, unsigned int size)
 
 #ifdef TAOCRYPT_X86ASM_AVAILABLE
 
+#ifndef _MSC_VER
+    static jmp_buf s_env;
+    static void SigIllHandler(int)
+    {
+        longjmp(s_env, 1);
+    }
+#endif
+
 
 bool HaveCpuId()
 {
@@ -196,8 +192,8 @@ bool HaveCpuId()
     return true;
 #else
     word32 eax, ebx;
-        __asm__ __volatile
-        (
+    __asm__ __volatile
+    (
         /* Put EFLAGS in eax and ebx */
         "pushf;"
         "pushf;"
@@ -214,9 +210,9 @@ bool HaveCpuId()
         "pop %0;"
         "popf"
         : "=r" (eax), "=r" (ebx)
-            :
+        :
         : "cc"
-        );
+    );
 
     if (eax == ebx)
         return false;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -2151,7 +2151,8 @@ static my_off_t write_huff_tree(HUFF_TREE *huff_tree, uint trees)
   */
   if (!(packed_tree=(uint*) my_alloca(sizeof(uint)*length*2)))
   {
-    my_error(EE_OUTOFMEMORY,MYF(ME_BELL),sizeof(uint)*length*2);
+    my_error(EE_OUTOFMEMORY, MYF(ME_BELL+ME_FATALERROR), 
+             sizeof(uint)*length*2);
     return 0;
   }
 

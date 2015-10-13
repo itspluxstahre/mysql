@@ -1,5 +1,5 @@
 /*
-   Copyright (C) 2000-2007 MySQL AB
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -46,15 +46,13 @@ typedef unsigned int  uint;
 const uint AUTO = 0xFEEDBEEF;
 
 
-// Checking Policy should implement a check function that tests whether the
-// index is within the size limit of the array
-struct Check {
-    void check(uint i, uint limit);
-};
-
 
 struct NoCheck {
-    void check(uint, uint);
+    int check(uint, uint);
+};
+
+struct Check {
+    int check(uint, uint);
 };
 
 /* input_buffer operates like a smart c style array with a checking option, 
@@ -71,6 +69,8 @@ class input_buffer : public Check {
     uint   current_;             // current offset position in buffer
     byte*  buffer_;              // storage for buffer
     byte*  end_;                 // end of storage marker
+    int    error_;               // error number
+    byte   zero_;                // for returning const reference to zero byte
 public:
     input_buffer();
 
@@ -99,6 +99,10 @@ public:
 
     uint get_remaining() const;
 
+    int  get_error()     const;
+
+    void set_error();
+
     void set_current(uint i);
 
     // read only access through [], advance current
@@ -109,7 +113,7 @@ public:
     bool eof();
 
     // peek ahead
-    byte peek() const;
+    byte peek();
 
     // write function, should use at/near construction
     void assign(const byte* t, uint s);
@@ -132,7 +136,7 @@ private:
  * Not using vector because need checked []access and the ability to
  * write to the buffer bulk wise and retain correct size
  */
-class output_buffer : public Check {
+class output_buffer : public NoCheck {
     uint    current_;                // current offset and elements in buffer
     byte*   buffer_;                 // storage for buffer
     byte*   end_;                    // end of storage marker

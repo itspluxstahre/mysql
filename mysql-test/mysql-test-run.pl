@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 # -*- cperl -*-
 
-# Copyright (c) 2004, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2004, 2015, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -164,7 +164,7 @@ our $opt_vs_config = $ENV{'MTR_VS_CONFIG'};
 
 # If you add a new suite, please check TEST_DIRS in Makefile.am.
 #
-my $DEFAULT_SUITES= "main,sys_vars,binlog,federated,rpl,innodb,perfschema";
+my $DEFAULT_SUITES= "main,twitter,sys_vars,binlog,federated,rpl,innodb,innodb_zip,perfschema";
 my $opt_suites;
 
 our $opt_verbose= 0;  # Verbose output, enable with --verbose
@@ -202,6 +202,7 @@ our @opt_cases;                  # The test cases names in argv
 our $opt_embedded_server;
 # -1 indicates use default, override with env.var.
 our $opt_ctest= env_or_val(MTR_UNIT_TESTS => -1);
+our $opt_ctest_report;
 # Unit test report stored here for delayed printing
 my $ctest_report;
 
@@ -233,6 +234,7 @@ our $opt_ddd;
 our $opt_client_ddd;
 my $opt_boot_ddd;
 our $opt_manual_gdb;
+our $opt_manual_lldb;
 our $opt_manual_dbx;
 our $opt_manual_ddd;
 our $opt_manual_debug;
@@ -311,8 +313,10 @@ sub check_timeout ($) { return testcase_timeout($_[0]) / 10; }
 
 our $opt_warnings= 1;
 
-our $opt_include_ndbcluster= 0;
-our $opt_skip_ndbcluster= 1;
+our $ndbcluster_enabled= 0;
+my $opt_include_ndbcluster= 0;
+my $opt_skip_ndbcluster= 0;
+
 our $opt_junit_output= undef;
 our $opt_junit_package= undef;
 
@@ -337,14 +341,6 @@ my $opt_parallel= $ENV{MTR_PARALLEL} || 1;
 select(STDOUT);
 $| = 1; # Automatically flush STDOUT
 
-# Used by --result-file for for formatting times
-
-sub isotime($) {
-  my ($sec,$min,$hr,$day,$mon,$yr)= gmtime($_[0]);
-  return sprintf "%d-%02d-%02dT%02d:%02d:%02dZ",
-    $yr+1900, $mon+1, $day, $hr, $min, $sec;
-}
-
 main();
 
 
@@ -368,26 +364,6 @@ sub main {
 
   if (!$opt_suites) {
     $opt_suites= $DEFAULT_SUITES;
-
-    # Check for any extra suites to enable based on the path name
-    my %extra_suites=
-      (
-       "mysql-5.1-new-ndb"              => "ndb_team",
-       "mysql-5.1-new-ndb-merge"        => "ndb_team",
-       "mysql-5.1-telco-6.2"            => "ndb_team",
-       "mysql-5.1-telco-6.2-merge"      => "ndb_team",
-       "mysql-5.1-telco-6.3"            => "ndb_team",
-       "mysql-6.0-ndb"                  => "ndb_team",
-      );
-
-    foreach my $dir ( reverse splitdir($basedir) ) {
-      my $extra_suite= $extra_suites{$dir};
-      if (defined $extra_suite) {
-	mtr_report("Found extra suite: $extra_suite");
-	$opt_suites= "$extra_suite,$opt_suites";
-	last;
-      }
-    }
   }
   mtr_report("Using suites: $opt_suites") unless @opt_cases;
 
@@ -411,7 +387,6 @@ sub main {
     unshift(@$tests, $tinfo);
   }
 
-  print "vardir: $opt_vardir\n";
   initialize_servers();
 
   #######################################################################
@@ -448,7 +423,6 @@ sub main {
     );
   mtr_error("Could not create testcase server port: $!") unless $server;
   my $server_port = $server->sockport();
-  mtr_report("Using server port $server_port");
 
   if ($opt_resfile) {
     resfile_init("$opt_vardir/mtr-results.txt");
@@ -462,6 +436,7 @@ sub main {
 
   # Also read from any plugin local or suite specific plugin.defs
   for (glob "$basedir/plugin/*/tests/mtr/plugin.defs".
+            " $basedir/internal/plugin/*/tests/mtr/plugin.defs".
             " suite/*/plugin.defs") {
     read_plugin_defs($_);
   }
@@ -505,15 +480,17 @@ sub main {
   # Send Ctrl-C to any children still running
   kill("INT", keys(%children));
 
-  # Wait for childs to exit
-  foreach my $pid (keys %children)
-  {
-    my $ret_pid= waitpid($pid, 0);
-    if ($ret_pid != $pid){
-      mtr_report("Unknown process $ret_pid exited");
-    }
-    else {
-      delete $children{$ret_pid};
+  if (!IS_WINDOWS) { 
+    # Wait for children to exit
+    foreach my $pid (keys %children)
+    {
+      my $ret_pid= waitpid($pid, 0);
+      if ($ret_pid != $pid){
+        mtr_report("Unknown process $ret_pid exited");
+      }
+      else {
+        delete $children{$ret_pid};
+      }
     }
   }
 
@@ -672,7 +649,7 @@ sub run_test_server ($$$) {
 			   mtr_report(" - found '$core_name'",
 				      "($num_saved_cores/$opt_max_save_core)");
 
-			   My::CoreDump->show($core_file, $exe_mysqld);
+			   My::CoreDump->show($core_file, $exe_mysqld, $opt_parallel);
 
 			   if ($num_saved_cores >= $opt_max_save_core) {
 			     mtr_report(" - deleting it, already saved",
@@ -728,6 +705,12 @@ sub run_test_server ($$$) {
 	    else {
 	      mtr_report("\nRetrying test $tname, ".
 			 "attempt($retries/$opt_retry)...\n");
+              #saving the log file as filename.failed in case of retry
+              if ( $result->is_failed() ) {
+                my $worker_logdir= $result->{savedir};
+                my $log_file_name=dirname($worker_logdir)."/".$result->{shortname}.".log";
+                rename $log_file_name,$log_file_name.".failed";
+              }
 	      delete($result->{result});
 	      $result->{retries}= $retries+1;
 	      $result->write_test($sock, 'TESTCASE');
@@ -1075,7 +1058,7 @@ sub command_line_setup {
              # Control what test suites or cases to run
              'force'                    => \$opt_force,
              'with-ndbcluster-only'     => \&collect_option,
-             'include-ndbcluster'       => \$opt_include_ndbcluster,
+             'ndb|include-ndbcluster'   => \$opt_include_ndbcluster,
              'skip-ndbcluster|skip-ndb' => \$opt_skip_ndbcluster,
              'suite|suites=s'           => \$opt_suites,
              'skip-rpl'                 => \&collect_option,
@@ -1112,6 +1095,7 @@ sub command_line_setup {
              'gdb'                      => \$opt_gdb,
              'client-gdb'               => \$opt_client_gdb,
              'manual-gdb'               => \$opt_manual_gdb,
+             'manual-lldb'              => \$opt_manual_lldb,
 	     'boot-gdb'                 => \$opt_boot_gdb,
              'manual-debug'             => \$opt_manual_debug,
              'ddd'                      => \$opt_ddd,
@@ -1192,6 +1176,7 @@ sub command_line_setup {
 	     'report-times'             => \$opt_report_times,
 	     'result-file'              => \$opt_resfile,
 	     'unit-tests!'              => \$opt_ctest,
+	     'unit-tests-report!'	=> \$opt_ctest_report,
 	     'stress=s'                 => \$opt_stress,
              'junit-output=s'           => \$opt_junit_output,
              'junit-package=s'          => \$opt_junit_package,
@@ -1456,7 +1441,7 @@ sub command_line_setup {
 
   # We make the path absolute, as the server will do a chdir() before usage
   unless ( $opt_vardir =~ m,^/, or
-           (IS_WINDOWS and $opt_vardir =~ m,^[a-z]:/,i) )
+           (IS_WINDOWS and $opt_vardir =~ m,^[a-z]:[/\\],i) )
   {
     # Make absolute path, relative test dir
     $opt_vardir= "$glob_mysql_test_dir/$opt_vardir";
@@ -1532,7 +1517,6 @@ sub command_line_setup {
       }
       $ENV{'PATH'}= "$ENV{'PATH'}".$separator.$lib_mysqld;
     }
-    $opt_skip_ndbcluster= 1;       # Turn off use of NDB cluster
     $opt_skip_ssl= 1;              # Turn off use of SSL
 
     # Turn off use of bin log
@@ -1571,8 +1555,9 @@ sub command_line_setup {
       $opt_debugger= undef;
     }
 
-    if ( $opt_gdb || $opt_ddd || $opt_manual_gdb || $opt_manual_ddd ||
-	 $opt_manual_debug || $opt_debugger || $opt_dbx || $opt_manual_dbx)
+    if ( $opt_gdb || $opt_ddd || $opt_manual_gdb || $opt_manual_lldb || 
+         $opt_manual_ddd || $opt_manual_debug || $opt_debugger || $opt_dbx || 
+         $opt_manual_dbx)
     {
       mtr_error("You need to use the client debug options for the",
 		"embedded server. Ex: --client-gdb");
@@ -1598,9 +1583,9 @@ sub command_line_setup {
   # --------------------------------------------------------------------------
   # Check debug related options
   # --------------------------------------------------------------------------
-  if ( $opt_gdb || $opt_client_gdb || $opt_ddd || $opt_client_ddd ||
-       $opt_manual_gdb || $opt_manual_ddd || $opt_manual_debug ||
-       $opt_dbx || $opt_client_dbx || $opt_manual_dbx ||
+  if ( $opt_gdb || $opt_client_gdb || $opt_ddd || $opt_client_ddd || 
+       $opt_manual_gdb || $opt_manual_lldb || $opt_manual_ddd || 
+       $opt_manual_debug || $opt_dbx || $opt_client_dbx || $opt_manual_dbx || 
        $opt_debugger || $opt_client_debugger )
   {
     # Indicate that we are using debugger
@@ -1638,12 +1623,21 @@ sub command_line_setup {
   }
 
   # --------------------------------------------------------------------------
-  # Don't run ctest if tests or suites named
+  # Set default values for opt_ctest (--unit-tests)
   # --------------------------------------------------------------------------
 
-  $opt_ctest= 0 if $opt_ctest == -1 && ($opt_suites || @opt_cases);
-  # Override: disable if running in the PB test environment
-  $opt_ctest= 0 if $opt_ctest == -1 && defined $ENV{PB2WORKDIR};
+  if ($opt_ctest == -1) {
+    if (defined $opt_ctest_report && $opt_ctest_report) {
+      # Turn on --unit-tests by default if --unit-tests-report is used
+      $opt_ctest= 1;
+    } elsif ($opt_suites || @opt_cases) {
+      # Don't run ctest if tests or suites named
+      $opt_ctest= 0;
+    } elsif (defined $ENV{PB2WORKDIR}) {
+      # Override: disable if running in the PB test environment
+      $opt_ctest= 0;
+    }
+  }
 
   # --------------------------------------------------------------------------
   # Check use of wait-all
@@ -2012,7 +2006,7 @@ sub executable_setup () {
 
   $exe_mysql_embedded= mtr_exe_maybe_exists("$basedir/libmysqld/examples/mysql_embedded");
 
-  if ( ! $opt_skip_ndbcluster )
+  if ( $ndbcluster_enabled )
   {
     # Look for single threaded NDB
     $exe_ndbd=
@@ -2067,7 +2061,17 @@ sub executable_setup () {
   }
   else
   {
-    $exe_mysqltest= mtr_exe_exists("$path_client_bindir/mysqltest");
+    if ( defined $ENV{'MYSQL_TEST'} )
+    {
+      $exe_mysqltest=$ENV{'MYSQL_TEST'};
+      print "===========================================================\n";
+      print "WARNING:The mysqltest binary is fetched from $exe_mysqltest\n";
+      print "===========================================================\n";
+    }
+    else
+    {
+      $exe_mysqltest= mtr_exe_exists("$path_client_bindir/mysqltest");
+    }
   }
 
 }
@@ -2283,7 +2287,7 @@ sub environment_setup {
   # --------------------------------------------------------------------------
   # Add the path where libndbclient can be found
   # --------------------------------------------------------------------------
-  if ( !$opt_skip_ndbcluster )
+  if ( $ndbcluster_enabled )
   {
     push(@ld_library_paths,  "$basedir/storage/ndb/src/.libs");
   }
@@ -2371,7 +2375,7 @@ sub environment_setup {
   # ----------------------------------------------------
   # Setup env for NDB
   # ----------------------------------------------------
-  if ( ! $opt_skip_ndbcluster )
+  if ( $ndbcluster_enabled )
   {
     $ENV{'NDB_MGM'}=
       my_find_bin($bindir,
@@ -2482,6 +2486,14 @@ sub environment_setup {
 				 "$basedir/extra/perror",
 				 "$path_client_bindir/perror");
   $ENV{'MY_PERROR'}= native_path($exe_perror);
+
+  # ----------------------------------------------------
+  # replace
+  # ----------------------------------------------------
+  my $exe_replace= mtr_exe_exists(vs_config_dirs('extra', 'replace'),
+                                 "$basedir/extra/replace",
+                                 "$path_client_bindir/replace");
+  $ENV{'REPLACE'}= native_path($exe_replace);
 
   # Create an environment variable to make it possible
   # to detect that valgrind is being used from test cases
@@ -2766,37 +2778,87 @@ sub vs_config_dirs ($$) {
 sub check_ndbcluster_support ($) {
   my $mysqld_variables= shift;
 
+  my $ndbcluster_supported = 0;
+  if ($mysqld_variables{'ndb-connectstring'})
+  {
+    $ndbcluster_supported = 1;
+  }
+
+  if ($opt_skip_ndbcluster && $opt_include_ndbcluster)
+  {
+    # User is ambivalent. Theoretically the arg which was
+    # given last on command line should win, but that order is
+    # unknown at this time.
+    mtr_error("Ambigous command, both --include-ndbcluster " .
+	      " and --skip-ndbcluster was specified");
+  }
+
   # Check if this is MySQL Cluster, ie. mysql version string ends
   # with -ndb-Y.Y.Y[-status]
   if ( defined $mysql_version_extra &&
-       $mysql_version_extra =~ /^-ndb-/ )
+       $mysql_version_extra =~ /-ndb-([0-9]*)\.([0-9]*)\.([0-9]*)/ )
   {
-    mtr_report(" - MySQL Cluster");
-    # Enable ndb engine and add more test suites
-    $opt_include_ndbcluster = 1;
-    $DEFAULT_SUITES.=",ndb";
+    # MySQL Cluster tree
+    mtr_report(" - MySQL Cluster detected");
+
+    if ($opt_skip_ndbcluster)
+    {
+      mtr_report(" - skipping ndbcluster(--skip-ndbcluster)");
+      return;
+    }
+
+    if (!$ndbcluster_supported)
+    {
+      # MySQL Cluster tree, but mysqld was not compiled with
+      # ndbcluster -> fail unless --skip-ndbcluster was used
+      mtr_error("This is MySQL Cluster but mysqld does not " .
+		"support ndbcluster. Use --skip-ndbcluster to " .
+		"force mtr to run without it.");
+    }
+
+    # mysqld was compiled with ndbcluster -> auto enable
+  }
+  else
+  {
+    # Not a MySQL Cluster tree
+    if (!$ndbcluster_supported)
+    {
+      if ($opt_include_ndbcluster)
+      {
+	mtr_error("Could not detect ndbcluster support ".
+		  "requested with --include-ndbcluster");
+      }
+
+      # Silently skip, mysqld was compiled without ndbcluster
+      # which is the default case
+      return;
+    }
+
+    if ($opt_skip_ndbcluster)
+    {
+      # Compiled with ndbcluster but ndbcluster skipped
+      mtr_report(" - skipping ndbcluster(--skip-ndbcluster)");
+      return;
+    }
+
+
+    # Not a MySQL Cluster tree, enable ndbcluster
+    # if --include-ndbcluster was used
+    if ($opt_include_ndbcluster)
+    {
+      # enable ndbcluster
+    }
+    else
+    {
+      mtr_report(" - skipping ndbcluster(disabled by default)");
+      return;
+    }
   }
 
-  if ($opt_include_ndbcluster)
-  {
-    $opt_skip_ndbcluster= 0;
-  }
-
-  if ($opt_skip_ndbcluster)
-  {
-    mtr_report(" - skipping ndbcluster");
-    return;
-  }
-
-  if ( ! $mysqld_variables{'ndb-connectstring'} )
-  {
-    mtr_report(" - skipping ndbcluster, mysqld not compiled with ndbcluster");
-    $opt_skip_ndbcluster= 2;
-    return;
-  }
-
-  mtr_report(" - using ndbcluster when necessary, mysqld supports it");
-
+  mtr_report(" - enabling ndbcluster");
+  $ndbcluster_enabled= 1;
+  # Add MySQL Cluster test suites
+  $DEFAULT_SUITES.=",ndb,ndb_binlog,rpl_ndb,ndb_rpl,ndb_memcache";
   return;
 }
 
@@ -3821,6 +3883,7 @@ sub resfile_report_test ($) {
 
 sub run_testcase ($) {
   my $tinfo=  shift;
+  my $print_freq=20;
 
   mtr_verbose("Running test:", $tinfo->{name});
   resfile_report_test($tinfo) if $opt_resfile;
@@ -3980,6 +4043,7 @@ sub run_testcase ($) {
   my $test= start_mysqltest($tinfo);
   # Set only when we have to keep waiting after expectedly died server
   my $keep_waiting_proc = 0;
+  my $print_timeout= start_timer($print_freq * 60);
 
   while (1)
   {
@@ -4004,7 +4068,22 @@ sub run_testcase ($) {
     }
     if (! $keep_waiting_proc)
     {
-      $proc= My::SafeProcess->wait_any_timeout($test_timeout);
+      if($test_timeout > $print_timeout)
+      {
+         $proc= My::SafeProcess->wait_any_timeout($print_timeout);
+         if ( $proc->{timeout} )
+         {
+            #print out that the test is still on
+            mtr_print("Test still running: $tinfo->{name}");
+            #reset the timer
+            $print_timeout= start_timer($print_freq * 60);
+            next;
+         }
+      }
+      else
+      {
+         $proc= My::SafeProcess->wait_any_timeout($test_timeout);
+      }
     }
 
     # Will be restored if we need to keep waiting
@@ -4312,7 +4391,7 @@ sub extract_warning_lines ($$) {
       {
 	# Remove initial timestamp and look for consecutive identical lines
 	my $line_pat= $line;
-	$line_pat =~ s/^[0-9: ]*//;
+	$line_pat =~ s/^[0-9:\-\+\.TZ ]*//;
 	if ($line_pat eq $last_pat) {
 	  $num_rep++;
 	} else {
@@ -4942,6 +5021,10 @@ sub mysqld_start ($$) {
   if ( $opt_gdb || $opt_manual_gdb )
   {
     gdb_arguments(\$args, \$exe, $mysqld->name());
+  }
+  elsif ( $opt_manual_lldb )
+  {
+    lldb_arguments(\$args, \$exe, $mysqld->name());
   }
   elsif ( $opt_ddd || $opt_manual_ddd )
   {
@@ -5635,6 +5718,24 @@ sub start_mysqltest ($) {
   return $proc;
 }
 
+sub create_debug_statement {
+  my $args= shift;
+  my $input= shift;
+
+  # Put $args into a single string
+  my $str= join(" ", @$$args);
+  my $runline= $input ? "run $str < $input" : "run $str";
+
+  # add quotes to escape ; in plugin_load option
+  my $pos1 = index($runline, "--plugin_load=");
+  if ( $pos1 != -1 ) {
+    my $pos2 = index($runline, " ",$pos1);
+    substr($runline,$pos1+14,0) = "\"";
+    substr($runline,$pos2+1,0) = "\"";
+  }
+
+  return $runline;
+}
 
 #
 # Modify the exe and args so that program is run in gdb in xterm
@@ -5650,9 +5751,7 @@ sub gdb_arguments {
   # Remove the old gdbinit file
   unlink($gdb_init_file);
 
-  # Put $args into a single string
-  my $str= join(" ", @$$args);
-  my $runline= $input ? "run $str < $input" : "run $str";
+  my $runline=create_debug_statement($args,$input);
 
   # write init file for mysqld or client
   mtr_tofile($gdb_init_file,
@@ -5688,6 +5787,32 @@ sub gdb_arguments {
   $$exe= "xterm";
 }
 
+ #
+# Modify the exe and args so that program is run in lldb
+#
+sub lldb_arguments {
+  my $args= shift;
+  my $exe= shift;
+  my $type= shift;
+  my $input= shift;
+
+  my $lldb_init_file= "$opt_vardir/tmp/lldbinit.$type";
+  unlink($lldb_init_file);
+
+  my $runline=create_debug_statement($args,$input);
+
+  # write init file for mysqld or client
+  mtr_tofile($lldb_init_file,
+	     "b main\n" .
+	     $runline);
+
+    print "\nTo start lldb for $type, type in another window:\n";
+    print "cd $glob_mysql_test_dir && lldb -s $lldb_init_file $$exe\n";
+
+    # Indicate the exe should not be started
+    $$exe= undef;
+    return;
+}
 
 #
 # Modify the exe and args so that program is run in ddd
@@ -5703,9 +5828,7 @@ sub ddd_arguments {
   # Remove the old gdbinit file
   unlink($gdb_init_file);
 
-  # Put $args into a single string
-  my $str= join(" ", @$$args);
-  my $runline= $input ? "run $str < $input" : "run $str";
+  my $runline=create_debug_statement($args,$input);
 
   # write init file for mysqld or client
   mtr_tofile($gdb_init_file,
@@ -5957,7 +6080,7 @@ sub run_ctest() {
   # Special override: also ignore in Pushbuild, some platforms may not have it
   # Now, run ctest and collect output
   my $ctest_out= `ctest $ctest_vs 2>&1`;
-  if ($? == $no_ctest && $opt_ctest == -1 && ! defined $ENV{PB2WORKDIR}) {
+  if ($? == $no_ctest && ($opt_ctest == -1 || defined $ENV{PB2WORKDIR})) {
     chdir($olddir);
     return;
   }
@@ -5981,6 +6104,8 @@ sub run_ctest() {
   my $ctres= 0;			# Did ctest produce report summary?
 
   open (CTEST, " > $ctfile") or die ("Could not open output file $ctfile");
+
+  $ctest_report .= $ctest_out if $opt_ctest_report;
 
   # Put ctest output in log file, while analyzing results
   for (split ('\n', $ctest_out)) {
@@ -6148,6 +6273,8 @@ Options for debugging the product
                         test(s)
   manual-dbx            Let user manually start mysqld in dbx, before running
                         test(s)
+  manual-lldb           Let user manually start mysqld in lldb, before running 
+                        test(s)
   strace-client         Create strace output for mysqltest client, 
   strace-server         Create strace output for mysqltest server, 
   max-save-core         Limit the number of core files saved (to avoid filling
@@ -6236,6 +6363,7 @@ Misc options
   nounit-tests          Do not run unit tests. Normally run if configured
                         and if not running named tests/suites
   unit-tests            Run unit tests even if they would otherwise not be run
+  unit-tests-report     Include report of every test included in unit tests.
   stress=ARGS           Run stress test, providing options to
                         mysql-stress-test.pl. Options are separated by comma.
   junit-output=FILE     Output JUnit test summary XML to FILE.

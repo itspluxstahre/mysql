@@ -1,4 +1,4 @@
--- Copyright (c) 2003, 2011, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -58,7 +58,7 @@ ALTER TABLE tables_priv
 ALTER TABLE tables_priv
   MODIFY Host char(60) NOT NULL default '',
   MODIFY Db char(64) NOT NULL default '',
-  MODIFY User char(16) NOT NULL default '',
+  MODIFY User char(32) NOT NULL default '',
   MODIFY Table_name char(64) NOT NULL default '',
   MODIFY Grantor char(77) NOT NULL default '',
   ENGINE=MyISAM,
@@ -86,7 +86,7 @@ ALTER TABLE columns_priv
 ALTER TABLE columns_priv
   MODIFY Host char(60) NOT NULL default '',
   MODIFY Db char(64) NOT NULL default '',
-  MODIFY User char(16) NOT NULL default '',
+  MODIFY User char(32) NOT NULL default '',
   MODIFY Table_name char(64) NOT NULL default '',
   MODIFY Column_name char(64) NOT NULL default '',
   ENGINE=MyISAM,
@@ -157,7 +157,7 @@ alter table func comment='User defined functions';
 # and reset all char columns to correct width
 ALTER TABLE user
   MODIFY Host char(60) NOT NULL default '',
-  MODIFY User char(16) NOT NULL default '',
+  MODIFY User char(32) NOT NULL default '',
   ENGINE=MyISAM, CONVERT TO CHARACTER SET utf8 COLLATE utf8_bin;
 ALTER TABLE user
   MODIFY Password char(41) character set latin1 collate latin1_bin NOT NULL default '',
@@ -187,7 +187,7 @@ ALTER TABLE user
 ALTER TABLE db
   MODIFY Host char(60) NOT NULL default '',
   MODIFY Db char(64) NOT NULL default '',
-  MODIFY User char(16) NOT NULL default '',
+  MODIFY User char(32) NOT NULL default '',
   ENGINE=MyISAM, CONVERT TO CHARACTER SET utf8 COLLATE utf8_bin;
 ALTER TABLE db
   MODIFY  Select_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL,
@@ -617,6 +617,18 @@ ALTER TABLE user MODIFY Create_tablespace_priv enum('N','Y') COLLATE utf8_genera
 
 UPDATE user SET Create_tablespace_priv = Super_priv WHERE @hadCreateTablespacePriv = 0;
 
+#
+# user.Ignore_logging_priv
+#
+
+SET @hadIgnoreLoggingPriv := 0;
+SELECT @hadIgnoreLoggingPriv :=1 FROM user WHERE Ignore_logging_priv LIKE '%';
+
+ALTER TABLE user ADD Ignore_logging_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL AFTER Create_tablespace_priv;
+ALTER TABLE user MODIFY Ignore_logging_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL AFTER Create_tablespace_priv;
+
+UPDATE user SET Ignore_logging_priv = Super_priv WHERE @hadIgnoreLoggingPriv = 0;
+
 --
 -- Unlike 'performance_schema', the 'mysql' database is reserved already,
 -- so no user procedure is supposed to be there.
@@ -656,6 +668,26 @@ DROP TABLE tmp_proxies_priv;
 -- Custom columns should be the last columns of the user table.
 --
 ALTER TABLE user ADD max_statement_time int(11) unsigned DEFAULT 0 NOT NULL;
+
+-- Checking for any duplicate hostname and username combination are exists.
+-- If exits we will throw error.
+DROP PROCEDURE IF EXISTS mysql.count_duplicate_host_names;
+DELIMITER //
+CREATE PROCEDURE mysql.count_duplicate_host_names()
+BEGIN
+  SET @duplicate_hosts=(SELECT count(*) FROM mysql.user GROUP BY user, lower(host) HAVING count(*) > 1 LIMIT 1);
+  IF @duplicate_hosts > 1 THEN
+    SIGNAL SQLSTATE '45000'  SET MESSAGE_TEXT = 'Multiple accounts exist for @user_name, @host_name that differ only in Host lettercase; remove all except one of them';
+  END IF;
+END //
+DELIMITER ;
+CALL mysql.count_duplicate_host_names();
+-- Get warnings (if any)
+SHOW WARNINGS;
+DROP PROCEDURE mysql.count_duplicate_host_names;
+
+# Convering the host name to lower case for existing users
+UPDATE user SET host=LOWER( host ) WHERE LOWER( host ) <> host;
 
 # Activate the new, possible modified privilege tables
 # This should not be needed, but gives us some extra testing that the above

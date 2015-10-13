@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -39,6 +39,8 @@ enum enum_plugin_load_option { PLUGIN_OFF, PLUGIN_ON, PLUGIN_FORCE,
 extern const char *global_plugin_typelib_names[];
 
 #include <my_sys.h>
+
+extern mysql_mutex_t LOCK_plugin_delete;
 
 #ifdef DBUG_OFF
 #define plugin_ref_to_int(A) A
@@ -154,7 +156,7 @@ extern bool mysql_uninstall_plugin(THD *thd, const LEX_STRING *name);
 extern bool plugin_register_builtin(struct st_mysql_plugin *plugin);
 extern void plugin_thdvar_init(THD *thd);
 extern void plugin_thdvar_cleanup(THD *thd);
-extern SHOW_COMP_OPTION plugin_status(const char *name, int len, size_t type);
+extern SHOW_COMP_OPTION plugin_status(const char *name, size_t len, int type);
 extern bool check_valid_path(const char *path, size_t length);
 
 typedef my_bool (plugin_foreach_func)(THD *thd,

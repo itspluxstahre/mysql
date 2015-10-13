@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -36,6 +36,7 @@
 #include "sql_priv.h"
 #include "log_event.h"
 #include "sql_common.h"
+#include "my_dir.h"
 #include <welcome_copyright_notice.h> // ORACLE_WELCOME_COPYRIGHT_NOTICE
 
 #define BIN_LOG_HEADER_SIZE	4
@@ -670,6 +671,37 @@ write_event_header_and_base64(Log_event *ev, FILE *result_file,
 
 
 /**
+  Attach a Table_metadata event to its respective Table_map event;
+
+  @param event The Table_metadata event.
+  @param print_event_info Print context.
+
+  @remark Upon successful attachment, the Table_map takes ownership
+          over the Table_metadata event.
+
+  @return false if successful, true otherwise.
+*/
+static bool
+attach_to_table_map_event(Table_metadata_log_event *event,
+                          PRINT_EVENT_INFO *print_event_info)
+{
+  Table_map_log_event *table_map;
+  ulong table_map_id= event->get_table_id();
+  DBUG_ENTER("process_table_metadata_event");
+
+  if (!(table_map= print_event_info->m_table_map.get_table(table_map_id)))
+    table_map= print_event_info->m_table_map_ignored.get_table(table_map_id);
+
+  if (!table_map)
+    DBUG_RETURN(true);
+
+  table_map->set_table_metadata_event(event);
+
+  DBUG_RETURN(false);
+}
+
+
+/**
   Print the given event, and either delete it or delegate the deletion
   to someone else.
 
@@ -698,6 +730,7 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
   DBUG_ENTER("process_event");
   print_event_info->short_form= short_form;
   Exit_status retval= OK_CONTINUE;
+  IO_CACHE *const head= &print_event_info->head_cache;
 
   /*
     Format events are not concerned by --offset and such, we always need to
@@ -761,6 +794,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
       }
       else
         ev->print(result_file, print_event_info);
+      if (head->error == -1)
+        goto err;
       break;
 
     case CREATE_FILE_EVENT:
@@ -789,8 +824,11 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
           goto end;
       }
       else
+      {
         ce->print(result_file, print_event_info, TRUE);
-
+        if (head->error == -1)
+          goto err;
+      }
       // If this binlog is not 3.23 ; why this test??
       if (glob_description_event->binlog_version >= 3)
       {
@@ -812,6 +850,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
         output of Append_block_log_event::print is only a comment.
       */
       ev->print(result_file, print_event_info);
+      if (head->error == -1)
+        goto err;
       if ((retval= load_processor.process((Append_block_log_event*) ev)) !=
           OK_CONTINUE)
         goto end;
@@ -820,6 +860,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
     case EXEC_LOAD_EVENT:
     {
       ev->print(result_file, print_event_info);
+      if (head->error == -1)
+        goto err;
       Execute_load_log_event *exv= (Execute_load_log_event*)ev;
       Create_file_log_event *ce= load_processor.grab_event(exv->file_id);
       /*
@@ -837,6 +879,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
 	ce->print(result_file, print_event_info, TRUE);
 	my_free((void*)ce->fname);
 	delete ce;
+        if (head->error == -1)
+          goto err;
       }
       else
         warning("Ignoring Execute_load_log_event as there is no "
@@ -849,6 +893,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
       print_event_info->common_header_len=
         glob_description_event->common_header_len;
       ev->print(result_file, print_event_info);
+      if (head->error == -1)
+        goto err;
       if (!remote_opt)
       {
         ev->free_temp_buf(); // free memory allocated in dump_local_log_entries
@@ -878,6 +924,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
       break;
     case BEGIN_LOAD_QUERY_EVENT:
       ev->print(result_file, print_event_info);
+      if (head->error == -1)
+        goto err;
       if ((retval= load_processor.process((Begin_load_query_log_event*) ev)) !=
           OK_CONTINUE)
         goto end;
@@ -893,6 +941,12 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
         {
           convert_path_to_forward_slashes(fname);
           exlq->print(result_file, print_event_info, fname);
+          if (head->error == -1)
+          {
+            if (fname)
+              my_free(fname);
+            goto err;
+          }
         }
         else
           warning("Ignoring Execute_load_query since there is no "
@@ -901,6 +955,13 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
 
       if (fname)
 	my_free(fname);
+      break;
+    }
+    case TABLE_METADATA_EVENT:
+    {
+      Table_metadata_log_event *event= (Table_metadata_log_event *) ev;
+      destroy_evt= attach_to_table_map_event(event, print_event_info);
+      event->print(result_file, print_event_info);
       break;
     }
     case TABLE_MAP_EVENT:
@@ -920,20 +981,41 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
     case PRE_GA_DELETE_ROWS_EVENT:
     case PRE_GA_UPDATE_ROWS_EVENT:
     {
-      if (ev_type != TABLE_MAP_EVENT)
-      {
-        Rows_log_event *e= (Rows_log_event*) ev;
-        Table_map_log_event *ignored_map= 
-          print_event_info->m_table_map_ignored.get_table(e->get_table_id());
-        bool skip_event= (ignored_map != NULL);
+      bool stmt_end= FALSE;
+      Table_map_log_event *ignored_map= NULL;
 
-        /* 
-           end of statement check:
-             i) destroy/free ignored maps
-            ii) if skip event, flush cache now
-         */
-        if (e->get_flags(Rows_log_event::STMT_END_F))
-        {
+      if (ev_type == WRITE_ROWS_EVENT ||
+          ev_type == DELETE_ROWS_EVENT ||
+          ev_type == UPDATE_ROWS_EVENT)
+      {
+        Rows_log_event *new_ev= (Rows_log_event*) ev;
+        if (new_ev->get_flags(Rows_log_event::STMT_END_F))
+          stmt_end= TRUE;
+        ignored_map= print_event_info->m_table_map_ignored.get_table(new_ev->get_table_id());
+      }
+      else if (ev_type == PRE_GA_WRITE_ROWS_EVENT ||
+               ev_type == PRE_GA_DELETE_ROWS_EVENT ||
+               ev_type == PRE_GA_UPDATE_ROWS_EVENT)
+      {
+        Old_rows_log_event *old_ev= (Old_rows_log_event*) ev;
+        if (old_ev->get_flags(Rows_log_event::STMT_END_F))
+          stmt_end= TRUE;
+        ignored_map= print_event_info->m_table_map_ignored.get_table(old_ev->get_table_id());
+      }
+
+      bool skip_event= (ignored_map != NULL);
+      /*
+        end of statement check:
+        i) destroy/free ignored maps
+        ii) if skip event
+              a) since we are skipping the last event,
+                 append END-MARKER(') to body cache (if required)
+
+              b) flush cache now
+       */
+      if (stmt_end)
+      {
+
           /* 
             Now is safe to clear ignored map (clear_tables will also
             delete original table map events stored in the map).
@@ -951,6 +1033,12 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
           */
           if (skip_event)
           {
+            // append END-MARKER(') with delimiter
+            IO_CACHE *const body_cache= &print_event_info->body_cache;
+            if (my_b_tell(body_cache))
+              my_b_printf(body_cache, "'%s\n", print_event_info->delimiter);
+
+            // flush cache
             if ((copy_event_cache_to_file_and_reinit(&print_event_info->head_cache, result_file) ||
                 copy_event_cache_to_file_and_reinit(&print_event_info->body_cache, result_file)))
               goto err;
@@ -960,7 +1048,6 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
         /* skip the event check */
         if (skip_event)
           goto end;
-      }
       /*
         These events must be printed in base64 format, if printed.
         base64 format requires a FD event to be safe, so if no FD
@@ -988,6 +1075,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
     }
     default:
       ev->print(result_file, print_event_info);
+      if (head->error == -1)
+        goto err;
     }
   }
 
@@ -1149,7 +1238,7 @@ static struct my_option my_long_options[] =
    "Stop reading the binlog at position N. Applies to the last binlog "
    "passed on the command line.",
    &stop_position, &stop_position, 0, GET_ULL,
-   REQUIRED_ARG, (ulonglong)(~(my_off_t)0), BIN_LOG_HEADER_SIZE,
+   REQUIRED_ARG, (longlong)(~(my_off_t)0), BIN_LOG_HEADER_SIZE,
    (ulonglong)(~(my_off_t)0), 0, 0, 0},
   {"to-last-log", 't', "Requires -R. Will not stop at the end of the \
 requested binlog but rather continue printing until the end of the last \
@@ -1261,7 +1350,7 @@ static void print_version()
 static void usage()
 {
   print_version();
-  puts(ORACLE_WELCOME_COPYRIGHT_NOTICE("2000, 2011"));
+  puts(ORACLE_WELCOME_COPYRIGHT_NOTICE("2000"));
   printf("\
 Dumps a MySQL binary log in a format usable for viewing or for piping to\n\
 the mysql command line client.\n\n");
@@ -1751,6 +1840,7 @@ static Exit_status check_header(IO_CACHE* file,
   uchar header[BIN_LOG_HEADER_SIZE];
   uchar buf[PROBE_HEADER_LEN];
   my_off_t tmp_pos, pos;
+  MY_STAT my_file_stat;
 
   delete glob_description_event;
   if (!(glob_description_event= new Format_description_log_event(3)))
@@ -1760,7 +1850,16 @@ static Exit_status check_header(IO_CACHE* file,
   }
 
   pos= my_b_tell(file);
-  my_b_seek(file, (my_off_t)0);
+
+  /* fstat the file to check if the file is a regular file. */
+  if (my_fstat(file->file, &my_file_stat, MYF(0)) == -1)
+  {
+    error("Unable to stat the file.");
+    return ERROR_STOP;
+  }
+  if ((my_file_stat.st_mode & S_IFMT) == S_IFREG)
+    my_b_seek(file, (my_off_t)0);
+
   if (my_b_read(file, header, sizeof(header)))
   {
     error("Failed reading header; probably an empty file.");
@@ -2020,7 +2119,13 @@ err:
 end:
   if (fd >= 0)
     my_close(fd, MYF(MY_WME));
-  end_io_cache(file);
+  /*
+    Since the end_io_cache() writes to the
+    file errors may happen.
+   */
+  if (end_io_cache(file))
+    retval= ERROR_STOP;
+
   return retval;
 }
 
@@ -2035,6 +2140,7 @@ int main(int argc, char** argv)
   DBUG_PROCESS(argv[0]);
 
   my_init_time(); // for time functions
+  tzset(); // set tzname
 
   if (load_defaults("my", load_default_groups, &argc, &argv))
     exit(1);
@@ -2076,6 +2182,8 @@ int main(int argc, char** argv)
     load_processor.init_by_dir_name(dirname_for_local_load);
   else
     load_processor.init_by_cur_dir();
+
+  fprintf(result_file, "/*!50530 SET @@SESSION.PSEUDO_SLAVE_MODE=1*/;\n");
 
   fprintf(result_file,
 	  "/*!40019 SET @@session.max_insert_delayed_threads=0*/;\n");
@@ -2127,6 +2235,8 @@ int main(int argc, char** argv)
             "/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;\n"
             "/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;\n");
 
+  fprintf(result_file, "/*!50530 SET @@SESSION.PSEUDO_SLAVE_MODE=0*/;\n");
+
   if (tmpdir.list)
     free_tmpdir(&tmpdir);
   if (result_file != stdout)
@@ -2154,3 +2264,4 @@ int main(int argc, char** argv)
 #include "log_event.cc"
 #include "log_event_old.cc"
 #include "rpl_utility.cc"
+#include "rpl_tblmap.cc"

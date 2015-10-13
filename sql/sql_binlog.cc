@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -107,7 +107,7 @@ void mysql_client_binlog_statement(THD* thd)
         rli->relay_log.description_event_for_exec &&
         buf))
   {
-    my_error(ER_OUTOFMEMORY, MYF(0), 1);  /* needed 1 bytes */
+    my_error(ER_OUTOFMEMORY, MYF(ME_FATALERROR), 1);  /* needed 1 bytes */
     goto end;
   }
 

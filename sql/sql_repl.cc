@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -248,7 +248,10 @@ bool log_in_use(const char* log_name)
   size_t log_name_len = strlen(log_name) + 1;
   THD *tmp;
   bool result = 0;
-
+#ifndef BDUG_OFF
+  if (current_thd)
+    DEBUG_SYNC(current_thd,"purge_logs_after_lock_index_before_thread_count");
+#endif
   mysql_mutex_lock(&LOCK_thread_count);
   I_List_iterator<THD> it(threads);
 
@@ -447,13 +450,11 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
   String* packet = &thd->packet;
   int error;
   const char *errmsg = "Unknown error";
-  char llbuff0[22], llbuff1[22], llbuff2[22];
   char error_text[MAX_SLAVE_ERRMSG]; // to be send to slave via my_message()
   NET* net = &thd->net;
   mysql_mutex_t *log_lock;
   mysql_cond_t *log_cond;
 
-  bool binlog_can_be_corrupted= FALSE;
 #ifndef DBUG_OFF
   int left_events = max_binlog_dump_events;
 #endif
@@ -477,7 +478,8 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
     heartbeat_ts= &heartbeat_buf;
     set_timespec_nsec(*heartbeat_ts, 0);
   }
-  sql_print_information("Start binlog_dump to slave_server(%d), pos(%s, %lu)",
+  if (global_system_variables.log_warnings > 1)
+    sql_print_information("Start binlog_dump to slave_server(%u), pos(%s, %lu)",
                         thd->server_id, log_ident, (ulong)pos);
   if (RUN_HOOK(binlog_transmit, transmit_start, (thd, flags, log_ident, pos)))
   {
@@ -588,7 +590,7 @@ impossible position";
     this larger than the corresponding packet (query) sent 
     from client to master.
   */
-  thd->variables.max_allowed_packet+= MAX_LOG_EVENT_HEADER;
+  thd->variables.max_allowed_packet= MAX_MAX_ALLOWED_PACKET;
 
   /*
     We can set log_lock now, it does not move (it's a member of
@@ -621,8 +623,6 @@ impossible position";
                    (*packet)[EVENT_TYPE_OFFSET+ev_offset]));
        if ((*packet)[EVENT_TYPE_OFFSET+ev_offset] == FORMAT_DESCRIPTION_EVENT)
        {
-         binlog_can_be_corrupted= test((*packet)[FLAGS_OFFSET+ev_offset] &
-                                       LOG_EVENT_BINLOG_IN_USE_F);
          (*packet)[FLAGS_OFFSET+ev_offset] &= ~LOG_EVENT_BINLOG_IN_USE_F;
          /*
            mark that this event with "log_pos=0", so the slave
@@ -679,7 +679,10 @@ impossible position";
     if (reset_transmit_packet(thd, flags, &ev_offset, &errmsg))
       goto err;
 
-    while (!(error= Log_event::read_log_event(&log, packet, log_lock)))
+    bool is_active_binlog= false;
+    while (!(error= Log_event::read_log_event(&log, packet, log_lock,
+                                              log_file_name,
+                                              &is_active_binlog)))
     {
 #ifndef DBUG_OFF
       if (max_binlog_dump_events && !left_events--)
@@ -711,34 +714,8 @@ impossible position";
                       });
       if (event_type == FORMAT_DESCRIPTION_EVENT)
       {
-        binlog_can_be_corrupted= test((*packet)[FLAGS_OFFSET+ev_offset] &
-                                      LOG_EVENT_BINLOG_IN_USE_F);
         (*packet)[FLAGS_OFFSET+ev_offset] &= ~LOG_EVENT_BINLOG_IN_USE_F;
       }
-      else if (event_type == STOP_EVENT)
-        binlog_can_be_corrupted= FALSE;
-
-      /*
-        Introduced this code to make the gcc 4.6.1 compiler happy. When
-        warnings are converted to errors, the compiler complains about
-        the fact that binlog_can_be_corrupted is defined but never used.
-
-        We need to check if this is a dead code or if someone removed any
-        code by mistake.
-
-        /Alfranio
-      */
-      if (binlog_can_be_corrupted)
-      {
-        /*
-           Don't try to print out warning messages because this generates
-           erroneous messages in the error log and causes performance
-           problems.
-
-           /Alfranio
-        */
-      }
-      
       pos = my_b_tell(&log);
       if (RUN_HOOK(binlog_transmit, before_send_event,
                    (thd, flags, packet, log_file_name, pos)))
@@ -786,6 +763,13 @@ impossible position";
         goto err;
     }
 
+    DBUG_EXECUTE_IF("wait_after_binlog_EOF",
+                    {
+                      const char act[]= "now wait_for signal.rotate_finished";
+                      DBUG_ASSERT(!debug_sync_set_action(current_thd,
+                                                         STRING_WITH_LEN(act)));
+                    };);
+
     /*
       TODO: now that we are logging the offset, check to make sure
       the recorded offset and the actual match.
@@ -796,8 +780,11 @@ impossible position";
     if (test_for_non_eof_log_read_errors(error, &errmsg))
       goto err;
 
-    if (!(flags & BINLOG_DUMP_NON_BLOCK) &&
-        mysql_bin_log.is_active(log_file_name))
+    /*
+      We should only move to the next binlog when the last read event
+      came from a already deactivated binlog.
+     */
+    if (!(flags & BINLOG_DUMP_NON_BLOCK) && is_active_binlog)
     {
       /*
 	Block until there is more data in the log
@@ -1034,12 +1021,14 @@ err:
        detailing the fatal error message with coordinates 
        of the last position read.
     */
-    const char *fmt= "%s; the start event position from '%s' at %s, the last event was read from '%s' at %s, the last byte read was read from '%s' at %s.";
-    my_snprintf(error_text, sizeof(error_text), fmt, errmsg,
-                p_start_coord->file_name,
-                (llstr(p_start_coord->pos, llbuff0), llbuff0),
-                p_coord->file_name, (llstr(p_coord->pos, llbuff1), llbuff1),
-                log_file_name,    (llstr(my_b_tell(&log), llbuff2), llbuff2));
+    my_snprintf(error_text, sizeof(error_text),
+                "%s; the first event '%s' at %lld, "
+                "the last event read from '%s' at %lld, "
+                "the last byte read from '%s' at %lld.",
+                errmsg,
+                p_start_coord->file_name, p_start_coord->pos,
+                p_coord->file_name, p_coord->pos,
+                log_file_name, my_b_tell(&log));
   }
   else
     strcpy(error_text, errmsg);
@@ -1114,6 +1103,8 @@ int start_slave(THD* thd , Master_info* mi,  bool net_report)
 
         if (thd->lex->mi.pos)
         {
+          if (thd->lex->mi.relay_log_pos)
+            slave_errno=ER_BAD_SLAVE_UNTIL_COND;
           mi->rli.until_condition= Relay_log_info::UNTIL_MASTER_POS;
           mi->rli.until_log_pos= thd->lex->mi.pos;
           /*
@@ -1125,6 +1116,8 @@ int start_slave(THD* thd , Master_info* mi,  bool net_report)
         }
         else if (thd->lex->mi.relay_log_pos)
         {
+          if (thd->lex->mi.pos)
+            slave_errno=ER_BAD_SLAVE_UNTIL_COND;
           mi->rli.until_condition= Relay_log_info::UNTIL_RELAY_POS;
           mi->rli.until_log_pos= thd->lex->mi.relay_log_pos;
           strmake(mi->rli.until_log_name, thd->lex->mi.relay_log_name,
@@ -1309,7 +1302,10 @@ int reset_slave(THD *thd, Master_info* mi)
 
   /* Clear master's log coordinates and associated information */
   mi->clear_in_memory_info(thd->lex->reset_slave_info.all);
-
+  if (thd->lex->reset_slave_info.all) {
+	  // MYSQL-312
+	  master_server_id= 0;
+  }
   /*
      Reset errors (the idea is that we forget about the
      old master).
@@ -1736,6 +1732,8 @@ bool mysql_show_binlog_events(THD* thd)
   File file = -1;
   MYSQL_BIN_LOG *binary_log= NULL;
   int old_max_allowed_packet= thd->variables.max_allowed_packet;
+  LOG_INFO linfo;
+
   DBUG_ENTER("mysql_show_binlog_events");
 
   Log_event::init_show_field_list(&field_list);
@@ -1778,7 +1776,6 @@ bool mysql_show_binlog_events(THD* thd)
     char search_file_name[FN_REFLEN], *name;
     const char *log_file_name = lex_mi->log_file_name;
     mysql_mutex_t *log_lock = binary_log->get_log_lock();
-    LOG_INFO linfo;
     Log_event* ev;
 
     unit->set_limit(thd->lex->current_select);
@@ -1870,6 +1867,8 @@ bool mysql_show_binlog_events(THD* thd)
 
     mysql_mutex_unlock(log_lock);
   }
+  // Check that linfo is still on the function scope.
+  DEBUG_SYNC(thd, "after_show_binlog_events");
 
   ret= FALSE;
 
@@ -1972,6 +1971,7 @@ bool show_binlogs(THD* thd)
     DBUG_RETURN(TRUE);
   
   mysql_mutex_lock(mysql_bin_log.get_log_lock());
+  DEBUG_SYNC(thd, "show_binlogs_after_lock_log_before_lock_index");
   mysql_bin_log.lock_index();
   index_file=mysql_bin_log.get_index_file();
   
@@ -2011,6 +2011,8 @@ bool show_binlogs(THD* thd)
     if (protocol->write())
       goto err;
   }
+  if(index_file->error == -1)
+    goto err;
   mysql_bin_log.unlock_index();
   my_eof(thd);
   DBUG_RETURN(FALSE);

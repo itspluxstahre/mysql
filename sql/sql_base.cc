@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2015, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 
 /* Basic functions needed by many modules */
@@ -214,7 +214,9 @@ static bool auto_repair_table(THD *thd, TABLE_LIST *table_list);
 static void free_cache_entry(TABLE *entry);
 static bool
 has_write_table_with_auto_increment(TABLE_LIST *tables);
-
+static bool
+has_write_table_with_auto_increment_and_select(TABLE_LIST *tables);
+static bool has_write_table_auto_increment_not_first_in_pk(TABLE_LIST *tables);
 
 uint cached_open_tables(void)
 {
@@ -314,8 +316,9 @@ uint create_table_def_key(THD *thd, char *key,
                           const TABLE_LIST *table_list,
                           bool tmp_table)
 {
-  uint key_length= (uint) (strmov(strmov(key, table_list->db)+1,
-                                  table_list->table_name)-key)+1;
+  uint key_length= create_table_def_key(key, table_list->db,
+                                        table_list->table_name);
+
   if (tmp_table)
   {
     int4store(key + key_length, thd->server_id);
@@ -813,13 +816,10 @@ void release_table_share(TABLE_SHARE *share)
 TABLE_SHARE *get_cached_table_share(const char *db, const char *table_name)
 {
   char key[NAME_LEN*2+2];
-  TABLE_LIST table_list;
   uint key_length;
   mysql_mutex_assert_owner(&LOCK_open);
 
-  table_list.db= (char*) db;
-  table_list.table_name= (char*) table_name;
-  key_length= create_table_def_key((THD*) 0, key, &table_list, 0);
+  key_length= create_table_def_key(key, db, table_name);
   return (TABLE_SHARE*) my_hash_search(&table_def_cache,
                                        (uchar*) key, key_length);
 }  
@@ -893,6 +893,7 @@ OPEN_TABLE_LIST *list_open_tables(THD *thd, const char *db, const char *wild)
   mysql_mutex_unlock(&LOCK_open);
   DBUG_RETURN(open_list);
 }
+
 
 /*****************************************************************************
  *	 Functions to free open table cache
@@ -1587,6 +1588,13 @@ bool close_thread_table(THD *thd, TABLE **table_ptr)
   table->mdl_ticket= NULL;
 
   mysql_mutex_lock(&thd->LOCK_thd_data);
+
+  if (unlikely(opt_userstat && table->file))
+  {
+    table->file->update_global_table_stats();
+    table->file->update_global_index_stats();
+  }
+
   *table_ptr=table->next;
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 
@@ -2211,6 +2219,12 @@ void close_temporary(TABLE *table, bool free_share, bool delete_table)
   DBUG_ENTER("close_temporary");
   DBUG_PRINT("tmptable", ("closing table: '%s'.'%s'",
                           table->s->db.str, table->s->table_name.str));
+
+  if (unlikely(opt_userstat))
+  {
+    table->file->update_global_table_stats();
+    table->file->update_global_index_stats();
+  }
 
   free_io_cache(table);
   closefrm(table, 0);
@@ -3166,7 +3180,7 @@ err_unlock:
 TABLE *find_locked_table(TABLE *list, const char *db, const char *table_name)
 {
   char	key[MAX_DBKEY_LENGTH];
-  uint key_length=(uint) (strmov(strmov(key,db)+1,table_name)-key)+1;
+  uint key_length= create_table_def_key(key, db, table_name);
 
   for (TABLE *table= list; table ; table=table->next)
   {
@@ -3946,7 +3960,8 @@ end_unlock:
 /** Open_table_context */
 
 Open_table_context::Open_table_context(THD *thd, uint flags)
-  :m_failed_table(NULL),
+  :m_thd(thd),
+   m_failed_table(NULL),
    m_start_of_statement_svp(thd->mdl_context.mdl_savepoint()),
    m_timeout(flags & MYSQL_LOCK_IGNORE_TIMEOUT ?
              LONG_TIMEOUT : thd->variables.lock_wait_timeout),
@@ -4023,6 +4038,7 @@ request_backoff_action(enum_open_table_action action_arg,
   if (action_arg != OT_REOPEN_TABLES && m_has_locks)
   {
     my_error(ER_LOCK_DEADLOCK, MYF(0));
+    m_thd->mark_transaction_to_rollback(true);
     return TRUE;
   }
   /*
@@ -4032,7 +4048,7 @@ request_backoff_action(enum_open_table_action action_arg,
   if (table)
   {
     DBUG_ASSERT(action_arg == OT_DISCOVER || action_arg == OT_REPAIR);
-    m_failed_table= (TABLE_LIST*) current_thd->alloc(sizeof(TABLE_LIST));
+    m_failed_table= (TABLE_LIST*) m_thd->alloc(sizeof(TABLE_LIST));
     if (m_failed_table == NULL)
       return TRUE;
     m_failed_table->init_one_table(table->db, table->db_length,
@@ -4049,8 +4065,6 @@ request_backoff_action(enum_open_table_action action_arg,
 /**
    Recover from failed attempt of open table by performing requested action.
 
-   @param  thd     Thread context
-
    @pre This function should be called only with "action" != OT_NO_ACTION
         and after having called @sa close_tables_for_reopen().
 
@@ -4060,7 +4074,7 @@ request_backoff_action(enum_open_table_action action_arg,
 
 bool
 Open_table_context::
-recover_from_failed_open(THD *thd)
+recover_from_failed_open()
 {
   bool result= FALSE;
   /* Execute the action. */
@@ -4072,33 +4086,33 @@ recover_from_failed_open(THD *thd)
       break;
     case OT_DISCOVER:
       {
-        if ((result= lock_table_names(thd, m_failed_table, NULL,
+        if ((result= lock_table_names(m_thd, m_failed_table, NULL,
                                       get_timeout(),
                                       MYSQL_OPEN_SKIP_TEMPORARY)))
           break;
 
-        tdc_remove_table(thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
+        tdc_remove_table(m_thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
                          m_failed_table->table_name, FALSE);
-        ha_create_table_from_engine(thd, m_failed_table->db,
+        ha_create_table_from_engine(m_thd, m_failed_table->db,
                                     m_failed_table->table_name);
 
-        thd->warning_info->clear_warning_info(thd->query_id);
-        thd->clear_error();                 // Clear error message
-        thd->mdl_context.release_transactional_locks();
+        m_thd->warning_info->clear_warning_info(m_thd->query_id);
+        m_thd->clear_error();                 // Clear error message
+        m_thd->mdl_context.release_transactional_locks();
         break;
       }
     case OT_REPAIR:
       {
-        if ((result= lock_table_names(thd, m_failed_table, NULL,
+        if ((result= lock_table_names(m_thd, m_failed_table, NULL,
                                       get_timeout(),
                                       MYSQL_OPEN_SKIP_TEMPORARY)))
           break;
 
-        tdc_remove_table(thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
+        tdc_remove_table(m_thd, TDC_RT_REMOVE_ALL, m_failed_table->db,
                          m_failed_table->table_name, FALSE);
 
-        result= auto_repair_table(thd, m_failed_table);
-        thd->mdl_context.release_transactional_locks();
+        result= auto_repair_table(m_thd, m_failed_table);
+        m_thd->mdl_context.release_transactional_locks();
         break;
       }
     default:
@@ -4651,6 +4665,9 @@ lock_table_names(THD *thd,
           schema_set.insert(table))
         return TRUE;
       mdl_requests.push_front(&table->mdl_request);
+      /* pass NO_WAIT lock mode to the lock request */
+      if (table->lock_table_no_wait)
+        table->mdl_request.lock_no_wait = TRUE;
     }
   }
 
@@ -4799,6 +4816,7 @@ bool open_tables(THD *thd, TABLE_LIST **start, uint *counter, uint flags,
   bool error= FALSE;
   MEM_ROOT new_frm_mem;
   bool has_prelocking_list;
+  const char *prev_proc_info= thd->proc_info;
   DBUG_ENTER("open_tables");
 
   /* Accessing data in XA_IDLE or XA_PREPARED is not allowed. */
@@ -4931,7 +4949,7 @@ restart:
             TABLE_LIST element. Altough currently this assumption is valid
             it may change in future.
           */
-          if (ot_ctx.recover_from_failed_open(thd))
+          if (ot_ctx.recover_from_failed_open())
             goto err;
 
           error= FALSE;
@@ -4953,8 +4971,6 @@ restart:
     */
     if (thd->locked_tables_mode <= LTM_LOCK_TABLES)
     {
-      bool need_prelocking= FALSE;
-      TABLE_LIST **save_query_tables_last= thd->lex->query_tables_last;
       /*
         Process elements of the prelocking set which are present there
         since parsing stage or were added to it by invocations of
@@ -4967,9 +4983,18 @@ restart:
       for (Sroutine_hash_entry *rt= *sroutine_to_open; rt;
            sroutine_to_open= &rt->next, rt= rt->next)
       {
+        bool need_prelocking= false;
+        TABLE_LIST **save_query_tables_last= thd->lex->query_tables_last;
+
         error= open_and_process_routine(thd, thd->lex, rt, prelocking_strategy,
                                         has_prelocking_list, &ot_ctx,
                                         &need_prelocking);
+
+        if (need_prelocking && ! thd->lex->requires_prelocking())
+          thd->lex->mark_as_requiring_prelocking(save_query_tables_last);
+
+        if (need_prelocking && ! *start)
+          *start= thd->lex->query_tables;
 
         if (error)
         {
@@ -4977,7 +5002,7 @@ restart:
           {
             close_tables_for_reopen(thd, start,
                                     ot_ctx.start_of_statement_svp());
-            if (ot_ctx.recover_from_failed_open(thd))
+            if (ot_ctx.recover_from_failed_open())
               goto err;
 
             error= FALSE;
@@ -4991,12 +5016,6 @@ restart:
           goto err;
         }
       }
-
-      if (need_prelocking && ! thd->lex->requires_prelocking())
-        thd->lex->mark_as_requiring_prelocking(save_query_tables_last);
-
-      if (need_prelocking && ! *start)
-        *start= thd->lex->query_tables;
     }
   }
 
@@ -5025,6 +5044,7 @@ restart:
 
 err:
   thd_proc_info(thd, 0);
+  thd->proc_info= prev_proc_info;
   free_root(&new_frm_mem, MYF(0));              // Free pre-alloced block
 
   if (error && *table_to_open)
@@ -5270,6 +5290,12 @@ static bool check_lock_and_start_stmt(THD *thd,
   DBUG_ENTER("check_lock_and_start_stmt");
 
   /*
+    Prelocking placeholder is not set for TABLE_LIST that
+    are directly used by TOP level statement.
+  */
+  DBUG_ASSERT(table_list->prelocking_placeholder == false);
+
+  /*
     TL_WRITE_DEFAULT and TL_READ_DEFAULT are supposed to be parser only
     types of locks so they should be converted to appropriate other types
     to be passed to storage engine. The exact lock type passed to the
@@ -5415,7 +5441,7 @@ TABLE *open_ltable(THD *thd, TABLE_LIST *table_list, thr_lock_type lock_type,
     */
     thd->mdl_context.rollback_to_savepoint(ot_ctx.start_of_statement_svp());
     table_list->mdl_request.ticket= 0;
-    if (ot_ctx.recover_from_failed_open(thd))
+    if (ot_ctx.recover_from_failed_open())
       break;
   }
 
@@ -5680,9 +5706,52 @@ bool lock_tables(THD *thd, TABLE_LIST *tables, uint count,
 	*(ptr++)= table->table;
     }
 
+    /*
+    DML statements that modify a table with an auto_increment column based on
+    rows selected from a table are unsafe as the order in which the rows are
+    fetched fron the select tables cannot be determined and may differ on
+    master and slave.
+    */
+    if (thd->variables.binlog_format != BINLOG_FORMAT_ROW && tables &&
+        has_write_table_with_auto_increment_and_select(tables))
+      thd->lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_WRITE_AUTOINC_SELECT);
+    /* Todo: merge all has_write_table_auto_inc with decide_logging_format */
+    if (thd->variables.binlog_format != BINLOG_FORMAT_ROW && tables)
+    {
+      if (has_write_table_auto_increment_not_first_in_pk(tables))
+        thd->lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_AUTOINC_NOT_FIRST);
+    }
+
+    /* 
+     INSERT...ON DUPLICATE KEY UPDATE on a table with more than one unique keys
+     can be unsafe.
+     */
+    uint unique_keys= 0;
+    for (TABLE_LIST *query_table= tables; query_table && unique_keys <= 1;
+         query_table= query_table->next_global)
+      if(query_table->table)
+      {
+        uint keys= query_table->table->s->keys, i= 0;
+        unique_keys= 0;
+        for (KEY* keyinfo= query_table->table->s->key_info;
+             i < keys && unique_keys <= 1; i++, keyinfo++)
+        {
+          if (keyinfo->flags & HA_NOSAME)
+            unique_keys++;
+        }
+        if (!query_table->placeholder() &&
+            query_table->lock_type >= TL_WRITE_ALLOW_WRITE &&
+            unique_keys > 1 && thd->lex->sql_command == SQLCOM_INSERT &&
+            /* Duplicate key update is not supported by INSERT DELAYED */
+            thd->command != COM_DELAYED_INSERT &&
+            thd->lex->duplicates == DUP_UPDATE)
+          thd->lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_INSERT_TWO_KEYS);
+      }
+ 
     /* We have to emulate LOCK TABLES if we are statement needs prelocking. */
     if (thd->lex->requires_prelocking())
     {
+
       /*
         A query that modifies autoinc column in sub-statement can make the 
         master and slave inconsistent.
@@ -5947,17 +6016,27 @@ TABLE *open_table_uncached(THD *thd, const char *path, const char *db,
 }
 
 
-bool rm_temporary_table(handlerton *base, char *path)
+/**
+  Delete a temporary table.
+
+  @param base  Handlerton for table to be deleted.
+  @param path  Path to the table to be deleted (i.e. path
+               to its .frm without an extension).
+
+  @retval false - success.
+  @retval true  - failure.
+*/
+
+bool rm_temporary_table(handlerton *base, const char *path)
 {
   bool error=0;
   handler *file;
-  char *ext;
+  char frm_path[FN_REFLEN + 1];
   DBUG_ENTER("rm_temporary_table");
 
-  strmov(ext= strend(path), reg_ext);
-  if (mysql_file_delete(key_file_frm, path, MYF(0)))
+  strxnmov(frm_path, sizeof(frm_path) - 1, path, reg_ext, NullS);
+  if (mysql_file_delete(key_file_frm, frm_path, MYF(0)))
     error=1; /* purecov: inspected */
-  *ext= 0;				// remove extension
   file= get_new_handler((TABLE_SHARE*) 0, current_thd->mem_root, base);
   if (file && file->ha_delete_table(path))
   {
@@ -7836,7 +7915,8 @@ bool setup_fields(THD *thd, Item **ref_pointer_array,
   thd->mark_used_columns= mark_used_columns;
   DBUG_PRINT("info", ("thd->mark_used_columns: %d", thd->mark_used_columns));
   if (allow_sum_func)
-    thd->lex->allow_sum_func|= 1 << thd->lex->current_select->nest_level;
+    thd->lex->allow_sum_func|=
+      (nesting_map)1 << thd->lex->current_select->nest_level;
   thd->where= THD::DEFAULT_WHERE;
   save_is_item_list_lookup= thd->lex->current_select->is_item_list_lookup;
   thd->lex->current_select->is_item_list_lookup= 0;
@@ -8896,7 +8976,7 @@ void tdc_remove_table(THD *thd, enum_tdc_remove_table_type remove_type,
               thd->mdl_context.is_lock_owner(MDL_key::TABLE, db, table_name,
                                              MDL_EXCLUSIVE));
 
-  key_length=(uint) (strmov(strmov(key,db)+1,table_name)-key)+1;
+  key_length= create_table_def_key(key, db, table_name);
 
   if ((share= (TABLE_SHARE*) my_hash_search(&table_def_cache,(uchar*) key,
                                             key_length)))
@@ -9009,12 +9089,14 @@ open_new_frm(THD *thd, TABLE_SHARE *share, const char *alias,
 {
   LEX_STRING pathstr;
   File_parser *parser;
-  char path[FN_REFLEN];
+  char path[FN_REFLEN+1];
   DBUG_ENTER("open_new_frm");
 
   /* Create path with extension */
-  pathstr.length= (uint) (strxmov(path, share->normalized_path.str, reg_ext,
-                                  NullS)- path);
+  pathstr.length= (uint) (strxnmov(path, sizeof(path) - 1,
+                                   share->normalized_path.str,
+                                   reg_ext,
+                                   NullS) - path);
   pathstr.str=    path;
 
   if ((parser= sql_parse_prepare(&pathstr, mem_root, 1)))
@@ -9079,6 +9161,67 @@ has_write_table_with_auto_increment(TABLE_LIST *tables)
 
   return 0;
 }
+
+/*
+   checks if we have select tables in the table list and write tables
+   with auto-increment column.
+
+  SYNOPSIS
+   has_two_write_locked_tables_with_auto_increment_and_select
+      tables        Table list
+
+  RETURN VALUES
+
+   -true if the table list has atleast one table with auto-increment column
+
+
+         and atleast one table to select from.
+   -false otherwise
+*/
+
+static bool
+has_write_table_with_auto_increment_and_select(TABLE_LIST *tables)
+{
+  bool has_select= false;
+  bool has_auto_increment_tables = has_write_table_with_auto_increment(tables);
+  for(TABLE_LIST *table= tables; table; table= table->next_global)
+  {
+     if (!table->placeholder() &&
+        (table->lock_type <= TL_READ_NO_INSERT))
+      {
+        has_select= true;
+        break;
+      }
+  }
+  return(has_select && has_auto_increment_tables);
+}
+
+/*
+  Tells if there is a table whose auto_increment column is a part
+  of a compound primary key while is not the first column in
+  the table definition.
+
+  @param tables Table list
+
+  @return true if the table exists, fais if does not.
+*/
+
+static bool
+has_write_table_auto_increment_not_first_in_pk(TABLE_LIST *tables)
+{
+  for (TABLE_LIST *table= tables; table; table= table->next_global)
+  {
+    /* we must do preliminary checks as table->table may be NULL */
+    if (!table->placeholder() &&
+        table->table->found_next_number_field &&
+        (table->lock_type >= TL_WRITE_ALLOW_WRITE)
+        && table->table->s->next_number_keypart != 0)
+      return 1;
+  }
+
+  return 0;
+}
+
 
 
 /*

@@ -919,7 +919,7 @@ void _db_pop_()
       } while (0)
 #define str_to_buf(S)    do {                   \
         char_to_buf(',');                       \
-        buf=strnmov(buf, (S), len+1);           \
+        buf=strnmov(buf, (S), end-buf);         \
         if (buf >= end) goto overflow;          \
       } while (0)
 #define list_to_buf(l, f)  do {                 \
@@ -1179,7 +1179,7 @@ void _db_return_(uint _line_, struct _db_stack_frame_ *_stack_frame_)
         pthread_mutex_lock(&THR_LOCK_dbug);
       DoPrefix(cs, _line_);
       Indent(cs, cs->level);
-      (void) fprintf(cs->stack->out_file, "<%s\n", cs->func);
+      (void) fprintf(cs->stack->out_file, "<%s %u\n", cs->func, _line_);
       DbugFlush(cs);
     }
   }

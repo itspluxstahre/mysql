@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -450,6 +450,15 @@ int mysql_update(THD *thd,
   { // Check if we are modifying a key that we are used to search with:
     used_key_is_modified= is_key_used(table, used_index, table->write_set);
   }
+  else if (select && select->quick)
+  {
+    /*
+      select->quick != NULL and used_index == MAX_KEY happens for index
+      merge and should be handled in a different way.
+    */
+    used_key_is_modified= (!select->quick->unique_key_range() &&
+                           select->quick->is_keys_used(table->write_set));
+  }
 
 #ifdef WITH_PARTITION_STORAGE_ENGINE
   if (used_key_is_modified || order ||
@@ -514,7 +523,10 @@ int mysql_update(THD *thd,
 
       /* If quick select is used, initialize it before retrieving rows. */
       if (select && select->quick && select->quick->reset())
+      {
+        close_cached_file(&tempfile);
         goto err;
+      }
       table->file->try_semi_consistent_read(1);
 
       /*
@@ -543,7 +555,10 @@ int mysql_update(THD *thd,
         if (select && select->skip_record(thd, &skip_record))
         {
           error= 1;
-          table->file->unlock_row();
+          /*
+            Don't try unlocking the row if skip_record reported an error since
+            in this case the transaction might have been rolled back already.
+          */
           break;
         }
         if (!skip_record)
@@ -789,8 +804,17 @@ int mysql_update(THD *thd,
         }
       }
     }
-    else
+    /*
+      Don't try unlocking the row if skip_record reported an error since in
+      this case the transaction might have been rolled back already.
+    */
+    else if (!thd->is_error())
       table->file->unlock_row();
+    else
+    {
+      error= 1;
+      break;
+    }
     thd->warning_info->inc_current_row_for_warning();
     if (thd->is_error())
     {
@@ -900,8 +924,10 @@ int mysql_update(THD *thd,
     my_snprintf(buff, sizeof(buff), ER(ER_UPDATE_INFO), (ulong) found,
                 (ulong) updated,
                 (ulong) thd->warning_info->statement_warn_count());
-    my_ok(thd, (thd->client_capabilities & CLIENT_FOUND_ROWS) ? found : updated,
-          id, buff);
+    ha_rows row_count=
+      (thd->client_capabilities & CLIENT_FOUND_ROWS) ? found : updated;
+    my_ok(thd, row_count, id, buff);
+    thd->updated_row_count += row_count;
     DBUG_PRINT("info",("%ld records updated", (long) updated));
   }
   thd->count_cuted_fields= CHECK_FIELD_IGNORE;		/* calc cuted fields */
@@ -2029,7 +2055,8 @@ int multi_update::do_updates()
     org_updated= updated;
     tmp_table= tmp_tables[cur_table->shared];
     tmp_table->file->extra(HA_EXTRA_CACHE);	// Change to read cache
-    (void) table->file->ha_rnd_init(0);
+    if ((local_error= table->file->ha_rnd_init(0)))
+      goto err;
     table->file->extra(HA_EXTRA_NO_CACHE);
 
     check_opt_it.rewind();
@@ -2154,11 +2181,16 @@ err:
   }
 
 err2:
-  (void) table->file->ha_rnd_end();
-  (void) tmp_table->file->ha_rnd_end();
+  if (table->file->inited)
+    (void) table->file->ha_rnd_end();
+  if (tmp_table->file->inited)
+    (void) tmp_table->file->ha_rnd_end();
   check_opt_it.rewind();
   while (TABLE *tbl= check_opt_it++)
-      tbl->file->ha_rnd_end();
+  {
+    if (tbl->file->inited)
+      (void) tbl->file->ha_rnd_end();
+  }
 
   if (updated != org_updated)
   {
@@ -2252,7 +2284,9 @@ bool multi_update::send_eof()
     thd->first_successful_insert_id_in_prev_stmt : 0;
   my_snprintf(buff, sizeof(buff), ER(ER_UPDATE_INFO),
               (ulong) found, (ulong) updated, (ulong) thd->cuted_fields);
-  ::my_ok(thd, (thd->client_capabilities & CLIENT_FOUND_ROWS) ? found : updated,
-          id, buff);
+  ha_rows row_count=
+    (thd->client_capabilities & CLIENT_FOUND_ROWS) ? found : updated;
+  ::my_ok(thd, row_count, id, buff);
+  thd->updated_row_count+= row_count;
   DBUG_RETURN(FALSE);
 }

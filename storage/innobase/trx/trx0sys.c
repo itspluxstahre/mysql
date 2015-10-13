@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2011, Innobase Oy. All Rights Reserved.
+Copyright (c) 1996, 2013, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -76,12 +76,17 @@ UNIV_INTERN ibool	trx_sys_multiple_tablespace_format	= FALSE;
 file name and position here. */
 /* @{ */
 /** Master binlog file name */
-UNIV_INTERN char	trx_sys_mysql_master_log_name[TRX_SYS_MYSQL_LOG_NAME_LEN];
+UNIV_INTERN char	trx_sys_mysql_master_log_name[TRX_SYS_MYSQL_MASTER_LOG_NAME_LEN];
 /** Master binlog file position.  We have successfully got the updates
 up to this position.  -1 means that no crash recovery was needed, or
 there was no master log position info inside InnoDB.*/
 UNIV_INTERN ib_int64_t	trx_sys_mysql_master_log_pos	= -1;
 /* @} */
+
+UNIV_INTERN char	trx_sys_css_mysql_master_log_name[TRX_SYS_MYSQL_MASTER_LOG_NAME_LEN];
+UNIV_INTERN ib_int64_t	trx_sys_css_mysql_master_log_pos	= -1;
+UNIV_INTERN char	trx_sys_css_mysql_relay_log_name[TRX_SYS_MYSQL_MASTER_LOG_NAME_LEN];
+UNIV_INTERN ib_int64_t	trx_sys_css_mysql_relay_log_pos	= -1;
 
 /** If this MySQL server uses binary logging, after InnoDB has been inited
 and if it has done a crash recovery, we store the binlog file name and position
@@ -134,12 +139,12 @@ UNIV_INTERN mysql_pfs_key_t	trx_doublewrite_mutex_key;
 UNIV_INTERN mysql_pfs_key_t	file_format_max_mutex_key;
 #endif /* UNIV_PFS_MUTEX */
 
+#ifndef UNIV_HOTBACKUP
 #ifdef UNIV_DEBUG
 /* Flag to control TRX_RSEG_N_SLOTS behavior debugging. */
-uint		trx_rseg_n_slots_debug = 0;
+UNIV_INTERN uint	trx_rseg_n_slots_debug = 0;
 #endif
 
-#ifndef UNIV_HOTBACKUP
 /** This is used to track the maximum file format id known to InnoDB. It's
 updated via SET GLOBAL innodb_file_format_max = 'x' or when we open
 or create a table. */
@@ -255,9 +260,7 @@ trx_sys_create_doublewrite_buf(void)
 {
 	buf_block_t*	block;
 	buf_block_t*	block2;
-#ifdef UNIV_SYNC_DEBUG
 	buf_block_t*	new_block;
-#endif /* UNIV_SYNC_DEBUG */
 	byte*	doublewrite;
 	byte*	fseg_header;
 	ulint	page_no;
@@ -336,10 +339,9 @@ start_again:
 
 		for (i = 0; i < 2 * TRX_SYS_DOUBLEWRITE_BLOCK_SIZE
 			     + FSP_EXTENT_SIZE / 2; i++) {
-			page_no = fseg_alloc_free_page(fseg_header,
-						       prev_page_no + 1,
-						       FSP_UP, &mtr);
-			if (page_no == FIL_NULL) {
+			new_block = fseg_alloc_free_page(
+				fseg_header, prev_page_no + 1, FSP_UP, &mtr);
+			if (new_block == NULL) {
 				fprintf(stderr,
 					"InnoDB: Cannot create doublewrite"
 					" buffer: you must\n"
@@ -360,13 +362,8 @@ start_again:
 			the page position in the tablespace, then the page
 			has not been written to in doublewrite. */
 
-#ifdef UNIV_SYNC_DEBUG
-			new_block =
-#endif /* UNIV_SYNC_DEBUG */
-			buf_page_get(TRX_SYS_SPACE, 0, page_no,
-				     RW_X_LATCH, &mtr);
-			buf_block_dbg_add_level(new_block,
-						SYNC_NO_ORDER_CHECK);
+			ut_ad(rw_lock_get_x_lock_count(&new_block->lock) == 1);
+			page_no = buf_block_get_page_no(new_block);
 
 			if (i == FSP_EXTENT_SIZE / 2) {
 				ut_a(page_no == FSP_EXTENT_SIZE);
@@ -572,7 +569,8 @@ trx_sys_doublewrite_init_or_restore_pages(
 			/* Check if the page is corrupt */
 
 			if (UNIV_UNLIKELY
-			    (buf_page_is_corrupted(read_buf, zip_size))) {
+			    (buf_page_is_corrupted(
+				    TRUE, read_buf, zip_size))) {
 
 				fprintf(stderr,
 					"InnoDB: Warning: database page"
@@ -583,15 +581,20 @@ trx_sys_doublewrite_init_or_restore_pages(
 					" the doublewrite buffer.\n",
 					(ulong) space_id, (ulong) page_no);
 
-				if (buf_page_is_corrupted(page, zip_size)) {
+				if (buf_page_is_corrupted(
+					    TRUE, page, zip_size)) {
 					fprintf(stderr,
 						"InnoDB: Dump of the page:\n");
-					buf_page_print(read_buf, zip_size);
+					buf_page_print(
+						read_buf, zip_size,
+						BUF_PAGE_PRINT_NO_CRASH);
 					fprintf(stderr,
 						"InnoDB: Dump of"
 						" corresponding page"
 						" in doublewrite buffer:\n");
-					buf_page_print(page, zip_size);
+					buf_page_print(
+						page, zip_size,
+						BUF_PAGE_PRINT_NO_CRASH);
 
 					fprintf(stderr,
 						"InnoDB: Also the page in the"
@@ -605,7 +608,7 @@ trx_sys_doublewrite_init_or_restore_pages(
 						"InnoDB: option:\n"
 						"InnoDB:"
 						" innodb_force_recovery=6\n");
-					exit(1);
+					ut_error;
 				}
 
 				/* Write the good page from the
@@ -689,22 +692,24 @@ UNIV_INTERN
 void
 trx_sys_update_mysql_binlog_offset(
 /*===============================*/
-	const char*	file_name,/*!< in: MySQL log file name */
+	trx_sysf_t*	sys_header,
+	const char*	file_name_in,/*!< in: MySQL log file name */
 	ib_int64_t	offset,	/*!< in: position in that log file */
 	ulint		field,	/*!< in: offset of the MySQL log info field in
 				the trx sys header */
 	mtr_t*		mtr)	/*!< in: mtr */
 {
-	trx_sysf_t*	sys_header;
+	const char*	file_name;
 
-	if (ut_strlen(file_name) >= TRX_SYS_MYSQL_LOG_NAME_LEN) {
+	if (ut_strlen(file_name_in) >= TRX_SYS_MYSQL_MASTER_LOG_NAME_LEN) {
 
 		/* We cannot fit the name to the 512 bytes we have reserved */
+		/* -> To store relay log file information, file_name must fit to the 480 bytes */
 
-		return;
+		file_name = "";
+	} else {
+		file_name = file_name_in;
 	}
-
-	sys_header = trx_sysf_get(mtr);
 
 	if (mach_read_from_4(sys_header + field
 			     + TRX_SYS_MYSQL_LOG_MAGIC_N_FLD)
@@ -792,6 +797,28 @@ trx_sys_print_mysql_binlog_offset(void)
 }
 
 /*****************************************************************//**
+Reads the log coordinates at the given offset in the trx sys header. */
+static
+void
+trx_sys_read_log_pos(
+/*=================*/
+	const trx_sysf_t*	sys_header,	/*!< in: the trx sys header */
+	uint			header_offset,	/*!< in: coord offset in the
+						header */
+	char*			log_fn,		/*!< out: the log file name */
+	ib_int64_t*		log_pos)	/*!< out: the log poistion */
+{
+	ut_memcpy(log_fn, sys_header + header_offset + TRX_SYS_MYSQL_LOG_NAME,
+		  TRX_SYS_MYSQL_MASTER_LOG_NAME_LEN);
+
+	*log_pos =
+		(((ib_int64_t)mach_read_from_4(sys_header + header_offset
+				+ TRX_SYS_MYSQL_LOG_OFFSET_HIGH)) << 32)
+		+ mach_read_from_4(sys_header + header_offset
+				   + TRX_SYS_MYSQL_LOG_OFFSET_LOW);
+}
+
+/*****************************************************************//**
 Prints to stderr the MySQL master log offset info in the trx system header if
 the magic number shows it valid. */
 UNIV_INTERN
@@ -808,6 +835,61 @@ trx_sys_print_mysql_master_log_pos(void)
 
 	if (mach_read_from_4(sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
 			     + TRX_SYS_MYSQL_LOG_MAGIC_N_FLD)
+	    == TRX_SYS_MYSQL_LOG_MAGIC_N) {
+
+		/* Copy the master log position info to global variables we can
+		use in ha_innobase.cc to initialize glob_mi to right values */
+		trx_sys_read_log_pos(sys_header, TRX_SYS_MYSQL_MASTER_LOG_INFO,
+				     trx_sys_mysql_master_log_name,
+				     &trx_sys_mysql_master_log_pos);
+	}
+
+	if (mach_read_from_4(sys_header + TRX_SYS_CSS_MYSQL_MASTER_LOG_INFO
+			     + TRX_SYS_MYSQL_LOG_MAGIC_N_FLD)
+	    == TRX_SYS_MYSQL_LOG_MAGIC_N) {
+		trx_sys_read_log_pos(sys_header, TRX_SYS_CSS_MYSQL_MASTER_LOG_INFO,
+				     trx_sys_css_mysql_master_log_name,
+				     &trx_sys_css_mysql_master_log_pos);
+
+
+		trx_sys_read_log_pos(sys_header, TRX_SYS_CSS_MYSQL_RELAY_LOG_INFO,
+				     trx_sys_css_mysql_relay_log_name,
+				     &trx_sys_css_mysql_relay_log_pos);
+
+		fprintf(stderr,
+			"InnoDB: In a MySQL replication slave the last"
+			" master binlog file\n"
+			"InnoDB: position %llu, file name %s\n",
+			trx_sys_css_mysql_master_log_pos,
+			trx_sys_css_mysql_master_log_name);
+
+		fprintf(stderr,
+			"InnoDB: and relay log file\n"
+			"InnoDB: position %llu, file name %s\n",
+			trx_sys_css_mysql_relay_log_pos,
+			trx_sys_css_mysql_relay_log_name);
+	}
+	mtr_commit(&mtr);
+}
+
+/*****************************************************************//**
+Prints to stderr the MySQL master log offset info in the trx system header
+COMMIT set of fields if the magic number shows it valid and stores it
+in global variables. */
+UNIV_INTERN
+void
+trx_sys_print_committed_mysql_master_log_pos(void)
+/*==============================================*/
+{
+	trx_sysf_t*	sys_header;
+	mtr_t		mtr;
+
+	mtr_start(&mtr);
+
+	sys_header = trx_sysf_get(&mtr);
+
+	if (mach_read_from_4(sys_header + TRX_SYS_CSS_COMMIT_MASTER_LOG_INFO
+			     + TRX_SYS_MYSQL_LOG_MAGIC_N_FLD)
 	    != TRX_SYS_MYSQL_LOG_MAGIC_N) {
 
 		mtr_commit(&mtr);
@@ -815,33 +897,71 @@ trx_sys_print_mysql_master_log_pos(void)
 		return;
 	}
 
+	/* Copy the master log position info to global variables we can
+	   use in ha_innobase.cc to initialize glob_mi to right values */
+	trx_sys_read_log_pos(sys_header, TRX_SYS_CSS_COMMIT_MASTER_LOG_INFO,
+			     trx_sys_css_mysql_master_log_name,
+			     &trx_sys_css_mysql_master_log_pos);
+
+	trx_sys_read_log_pos(sys_header, TRX_SYS_CSS_COMMIT_RELAY_LOG_INFO,
+			     trx_sys_css_mysql_relay_log_name,
+			     &trx_sys_css_mysql_relay_log_pos);
+
+	mtr_commit(&mtr);
+
 	fprintf(stderr,
 		"InnoDB: In a MySQL replication slave the last"
 		" master binlog file\n"
-		"InnoDB: position %lu %lu, file name %s\n",
-		(ulong) mach_read_from_4(sys_header
-					 + TRX_SYS_MYSQL_MASTER_LOG_INFO
-					 + TRX_SYS_MYSQL_LOG_OFFSET_HIGH),
-		(ulong) mach_read_from_4(sys_header
-					 + TRX_SYS_MYSQL_MASTER_LOG_INFO
-					 + TRX_SYS_MYSQL_LOG_OFFSET_LOW),
-		sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
-		+ TRX_SYS_MYSQL_LOG_NAME);
-	/* Copy the master log position info to global variables we can
-	use in ha_innobase.cc to initialize glob_mi to right values */
+		"InnoDB: position %llu, file name %s\n",
+		trx_sys_css_mysql_master_log_pos,
+		trx_sys_css_mysql_master_log_name);
 
-	ut_memcpy(trx_sys_mysql_master_log_name,
+	fprintf(stderr,
+		"InnoDB: and relay log file\n"
+		"InnoDB: position %llu, file name %s\n",
+		trx_sys_css_mysql_relay_log_pos,
+		trx_sys_css_mysql_relay_log_name);
+}
+
+/*****************************************************************//**
+Get the MySQL master log offset info in the trx system header if
+the magic number shows it is valid. */
+UNIV_INTERN
+void
+trx_sys_get_mysql_master_log_pos(
+/*=============================*/
+	char*		log_name, /*!< out: Master binlog file name. */
+	ib_int64_t*	log_pos)  /*!< out: Master binlog file position. */
+{
+	trx_sysf_t*	sys_header;
+	mtr_t		mtr;
+	ib_int64_t	high, low;
+
+	mtr_start(&mtr);
+
+	sys_header = trx_sysf_get(&mtr);
+
+	if (mach_read_from_4(sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
+			     + TRX_SYS_MYSQL_LOG_MAGIC_N_FLD)
+	    != TRX_SYS_MYSQL_LOG_MAGIC_N) {
+
+		mtr_commit(&mtr);
+
+		return;
+	}
+
+	high = mach_read_from_4(sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
+				+ TRX_SYS_MYSQL_LOG_OFFSET_HIGH);
+	low  = mach_read_from_4(sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
+				+ TRX_SYS_MYSQL_LOG_OFFSET_LOW);
+
+	*log_pos = (high << 32) + low;
+
+	ut_memcpy(log_name,
 		  sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
 		  + TRX_SYS_MYSQL_LOG_NAME,
 		  TRX_SYS_MYSQL_LOG_NAME_LEN);
 
-	trx_sys_mysql_master_log_pos
-		= (((ib_int64_t) mach_read_from_4(
-			    sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
-			    + TRX_SYS_MYSQL_LOG_OFFSET_HIGH)) << 32)
-		+ ((ib_int64_t) mach_read_from_4(
-			   sys_header + TRX_SYS_MYSQL_MASTER_LOG_INFO
-			   + TRX_SYS_MYSQL_LOG_OFFSET_LOW));
 	mtr_commit(&mtr);
 }
 

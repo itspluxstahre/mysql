@@ -1,5 +1,6 @@
 /* Copyright (C) 2007 Google Inc.
    Copyright (C) 2008 MySQL AB
+   Use is subject to license terms
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -26,5 +27,5 @@ const unsigned long Trace::kTraceDetail   = 0x0010;
 const unsigned long Trace::kTraceNetWait  = 0x0020;
 const unsigned long Trace::kTraceFunction = 0x0040;
 
-const char  ReplSemiSyncBase::kSyncHeader[2] =
+const unsigned char  ReplSemiSyncBase::kSyncHeader[2] =
   {ReplSemiSyncBase::kPacketMagicNum, 0};

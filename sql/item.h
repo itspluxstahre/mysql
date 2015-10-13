@@ -1,7 +1,7 @@
 #ifndef ITEM_INCLUDED
 #define ITEM_INCLUDED
 
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2015, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -14,7 +14,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 
 #ifdef USE_PRAGMA_INTERFACE
@@ -1249,6 +1249,11 @@ public:
     Return TRUE if the item points to a column of an outer-joined table.
   */
   virtual bool is_outer_field() const { DBUG_ASSERT(fixed); return FALSE; }
+
+  /**
+    Checks if this item or any of its decendents contains a subquery.
+  */
+  virtual bool has_subquery() const { return with_subselect; }
 };
 
 
@@ -1948,7 +1953,7 @@ public:
   */
   void (*set_param_func)(Item_param *param, uchar **pos, ulong len);
 
-  const String *query_val_str(String *str) const;
+  const String *query_val_str(THD *thd, String *str) const;
 
   bool convert_str_value(THD *thd);
 
@@ -2528,6 +2533,10 @@ public:
   Field *get_tmp_table_field()
   { return result_field ? result_field : (*ref)->get_tmp_table_field(); }
   Item *get_tmp_table_item(THD *thd);
+  bool const_item() const
+  {
+    return (*ref)->const_item() && (used_tables() == 0);
+  }
   table_map used_tables() const		
   {
     return depended_from ? OUTER_REF_TABLE_BIT : (*ref)->used_tables(); 
@@ -2603,6 +2612,13 @@ public:
     return (*ref)->is_outer_field();
   }
 
+  /**
+    Checks if the item tree that ref points to contains a subquery.
+  */
+  virtual bool has_subquery() const 
+  { 
+    return (*ref)->has_subquery();
+  }
 };
 
 
@@ -2676,6 +2692,7 @@ public:
   resolved is a grouping one. After it has been fixed the ref field will point
   to either an Item_ref or an Item_direct_ref object which will be used to
   access the field.
+  The ref field may also point to an Item_field instance.
   See also comments for the fix_inner_refs() and the
   Item_field::fix_outer_field() functions.
 */
@@ -2719,6 +2736,8 @@ public:
   {
     return (*ref)->const_item() ? 0 : OUTER_REF_TABLE_BIT;
   }
+  table_map not_null_tables() const { return 0; }
+
   virtual Ref_Type ref_type() { return OUTER_REF; }
 };
 
@@ -2801,6 +2820,7 @@ public:
 #include "item_timefunc.h"
 #include "item_subselect.h"
 #include "item_xmlfunc.h"
+#include "item_inetfunc.h"
 #include "item_create.h"
 #endif
 
@@ -3270,7 +3290,11 @@ public:
     collation.set(item->collation);
     unsigned_flag= item->unsigned_flag;
     if (item->type() == FIELD_ITEM)
+    {
       cached_field= ((Item_field *)item)->field;
+      if (cached_field->table)
+        used_table_map= cached_field->table->map;
+    }
     return 0;
   };
   enum Type type() const { return CACHE_ITEM; }

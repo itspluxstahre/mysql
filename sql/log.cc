@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 
 /**
@@ -38,6 +38,7 @@
 #include "rpl_filter.h"
 #include "rpl_rli.h"
 #include "sql_audit.h"
+#include "set_var.h"            // get_expire_logs_seconds
 
 #include <my_dir.h>
 #include <stdarg.h>
@@ -50,6 +51,7 @@
 #include "sql_plugin.h"
 #include "rpl_handler.h"
 #include "debug_sync.h"
+#include <time.h>              // ctime
 /* max size of the log message */
 #define MAX_LOG_BUFFER_SIZE 1024
 #define MAX_TIME_SIZE 32
@@ -300,7 +302,7 @@ public:
       before_stmt_pos= MY_OFF_T_UNDEF;
   }
 
-  void set_binlog_cache_info(ulong param_max_binlog_cache_size,
+  void set_binlog_cache_info(my_off_t param_max_binlog_cache_size,
                              ulong *param_ptr_binlog_cache_use,
                              ulong *param_ptr_binlog_cache_disk_use)
   {
@@ -377,7 +379,7 @@ private:
     is configured. This corresponds to either
       . max_binlog_cache_size or max_binlog_stmt_cache_size.
   */
-  ulong saved_max_binlog_cache_size;
+  my_off_t saved_max_binlog_cache_size;
 
   /*
     Stores a pointer to the status variable that keeps track of the in-memory 
@@ -415,8 +417,8 @@ private:
 
 class binlog_cache_mngr {
 public:
-  binlog_cache_mngr(ulong param_max_binlog_stmt_cache_size,
-                    ulong param_max_binlog_cache_size,
+  binlog_cache_mngr(my_off_t param_max_binlog_stmt_cache_size,
+                    my_off_t param_max_binlog_cache_size,
                     ulong *param_ptr_binlog_stmt_cache_use,
                     ulong *param_ptr_binlog_stmt_cache_disk_use,
                     ulong *param_ptr_binlog_cache_use,
@@ -552,7 +554,7 @@ void Log_to_csv_event_handler::cleanup()
 
 bool Log_to_csv_event_handler::
   log_general(THD *thd, time_t event_time, const char *user_host,
-              uint user_host_len, int thread_id,
+              uint user_host_len, my_thread_id thread_id,
               const char *command_type, uint command_type_len,
               const char *sql_text, uint sql_text_len,
               CHARSET_INFO *client_cs)
@@ -958,7 +960,7 @@ bool Log_to_file_event_handler::
 
 bool Log_to_file_event_handler::
   log_general(THD *thd, time_t event_time, const char *user_host,
-              uint user_host_len, int thread_id,
+              uint user_host_len, my_thread_id thread_id,
               const char *command_type, uint command_type_len,
               const char *sql_text, uint sql_text_len,
               CHARSET_INFO *client_cs)
@@ -1001,6 +1003,13 @@ void Log_to_file_event_handler::flush()
   /* reopen log files */
   if (opt_log)
     mysql_log.reopen_file();
+  if (opt_slow_log)
+    mysql_slow_log.reopen_file();
+}
+
+void Log_to_file_event_handler::flush_slow_log()
+{
+  /* reopen slow log file */
   if (opt_slow_log)
     mysql_slow_log.reopen_file();
 }
@@ -1217,9 +1226,11 @@ bool LOGGER::slow_log_print(THD *thd, const char *query, uint query_length,
     user_host_len= (strxnmov(user_host_buff, MAX_USER_HOST_SIZE,
                              sctx->priv_user ? sctx->priv_user : "", "[",
                              sctx->user ? sctx->user : "", "] @ ",
-                             sctx->host ? sctx->host : "", " [",
-                             sctx->ip ? sctx->ip : "", "]", NullS) -
-                    user_host_buff);
+                             sctx->get_host()->length() ?
+                             sctx->get_host()->ptr() : "", " [",
+                             sctx->get_ip()->length() ? sctx->get_ip()->ptr() :
+                             "", "]", NullS) - user_host_buff);
+
 
     current_time= my_time_possible_from_micro(current_utime);
     if (thd->start_utime)
@@ -2307,6 +2318,7 @@ bool MYSQL_LOG::open(
                      const char *new_name, enum cache_type io_cache_type_arg)
 {
   char buff[FN_REFLEN];
+  MY_STAT f_stat;
   File file= -1;
   int open_flags= O_CREAT | O_BINARY;
   DBUG_ENTER("MYSQL_LOG::open");
@@ -2322,6 +2334,10 @@ bool MYSQL_LOG::open(
 
   if (init_and_set_log_file_name(name, new_name,
                                  log_type_arg, io_cache_type_arg))
+    goto err;
+
+  /* File is regular writable file */
+  if (my_stat(log_file_name, &f_stat, MYF(0)) && !MY_S_ISREG(f_stat.st_mode))
     goto err;
 
   if (io_cache_type == SEQ_READ_APPEND)
@@ -2554,7 +2570,7 @@ void MYSQL_QUERY_LOG::reopen_file()
 */
 
 bool MYSQL_QUERY_LOG::write(time_t event_time, const char *user_host,
-                            uint user_host_len, int thread_id,
+                            uint user_host_len, my_thread_id thread_id,
                             const char *command_type, uint command_type_len,
                             const char *sql_text, uint sql_text_len)
 {
@@ -2592,8 +2608,7 @@ bool MYSQL_QUERY_LOG::write(time_t event_time, const char *user_host,
         if (my_b_write(&log_file, (uchar*) "\t\t" ,2) < 0)
           goto err;
 
-      /* command_type, thread_id */
-      length= my_snprintf(buff, 32, "%5ld ", (long) thread_id);
+    length= my_snprintf(buff, 32, "%5lu ", thread_id);
 
     if (my_b_write(&log_file, (uchar*) buff, length))
       goto err;
@@ -2678,8 +2693,10 @@ bool MYSQL_QUERY_LOG::write(THD *thd, time_t current_time,
     int tmp_errno= 0;
     char buff[80], *end;
     char query_time_buff[22+7], lock_time_buff[22+7];
-    uint buff_len;
+    uint buff_len, sql_errno;
     end= buff;
+
+    sql_errno= thd->is_error() ? thd->stmt_da->sql_errno() : 0;
 
     if (!(specialflag & SPECIAL_SHORT_LOG_FORMAT))
     {
@@ -2711,11 +2728,13 @@ bool MYSQL_QUERY_LOG::write(THD *thd, time_t current_time,
     sprintf(query_time_buff, "%.6f", ulonglong2double(query_utime)/1000000.0);
     sprintf(lock_time_buff,  "%.6f", ulonglong2double(lock_utime)/1000000.0);
     if (my_b_printf(&log_file,
-                    "# Query_time: %s  Lock_time: %s"
-                    " Rows_sent: %lu  Rows_examined: %lu\n",
+                    "# Query_time: %s  Lock_time: %s "
+                    " Rows_sent: %lu  Rows_examined: %lu "
+                    " Error_code: %u\n",
                     query_time_buff, lock_time_buff,
                     (ulong) thd->sent_row_count,
-                    (ulong) thd->examined_row_count) == (uint) -1)
+                    (ulong) thd->examined_row_count,
+                    sql_errno) == (uint) -1)
       tmp_errno= errno;
     if (thd->db && strcmp(thd->db, db))
     {						// Database changed
@@ -2762,7 +2781,10 @@ bool MYSQL_QUERY_LOG::write(THD *thd, time_t current_time,
     {
       end= strxmov(buff, "# administrator command: ", NullS);
       buff_len= (ulong) (end - buff);
-      my_b_write(&log_file, (uchar*) buff, buff_len);
+      DBUG_EXECUTE_IF("simulate_slow_log_write_error",
+                      {DBUG_SET("+d,simulate_file_write_error");});
+      if(my_b_write(&log_file, (uchar*) buff, buff_len))
+        tmp_errno= errno;
     }
     if (my_b_write(&log_file, (uchar*) sql_text, sql_text_len) ||
         my_b_write(&log_file, (uchar*) ";\n",2) ||
@@ -2814,7 +2836,7 @@ const char *MYSQL_LOG::generate_name(const char *log_name,
 MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period)
   :bytes_written(0), prepared_xids(0), file_id(1), open_count(1),
    need_start_event(TRUE),
-   sync_period_ptr(sync_period),
+   sync_period_ptr(sync_period), sync_counter(0),
    is_relay_log(0), signal_cnt(0),
    description_event_for_exec(0), description_event_for_queue(0)
 {
@@ -3410,19 +3432,19 @@ bool MYSQL_BIN_LOG::reset_logs(THD* thd)
   ha_reset_logs(thd);
 
   /*
+    We need to get both locks to be sure that no one is trying to
+    write to the index log file.
+  */
+  mysql_mutex_lock(&LOCK_log);
+  mysql_mutex_lock(&LOCK_index);
+
+  /*
     The following mutex is needed to ensure that no threads call
     'delete thd' as we would then risk missing a 'rollback' from this
     thread. If the transaction involved MyISAM tables, it should go
     into binlog even on rollback.
   */
   mysql_mutex_lock(&LOCK_thread_count);
-
-  /*
-    We need to get both locks to be sure that no one is trying to
-    write to the index log file.
-  */
-  mysql_mutex_lock(&LOCK_log);
-  mysql_mutex_lock(&LOCK_index);
 
   /* Save variables so that we can reopen the log */
   save_name=name;
@@ -3619,8 +3641,6 @@ int MYSQL_BIN_LOG::purge_first_log(Relay_log_info* rli, bool included)
   mysql_mutex_lock(&rli->log_space_lock);
   rli->relay_log.purge_logs(to_purge_if_included, included,
                             0, 0, &rli->log_space_total);
-  // Tell the I/O thread to take the relay_log_space_limit into account
-  rli->ignore_log_space_limit= 0;
   mysql_mutex_unlock(&rli->log_space_lock);
 
   /*
@@ -4418,15 +4438,20 @@ err:
 bool MYSQL_BIN_LOG::flush_and_sync(bool *synced)
 {
   int err=0, fd=log_file.file;
+  Scoped_proc_info state;
+
   if (synced)
     *synced= 0;
   mysql_mutex_assert_owner(&LOCK_log);
+  scoped_proc_info(state, "Flushing the binary log I/O cache");
   if (flush_io_cache(&log_file))
     return 1;
   uint sync_period= get_sync_period();
   if (sync_period && ++sync_counter >= sync_period)
   {
     sync_counter= 0;
+    state.reset();
+    scoped_proc_info(state, "Synchronizing the binary log to disk");
     err= mysql_file_sync(fd, MYF(MY_WME));
     if (synced)
       *synced= 1;
@@ -4734,6 +4759,32 @@ int THD::binlog_write_table_map(TABLE *table, bool is_transactional)
 }
 
 /**
+  Write a table metadata event to the binary log.
+
+  @param table             a pointer to the table.
+  @param is_transactional  @c true indicates a transactional table,
+                           otherwise @c false a non-transactional.
+
+  @return zero on success, nonzero on failure.
+*/
+int THD::binlog_write_table_metadata(TABLE *table, bool is_transactional)
+{
+  DBUG_ENTER("THD::binlog_write_table_metadata");
+
+  DBUG_ASSERT(binlog_table_maps);
+
+  Table_metadata_log_event event(this, table, is_transactional);
+
+  binlog_cache_mngr *const cache_mngr=
+    (binlog_cache_mngr *) thd_get_ha_data(this, binlog_hton);
+
+  IO_CACHE *cache=
+    cache_mngr->get_binlog_cache_log(use_trans_cache(this, is_transactional));
+
+  DBUG_RETURN(event.write(cache));
+}
+
+/**
   This function retrieves a pending row event from a cache which is
   specified through the parameter @c is_transactional. Respectively, when it
   is @c true, the pending event is returned from the transactional cache.
@@ -4858,16 +4909,25 @@ MYSQL_BIN_LOG::flush_and_set_pending_rows_event(THD *thd,
   if (Rows_log_event* pending= cache_data->pending())
   {
     IO_CACHE *file= &cache_data->cache_log;
+    Scoped_proc_info state(thd);
+
+    scoped_proc_info(state, "Writing a pending event to the binary log cache");
 
     /*
       Write pending event to the cache.
     */
+    DBUG_EXECUTE_IF("simulate_disk_full_at_flush_pending",
+                    {DBUG_SET("+d,simulate_file_write_error");});
     if (pending->write(file))
     {
       set_write_error(thd, is_transactional);
       if (check_write_error(thd) && cache_data &&
           stmt_has_updated_non_trans_table(thd))
         cache_data->set_incident();
+      delete pending;
+      cache_data->set_pending(NULL);
+      DBUG_EXECUTE_IF("simulate_disk_full_at_flush_pending",
+                      {DBUG_SET("-d,simulate_file_write_error");});
       DBUG_RETURN(1);
     }
 
@@ -4890,6 +4950,9 @@ bool MYSQL_BIN_LOG::write(Log_event *event_info)
   DBUG_ENTER("MYSQL_BIN_LOG::write(Log_event *)");
   binlog_cache_data *cache_data= 0;
   bool is_trans_cache= FALSE;
+  Scoped_proc_info state(thd);
+
+  scoped_proc_info(state, "Writing an event to the binary log");
 
   if (thd->binlog_evt_union.do_union)
   {
@@ -4979,6 +5042,8 @@ bool MYSQL_BIN_LOG::write(Log_event *event_info)
                              thd->first_successful_insert_id_in_prev_stmt_for_binlog);
           if (e.write(file))
             goto err;
+          if (file == &log_file)
+            thd->binlog_bytes_written+= e.data_written;
         }
         if (thd->auto_inc_intervals_in_cur_stmt_for_binlog.nb_elements() > 0)
         {
@@ -4990,12 +5055,16 @@ bool MYSQL_BIN_LOG::write(Log_event *event_info)
                              minimum());
           if (e.write(file))
             goto err;
+          if (file == &log_file)
+            thd->binlog_bytes_written+= e.data_written;
         }
         if (thd->rand_used)
         {
           Rand_log_event e(thd,thd->rand_saved_seed1,thd->rand_saved_seed2);
           if (e.write(file))
             goto err;
+          if (file == &log_file)
+            thd->binlog_bytes_written+= e.data_written;
         }
         if (thd->user_var_events.elements)
         {
@@ -5018,6 +5087,8 @@ bool MYSQL_BIN_LOG::write(Log_event *event_info)
                                  flags);
             if (e.write(file))
               goto err;
+            if (file == &log_file)
+              thd->binlog_bytes_written+= e.data_written;
           }
         }
       }
@@ -5029,6 +5100,8 @@ bool MYSQL_BIN_LOG::write(Log_event *event_info)
     if (event_info->write(file) ||
         DBUG_EVALUATE_IF("injecting_fault_writing", 1, 0))
       goto err;
+    if (file == &log_file)
+      thd->binlog_bytes_written+= event_info->data_written;
 
     error= 0;
 err:
@@ -5124,6 +5197,15 @@ bool general_log_print(THD *thd, enum enum_server_command command,
   va_list args;
   uint error= 0;
 
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  if (opt_twitter_audit_log)
+  {
+    va_start(args, format);
+    twitter_audit_print(thd, command, 0, format, args);
+    va_end(args);
+  }
+#endif
+
   /* Print the message to the buffer if we want to log this king of commands */
   if (! logger.log_command(thd, command))
     return FALSE;
@@ -5138,6 +5220,10 @@ bool general_log_print(THD *thd, enum enum_server_command command,
 bool general_log_write(THD *thd, enum enum_server_command command,
                        const char *query, uint query_length)
 {
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  twitter_audit_log(thd, command, query, query_length);
+#endif
+
   /* Write the message to the log if we want to log this king of commands */
   if (logger.log_command(thd, command))
     return logger.general_log_write(thd, command, query, query_length);
@@ -5170,6 +5256,10 @@ int MYSQL_BIN_LOG::rotate(bool force_rotate, bool* check_purge)
 
   if (force_rotate || (my_b_tell(&log_file) >= (my_off_t) max_size))
   {
+    Scoped_proc_info state;
+
+    scoped_proc_info(state, "Rotating the binary log");
+
     if ((error= new_file_without_locking()))
       /** 
          Be conservative... There are possible lost events (eg, 
@@ -5197,10 +5287,11 @@ int MYSQL_BIN_LOG::rotate(bool force_rotate, bool* check_purge)
 void MYSQL_BIN_LOG::purge()
 {
 #ifdef HAVE_REPLICATION
-  if (expire_logs_days)
+  ulong expire_logs_seconds = get_expire_logs_seconds();
+  if (expire_logs_seconds)
   {
     DEBUG_SYNC(current_thd, "at_purge_logs_before_date");
-    time_t purge_time= my_time(0) - expire_logs_days*24*60*60;
+    time_t purge_time= my_time(0) - expire_logs_seconds;
     if (purge_time >= 0)
     {
       purge_logs_before_date(purge_time);
@@ -5263,9 +5354,13 @@ uint MYSQL_BIN_LOG::next_file_id()
     be reset as a READ_CACHE to be able to read the contents from it.
  */
 
-int MYSQL_BIN_LOG::write_cache(IO_CACHE *cache, bool lock_log, bool sync_log)
+int MYSQL_BIN_LOG::write_cache(THD *thd, IO_CACHE *cache,
+                               bool lock_log, bool sync_log)
 {
+  Scoped_proc_info state;
   Mutex_sentry sentry(lock_log ? &LOCK_log : NULL);
+
+  scoped_proc_info(state, "Writing the contents of a cache to the binary log");
 
   if (reinit_io_cache(cache, READ_CACHE, 0, 0, 0))
     return ER_ERROR_ON_WRITE;
@@ -5310,6 +5405,7 @@ int MYSQL_BIN_LOG::write_cache(IO_CACHE *cache, bool lock_log, bool sync_log)
       /* write the first half of the split header */
       if (my_b_write(&log_file, header, carry))
         return ER_ERROR_ON_WRITE;
+      thd->binlog_bytes_written+= carry;
 
       /*
         copy fixed second half of header to cache so the correct
@@ -5378,6 +5474,7 @@ int MYSQL_BIN_LOG::write_cache(IO_CACHE *cache, bool lock_log, bool sync_log)
     /* Write data to the binary log file */
     if (my_b_write(&log_file, cache->read_pos, length))
       return ER_ERROR_ON_WRITE;
+    thd->binlog_bytes_written+= length;
     cache->read_pos=cache->read_end;		// Mark buffer used up
   } while ((length= my_b_fill(cache)));
 
@@ -5485,7 +5582,10 @@ bool MYSQL_BIN_LOG::write(THD *thd, IO_CACHE *cache, Log_event *commit_event,
   if (likely(is_open()))                       // Should always be true
   {
     bool check_purge;
-    
+    Scoped_proc_info state(thd);
+
+    scoped_proc_info(state, "Writing a cached log to the binary log");
+
     mysql_mutex_lock(&LOCK_log);
     /*
       We only bother to write to the binary log if there is anything
@@ -5501,20 +5601,23 @@ bool MYSQL_BIN_LOG::write(THD *thd, IO_CACHE *cache, Log_event *commit_event,
       Query_log_event qinfo(thd, STRING_WITH_LEN("BEGIN"), TRUE, FALSE, TRUE, 0);
       if (qinfo.write(&log_file))
         goto err;
+      thd->binlog_bytes_written+= qinfo.data_written;
       DBUG_EXECUTE_IF("crash_before_writing_xid",
                       {
-                        if ((write_error= write_cache(cache, false, true)))
+                        if ((write_error= write_cache(thd, cache, false, true)))
                           DBUG_PRINT("info", ("error writing binlog cache: %d",
                                                write_error));
                         DBUG_PRINT("info", ("crashing before writing xid"));
                         DBUG_SUICIDE();
                       });
 
-      if ((write_error= write_cache(cache, false, false)))
+      if ((write_error= write_cache(thd, cache, false, false)))
         goto err;
 
       if (commit_event && commit_event->write(&log_file))
         goto err;
+      if (commit_event)
+        thd->binlog_bytes_written+= commit_event->data_written;
 
       if (incident && write_incident(thd, FALSE))
         goto err;
@@ -5893,13 +5996,14 @@ static void print_buffer_to_file(enum loglevel level, const char *buffer,
   localtime_r(&skr, &tm_tmp);
   start=&tm_tmp;
 
-  fprintf(stderr, "%02d%02d%02d %2d:%02d:%02d [%s] %.*s\n",
-          start->tm_year % 100,
-          start->tm_mon+1,
+  fprintf(stderr, "%d-%02d-%02d %02d:%02d:%02d %lu [%s] %.*s\n",
+          start->tm_year + 1900,
+          start->tm_mon + 1,
           start->tm_mday,
           start->tm_hour,
           start->tm_min,
           start->tm_sec,
+          current_pid,
           (level == ERROR_LEVEL ? "ERROR" : level == WARNING_LEVEL ?
            "Warning" : "Note"),
           (int) length, buffer);
@@ -6664,6 +6768,188 @@ err1:
   return 1;
 }
 
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+
+void LOGGER::twitter_log_write(THD *thd, enum enum_server_command command,
+                               const char *query, uint query_length)
+{
+#define DBA_LOG_QUERY_LEN 4096
+  time_t ev_time;
+  struct tm ev_tm;
+  Security_context *sctx= thd->security_ctx;
+  char user_host[MAX_USER_HOST_SIZE + 1] = "null@null";
+  char qry_buf[DBA_LOG_QUERY_LEN + 1] = "\0";
+  char *qry_ptr;
+  bool free_qry_ptr = 0;
+  uint err_code = 0;
+
+  if (command == COM_QUERY && thd->lex)
+  {
+    switch (thd->lex->sql_command)
+    {
+      case SQLCOM_END:
+        /* It reaches here before sql parse phase, ignore */
+        return;
+      case SQLCOM_SELECT:
+      case SQLCOM_SHOW_AUTHORS:
+#ifndef EMBEDDED_LIBRARY
+      case SQLCOM_SHOW_BINLOGS:
+#endif
+      case SQLCOM_SHOW_BINLOG_EVENTS:
+      case SQLCOM_SHOW_CHARSETS:
+      case SQLCOM_SHOW_COLLATIONS:
+      case SQLCOM_SHOW_CONTRIBUTORS:
+      case SQLCOM_SHOW_CREATE:
+      case SQLCOM_SHOW_CREATE_DB:
+      case SQLCOM_SHOW_CREATE_EVENT:
+      case SQLCOM_SHOW_DATABASES:
+      case SQLCOM_SHOW_ENGINE_LOGS:
+      case SQLCOM_SHOW_ENGINE_MUTEX:
+      case SQLCOM_SHOW_ENGINE_STATUS:
+      case SQLCOM_SHOW_ERRORS:
+      case SQLCOM_SHOW_EVENTS:
+      case SQLCOM_SHOW_FIELDS:
+      case SQLCOM_SHOW_GRANTS:
+      case SQLCOM_SHOW_KEYS:
+      case SQLCOM_SHOW_MASTER_STAT:
+      case SQLCOM_SHOW_OPEN_TABLES:
+      case SQLCOM_SHOW_PLUGINS:
+      case SQLCOM_SHOW_PRIVILEGES:
+      case SQLCOM_SHOW_PROCESSLIST:
+      case SQLCOM_SHOW_PROFILE:
+      case SQLCOM_SHOW_PROFILES:
+      case SQLCOM_SHOW_RELAYLOG_EVENTS:
+      case SQLCOM_SHOW_SLAVE_HOSTS:
+      case SQLCOM_SHOW_SLAVE_STAT:
+      case SQLCOM_SHOW_STATUS:
+      case SQLCOM_SHOW_STATUS_PROC:
+      case SQLCOM_SHOW_STATUS_FUNC:
+      case SQLCOM_SHOW_STORAGE_ENGINES:
+      case SQLCOM_SHOW_TABLES:
+      case SQLCOM_SHOW_TABLE_STATUS:
+      case SQLCOM_SHOW_TRIGGERS:
+      case SQLCOM_SHOW_VARIABLES:
+      case SQLCOM_SHOW_WARNS:
+      {
+        /* log SELECT and SHOW commands if audit level is at 2 */
+        if (opt_twitter_audit_log < 2)
+          return;
+      }
+      default:
+        break;
+    } /* end of switch */
+
+    if (thd->is_error())
+      err_code = thd->stmt_da->sql_errno();
+  }
+  else if (command == COM_QUIT && query_length == 0)
+  {
+    strxnmov(qry_buf, MAX_USER_HOST_SIZE, "quit", NullS);
+  }
+
+  ev_time= my_time(0);
+  localtime_r(&ev_time, &ev_tm);
+
+  strxnmov(user_host, MAX_USER_HOST_SIZE,
+           sctx->user ? sctx->user : "null", "@",
+           sctx->host_or_ip ? sctx->host_or_ip : "null", NullS);
+
+  /* strip the query string of new line or tab */
+  qry_ptr = &qry_buf[0];
+  if (query_length > 0)
+  {
+    if (query_length > DBA_LOG_QUERY_LEN) {
+      qry_ptr = (char *) my_malloc(query_length + 1, MYF(MY_WME));
+      free_qry_ptr = 1;
+    }
+
+    if (qry_ptr)
+    {
+      uint qry_len;
+      char *qry;
+      const char *q;
+      for (q = query, qry = qry_ptr, qry_len = 0;
+           qry_len < query_length && *q != '\0'; ++q, ++qry, ++qry_len)
+      {
+        if (*q == '\t' || *q == '\n' || *q == '\r')
+          *qry = ' ';
+        else
+          *qry = *q;
+      }
+      *qry++ = '\0';
+    }
+    else {
+      qry_ptr = (char *) query;
+      free_qry_ptr = 0;
+    }
+  }
+
+  /* timestamp<tab>error_code<tab>user@host_or_ip<tab>query_string */
+  fprintf(stderr, "%d-%02d-%02d %02d:%02d:%02d\t%s\t%u\t%s\n",
+          ev_tm.tm_year + 1900, ev_tm.tm_mon + 1, ev_tm.tm_mday,
+          ev_tm.tm_hour, ev_tm.tm_min, ev_tm.tm_sec, user_host,
+          err_code, qry_ptr);
+
+  if (free_qry_ptr)
+    my_free(qry_ptr);
+}
+
+void twitter_audit_log(THD *thd, enum enum_server_command command,
+                       const char *query, uint query_length,
+                       my_bool twitter_audit, void *acl)
+{
+  Security_context *sctx= thd->security_ctx;
+
+  /* twitter_audit has opt_twitter_audit_log value before query
+     execution, and it is to log disable operation. */
+  if (!opt_twitter_audit_log && !twitter_audit)
+    return;
+
+  /* Root user has ignore_logging_priv but he is always logged;
+     never log anything by slave SQL thread. */
+  if ((((sctx->master_access & GLOBAL_ACLS) != GLOBAL_ACLS) &&
+       (sctx->master_access & IGNORE_LOGGING_ACL)) ||
+      (thd->rli_slave && thd->rli_slave->sql_thd == thd))
+  {
+    return;
+  }
+
+  /* To log user logins, we use ACL info because security context
+     is not available. */
+  if (command == COM_CONNECT) {
+    if (!acl || !twitter_audit_acl_check(acl))
+      return;
+  }
+
+  logger.twitter_log_write(thd, command, query, query_length);
+}
+
+void twitter_audit_print(THD *thd, enum enum_server_command command,
+                         void *acl, const char *format, va_list args)
+{
+  uint msg_buf_len= 0;
+  char msg_buf[MAX_LOG_BUFFER_SIZE];
+
+  if (format)
+    msg_buf_len = my_vsnprintf(msg_buf, sizeof(msg_buf), format, args);
+  else
+    msg_buf[0] = '\0';
+
+  twitter_audit_log(thd, command, msg_buf, msg_buf_len, 0, acl);
+}
+
+void twitter_audit_logins(THD *thd, enum enum_server_command command,
+                          void *acl, const char *format,...)
+{
+  if (opt_twitter_audit_log)
+  {
+    va_list args;
+    va_start(args, format);
+    twitter_audit_print(thd, command, acl, format, args);
+    va_end(args);
+  }
+}
+#endif // NO_EMBEDDED_ACCESS_CHECKS
 
 #ifdef INNODB_COMPATIBILITY_HOOKS
 /**

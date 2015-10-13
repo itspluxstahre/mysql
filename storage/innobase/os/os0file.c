@@ -21,7 +21,7 @@ Public License for more details.
 
 You should have received a copy of the GNU General Public License along
 with this program; if not, write to the Free Software Foundation, Inc.,
-59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 ***********************************************************************/
 
@@ -338,6 +338,7 @@ os_file_account_flush(void)
 }
 
 #ifdef UNIV_DEBUG
+# ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Validates the consistency the aio system some of the time.
 @return	TRUE if ok or the check was skipped */
@@ -364,6 +365,7 @@ os_aio_validate_skip(void)
 	os_aio_validate_count = OS_AIO_VALIDATE_SKIP;
 	return(os_aio_validate());
 }
+# endif /* !UNIV_HOTBACKUP */
 #endif /* UNIV_DEBUG */
 
 #ifdef __WIN__
@@ -1432,6 +1434,13 @@ os_file_create_func(
 	DWORD		create_flag;
 	DWORD		attributes;
 	ibool		retry;
+
+	DBUG_EXECUTE_IF(
+		"ib_create_table_fail_disk_full",
+		*success = FALSE;
+		SetLastError(ERROR_DISK_FULL);
+		return((os_file_t) -1);
+	);
 try_again:
 	ut_a(name);
 
@@ -1547,6 +1556,12 @@ try_again:
 	ibool		retry;
 	const char*	mode_str	= NULL;
 
+	DBUG_EXECUTE_IF(
+		"ib_create_table_fail_disk_full",
+		*success = FALSE;
+		errno = ENOSPC;
+		return((os_file_t) -1);
+	);
 try_again:
 	ut_a(name);
 

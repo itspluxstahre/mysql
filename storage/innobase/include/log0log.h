@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2010, Innobase Oy. All Rights Reserved.
+Copyright (c) 1995, 2010, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -18,8 +18,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -40,6 +40,9 @@ Created 12/9/1995 Heikki Tuuri
 #include "sync0sync.h"
 #include "sync0rw.h"
 #endif /* !UNIV_HOTBACKUP */
+
+/* Type used for all log sequence number storage and arithmetics */
+typedef	ib_uint64_t		lsn_t;
 
 /** Redo log buffer */
 typedef struct log_struct	log_t;
@@ -762,7 +765,6 @@ struct log_struct{
 					buffer */
 #ifndef UNIV_HOTBACKUP
 	mutex_t		mutex;		/*!< mutex protecting the log */
-#endif /* !UNIV_HOTBACKUP */
 
 	mutex_t		log_flush_order_mutex;/*!< mutex to serialize access to
 					the flush list when we are putting
@@ -772,6 +774,7 @@ struct log_struct{
 					mtr_commit and still ensure that
 					insertions in the flush_list happen
 					in the LSN order. */
+#endif /* !UNIV_HOTBACKUP */
 	byte*		buf_ptr;	/* unaligned log buffer */
 	byte*		buf;		/*!< log buffer */
 	ulint		buf_size;	/*!< log buffer size in bytes */
@@ -806,6 +809,8 @@ struct log_struct{
 					later; this is advanced when a flush
 					operation is completed to all the log
 					groups */
+	volatile ibool	is_extending;	/*!< this is set to true during extend
+					the log buffer size */
 	ib_uint64_t	written_to_some_lsn;
 					/*!< first log sequence number not yet
 					written to any log group; for this to

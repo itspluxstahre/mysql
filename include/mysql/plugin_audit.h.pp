@@ -190,6 +190,7 @@ int mysql_tmpfile(const char *prefix);
 void* thd_get_current_thd();
 int thd_killed(const void* thd);
 void thd_set_kill_status(const void* thd);
+void thd_set_deadlock_report(void* thd, int val);
 unsigned long thd_get_thread_id(const void* thd);
 void thd_get_xid(const void* thd, MYSQL_XID *xid);
 void mysql_query_cache_invalidate4(void* thd,
@@ -212,6 +213,10 @@ struct mysql_event_general
   struct charset_info_st *general_charset;
   unsigned long long general_time;
   unsigned long long general_rows;
+  MYSQL_LEX_STRING general_host;
+  MYSQL_LEX_STRING general_sql_command;
+  MYSQL_LEX_STRING general_external_user;
+  MYSQL_LEX_STRING general_ip;
 };
 struct mysql_event_connection
 {

@@ -341,8 +341,14 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
 	break;
       }
     }
-    else
+    /*
+      Don't try unlocking the row if skip_record reported an error since in
+      this case the transaction might have been rolled back already.
+    */
+    else if (!thd->is_error())
       table->file->unlock_row();  // Row failed selection, release lock on it
+    else
+      break;
   }
   killed_status= thd->killed;
   if (killed_status != THD::NOT_KILLED || thd->is_error())
@@ -411,6 +417,7 @@ cleanup:
     my_ok(thd, deleted);
     DBUG_PRINT("info",("%ld records deleted",(long) deleted));
   }
+  thd->updated_row_count+= deleted;
   DBUG_RETURN(error >= 0 || thd->is_error());
 }
 
@@ -1005,6 +1012,7 @@ bool multi_delete::send_eof()
   {
     ::my_ok(thd, deleted);
   }
+  thd->updated_row_count+= deleted;
   return 0;
 }
 

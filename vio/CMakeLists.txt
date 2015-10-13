@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,3 +20,7 @@ ADD_DEFINITIONS(${SSL_DEFINES})
 SET(VIO_SOURCES  vio.c viosocket.c viossl.c viosslfactories.c)
 ADD_CONVENIENCE_LIBRARY(vio ${VIO_SOURCES})
 TARGET_LINK_LIBRARIES(vio ${LIBSOCKET})
+
+IF(MSVC)
+   INSTALL_DEBUG_TARGET(vio DESTINATION ${INSTALL_LIBDIR}/debug)
+ENDIF()

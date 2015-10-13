@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2006, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -31,7 +31,7 @@
 To use MemoryTracker merely add this file to your project
 No need to instantiate anything
 
-If your app is multi threaded define YASSL_THREAD_SAFE
+If your app is multi threaded define MULTI_THREADED
 
 *********************************************************************/
 
@@ -328,3 +328,32 @@ void operator delete[](void* ptr)
 {
     ::operator delete(ptr);
 }
+
+
+extern "C" {
+
+void* XMALLOC(size_t sz, void* head)
+{
+    return ::operator new(sz);
+}
+
+void* XREALLOC(void* ptr, size_t sz, void* heap)
+{
+    void* ret = ::operator new(sz);
+
+    if (ret && ptr)
+        memcpy(ret, ptr, sz);
+
+    if (ret)
+        ::operator delete(ptr);
+    return ret;
+}
+
+
+void XFREE(void* ptr, void* heap)
+{
+    ::operator delete(ptr);
+}
+
+}  // extern "C"
+

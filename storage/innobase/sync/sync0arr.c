@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2011, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -18,8 +18,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -604,10 +604,6 @@ sync_array_deadlock_step(
 	new = sync_array_find_thread(arr, thread);
 
 	if (UNIV_UNLIKELY(new == start)) {
-		/* Stop running of other threads */
-
-		ut_dbg_stop_threads = TRUE;
-
 		/* Deadlock */
 		fputs("########################################\n"
 		      "DEADLOCK of threads detected!\n", stderr);
@@ -918,15 +914,22 @@ ibool
 sync_array_print_long_waits(
 /*========================*/
 	os_thread_id_t*	waiter,	/*!< out: longest waiting thread */
-	const void**	sema)	/*!< out: longest-waited-for semaphore */
+	const void**	sema,	/*!< out: longest-waited-for semaphore */
+	ulint*		n_tmo)	/*!< out: number of timed-out semaphores */
 {
 	sync_cell_t*	cell;
 	ibool		old_val;
 	ibool		noticed = FALSE;
 	ulint		i;
 	ulint		fatal_timeout = srv_fatal_semaphore_wait_threshold;
+	ulint		n_stalls = 0;
 	ibool		fatal = FALSE;
 	double		longest_diff = 0;
+
+	/* For huge tables, skip the check during CHECK TABLE etc... */
+	if (fatal_timeout > SRV_SEMAPHORE_WAIT_EXTENSION) {
+		return(FALSE);
+	}
 
 #ifdef UNIV_DEBUG_VALGRIND
 	/* Increase the timeouts if running under valgrind because it executes
@@ -939,6 +942,8 @@ sync_array_print_long_waits(
 #else
 # define SYNC_ARRAY_TIMEOUT	240
 #endif
+
+	sync_array_enter(sync_primary_wait_array);
 
 	for (i = 0; i < sync_primary_wait_array->n_cells; i++) {
 
@@ -961,6 +966,7 @@ sync_array_print_long_waits(
 			      stderr);
 			sync_array_cell_print(stderr, cell);
 			noticed = TRUE;
+			n_stalls++;
 		}
 
 		if (diff > fatal_timeout) {
@@ -973,6 +979,9 @@ sync_array_print_long_waits(
 			*waiter = cell->thread;
 		}
 	}
+
+	*n_tmo = n_stalls;
+	sync_array_exit(sync_primary_wait_array);
 
 	if (noticed) {
 		fprintf(stderr,
@@ -1022,8 +1031,9 @@ sync_array_output_info(
 	ulint		i;
 
 	fprintf(file,
-		"OS WAIT ARRAY INFO: reservation count %ld, signal count %ld\n",
-						(long) arr->res_count, (long) arr->sg_count);
+		"OS WAIT ARRAY INFO: reservation count " ULINTPF
+		", signal count " ULINTPF "\n",
+		arr->res_count, arr->sg_count);
 	i = 0;
 	count = 0;
 

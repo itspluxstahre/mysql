@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2012, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, 2009 Google Inc.
 Copyright (c) 2009, Percona Inc.
 
@@ -26,8 +26,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -58,6 +58,8 @@ Created 10/8/1995 Heikki Tuuri
 *******************************************************/
 
 /* Dummy comment */
+#include "m_string.h" /* for my_sys.h */
+#include "my_sys.h" /* DEBUG_SYNC_C */
 #include "srv0srv.h"
 
 #include "ut0mem.h"
@@ -82,7 +84,9 @@ Created 10/8/1995 Heikki Tuuri
 #include "row0mysql.h"
 #include "ha_prototypes.h"
 #include "trx0i_s.h"
+#include "trx0sys.h"
 #include "os0sync.h" /* for HAVE_ATOMIC_BUILTINS */
+#include "read0read.h"
 #include "mysql/plugin.h"
 #include "mysql/service_thd_wait.h"
 
@@ -169,6 +173,28 @@ many pages to it at a time */
 UNIV_INTERN ulong	srv_auto_extend_increment = 8;
 UNIV_INTERN ulint*	srv_data_file_is_raw_partition = NULL;
 
+/* Minimum percentage of pages in a segment to be used before a new
+extent is added to a segment. */
+UNIV_INTERN double	srv_segment_fill_factor = 87.50;
+
+/* Target percentage for how much to fill leaf pages, reserving the
+remaining space for record growth (e.g. updates). */
+UNIV_INTERN double	srv_index_fill_factor = 93.75;
+
+/* Allocate a free fragment to a segment before taking an extent
+from the segment/space free list. */
+UNIV_INTERN my_bool	srv_lease_fragment_extents = FALSE;
+
+/* Whether to reserve a percentage (srv_free_extents_rsvn_factor)
+of a space size as free space for operations that might allocate
+several pages. */
+UNIV_INTERN my_bool	srv_reserve_free_extents = TRUE;
+
+/* Percentage of the space size to reserve for operations that may
+allocate several pages. Used to attempt to ensure page allocations
+won't fail when expanding an index tree (e.g. page split). */
+UNIV_INTERN double	srv_free_extents_rsvn_factor = 1.0;
+
 /* If the following is TRUE we do not allow inserts etc. This protects
 the user from forgetting the 'newraw' keyword to my.cnf */
 
@@ -210,6 +236,8 @@ UNIV_INTERN ulint	srv_buf_pool_size	= ULINT_MAX;
 UNIV_INTERN my_bool	srv_buf_pool_populate	= FALSE;
 /* requested number of buffer pool instances */
 UNIV_INTERN ulint       srv_buf_pool_instances  = 1;
+/** whether or not to flush neighbors of a block */
+UNIV_INTERN my_bool	srv_flush_neighbors	= TRUE;
 /* previously requested size */
 UNIV_INTERN ulint	srv_buf_pool_old_size;
 /* current size in kilobytes */
@@ -219,6 +247,9 @@ UNIV_INTERN ulint	srv_mem_pool_size	= ULINT_MAX;
 UNIV_INTERN ulint	srv_lock_table_size	= ULINT_MAX;
 
 UNIV_INTERN uint	srv_buf_flush_dirty_pages_age = 0;
+
+/* Try to flush dirty pages so as to avoid IO bursts at */
+UNIV_INTERN my_bool	srv_anticipatory_flushing = TRUE;
 
 /* This parameter is deprecated. Use srv_n_io_[read|write]_threads
 instead. */
@@ -280,7 +311,7 @@ UNIV_INTERN ulint srv_data_read = 0;
 /* Internal setting for "innodb_stats_method". Decides how InnoDB treats
 NULL value when collecting statistics. By default, it is set to
 SRV_STATS_NULLS_EQUAL(0), ie. all NULL value are treated equal */
-ulong srv_innodb_stats_method = SRV_STATS_NULLS_EQUAL;
+UNIV_INTERN ulong srv_innodb_stats_method = SRV_STATS_NULLS_EQUAL;
 
 /* here we count the amount of data written in total (in bytes) */
 UNIV_INTERN ulint srv_data_written = 0;
@@ -325,6 +356,48 @@ UNIV_INTERN ulint srv_buf_pool_flushed = 0;
 reading of a disk page */
 UNIV_INTERN ulint srv_buf_pool_reads = 0;
 
+/** Number of pages scanned as part of a flush batch. */
+UNIV_INTERN ulint srv_buf_pool_flush_batch_scanned;
+
+/** Number of pages flushed as part of sync batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_sync_page;
+
+/** Number of pages flushed as part of async batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_async_page;
+
+/** Number of pages flushed as part of adaptive batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_adaptive_pages;
+
+/** Number of pages flushed as part of anticipatory batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_anticipatory_pages;
+
+/** Number of pages flushed as part of background (async) batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_background_pages;
+
+/** Number of pages flushed as part of max_dirty batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_max_dirty_pages;
+
+/** Number of pages flushed as part of neighbor flush. */
+UNIV_INTERN ulint srv_buf_pool_flush_neighbor_pages;
+
+/** Number of pages scanned as part of LRU batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_LRU_batch_scanned;
+
+/** Number of pages flushed as part of LRU batches. */
+UNIV_INTERN ulint srv_buf_pool_flush_LRU_page_count;
+
+/** Number of pages scanned as part of LRU search. */
+UNIV_INTERN ulint srv_buf_pool_LRU_search_scanned;
+
+/** Number of pages scanned as part of LRU unzip search. */
+UNIV_INTERN ulint srv_buf_pool_LRU_unzip_search_scanned;
+
+/** Number of searches performed for a clean page. */
+UNIV_INTERN ulint srv_buf_pool_LRU_get_free_search;
+
+/** Number of semaphore stalls. */
+UNIV_INTERN ulint srv_n_semaphore_stalls	= 0;
+
 /* structure to pass status variables to MySQL */
 UNIV_INTERN export_struc export_vars;
 
@@ -359,6 +432,12 @@ UNIV_INTERN lint	srv_conc_n_threads	= 0;
 /* number of OS threads waiting in the FIFO for a permission to enter
 InnoDB */
 UNIV_INTERN ulint	srv_conc_n_waiting_threads = 0;
+
+/* print all user-level transactions deadlocks to mysqld stderr */
+UNIV_INTERN my_bool	srv_print_all_deadlocks = FALSE;
+
+/* Perform deadlock detection check */
+UNIV_INTERN my_bool	srv_deadlock_check = TRUE;
 
 typedef struct srv_conc_slot_struct	srv_conc_slot_t;
 struct srv_conc_slot_struct{
@@ -435,6 +514,9 @@ UNIV_INTERN ulint		srv_n_lock_max_wait_time	= 0;
 UNIV_INTERN ulint		srv_n_lock_deadlock_count	= 0;
 
 UNIV_INTERN ulint		srv_truncated_status_writes	= 0;
+
+UNIV_INTERN ulint	srv_n_corrupted_page_reads	= 0;
+UNIV_INTERN ulint	srv_n_corrupted_table_opens	= 0;
 
 /*
   Set the following to 0 if you want InnoDB to write messages on
@@ -1186,7 +1268,8 @@ retry:
 
 	ut_ad(srv_conc_n_threads >= 0);
 
-	if (srv_conc_n_threads < (lint)srv_thread_concurrency) {
+	if (srv_thread_concurrency == 0
+	    || srv_conc_n_threads < (lint) srv_thread_concurrency) {
 
 		srv_conc_n_threads++;
 		trx->declared_to_be_inside_innodb = TRUE;
@@ -1200,7 +1283,8 @@ retry:
 	/* If the transaction is not holding resources, let it sleep
 	for SRV_THREAD_SLEEP_DELAY microseconds, and try again then */
 
-	if (!has_slept && !trx->has_search_latch
+	if (!has_slept
+	    && !trx->has_search_latch
 	    && NULL == UT_LIST_GET_FIRST(trx->trx_locks)) {
 
 		has_slept = TRUE; /* We let it sleep only once to avoid
@@ -1421,6 +1505,28 @@ srv_conc_exit_innodb(
 	srv_conc_force_exit_innodb(trx);
 }
 
+/*********************************************************************//**
+Wake all threads in the queue, this is called when the concurrency setting
+is set to 0 by the user. */
+UNIV_INTERN
+void
+srv_conc_wake_all(void)
+/*===================*/
+{
+	srv_conc_slot_t*	slot;
+
+	for (slot = UT_LIST_GET_FIRST(srv_conc_queue);
+	     slot != NULL;
+	     slot = UT_LIST_GET_NEXT(srv_conc_queue, slot)) {
+
+		if (!slot->wait_ended) {
+			slot->wait_ended = TRUE;
+			++srv_conc_n_threads;
+			os_event_set(slot->event);
+		}
+	}
+}
+
 /*========================================================================*/
 
 /*********************************************************************//**
@@ -1576,6 +1682,10 @@ srv_suspend_mysql_thread(
 
 	trx = thr_get_trx(thr);
 
+	if (trx->mysql_thd != 0) {
+		DEBUG_SYNC_C("srv_suspend_mysql_thread_enter");
+	}
+
 	os_event_set(srv_lock_timeout_thread_event);
 
 	mutex_enter(&kernel_mutex);
@@ -1713,7 +1823,8 @@ srv_suspend_mysql_thread(
 			finish_time = (ib_int64_t) sec * 1000000 + ms;
 		}
 
-		diff_time = (ulint) (finish_time - start_time);
+		diff_time = (finish_time > start_time) ?
+			    (ulint) (finish_time - start_time) : 0;
 
 		srv_n_lock_wait_current_count--;
 		srv_n_lock_wait_time = srv_n_lock_wait_time + diff_time;
@@ -2014,13 +2125,26 @@ void
 srv_export_innodb_status(void)
 /*==========================*/
 {
-	buf_pool_stat_t	stat;
-	ulint		LRU_len;
-	ulint		free_len;
-	ulint		flush_list_len;
+	buf_pool_stat_t		stat;
+	buf_pools_list_size_t	buf_pools_list_size;
+	ulint			LRU_len;
+	ulint			free_len;
+	ulint			flush_list_len;
+	ibuf_stat_t		ibuf_stat;
+	ib_int64_t		mysql_master_log_pos;
+	char			mysql_master_log_name[TRX_SYS_MYSQL_LOG_NAME_LEN];
 
 	buf_get_total_stat(&stat);
 	buf_get_total_list_len(&LRU_len, &free_len, &flush_list_len);
+	buf_get_total_list_size_in_bytes(&buf_pools_list_size);
+
+ 	ibuf_get_stats(&ibuf_stat);
+
+	mysql_master_log_pos = 0;
+	memset(mysql_master_log_name, 0, sizeof(mysql_master_log_name));
+
+	trx_sys_get_mysql_master_log_pos(mysql_master_log_name,
+					 &mysql_master_log_pos);
 
 	mutex_enter(&srv_innodb_monitor_mutex);
 
@@ -2049,7 +2173,12 @@ srv_export_innodb_status(void)
 	export_vars.innodb_buffer_pool_read_ahead_evicted
 		= stat.n_ra_pages_evicted;
 	export_vars.innodb_buffer_pool_pages_data = LRU_len;
+	export_vars.innodb_buffer_pool_bytes_data =
+		buf_pools_list_size.LRU_bytes
+		+ buf_pools_list_size.unzip_LRU_bytes;
 	export_vars.innodb_buffer_pool_pages_dirty = flush_list_len;
+	export_vars.innodb_buffer_pool_bytes_dirty =
+		buf_pools_list_size.flush_list_bytes;
 	export_vars.innodb_buffer_pool_pages_free = free_len;
 #ifdef UNIV_DEBUG
 	export_vars.innodb_buffer_pool_pages_latched
@@ -2107,6 +2236,105 @@ srv_export_innodb_status(void)
 	export_vars.innodb_lsn_current = log_sys->lsn;
 	export_vars.innodb_lsn_flushed = log_sys->flushed_to_disk_lsn;
 	export_vars.innodb_lsn_checkpoint = log_sys->last_checkpoint_lsn;
+
+	export_vars.innodb_buffer_pool_flush_batch_scanned
+		= srv_buf_pool_flush_batch_scanned;
+	export_vars.innodb_buffer_pool_flush_sync_page
+		= srv_buf_pool_flush_sync_page;
+	export_vars.innodb_buffer_pool_flush_async_page
+		= srv_buf_pool_flush_async_page;
+	export_vars.innodb_buffer_pool_flush_adaptive_pages
+		= srv_buf_pool_flush_adaptive_pages;
+	export_vars.innodb_buffer_pool_flush_anticipatory_pages
+		= srv_buf_pool_flush_anticipatory_pages;
+	export_vars.innodb_buffer_pool_flush_background_pages
+		= srv_buf_pool_flush_background_pages;
+	export_vars.innodb_buffer_pool_flush_max_dirty_pages
+		= srv_buf_pool_flush_max_dirty_pages;
+	export_vars.innodb_buffer_pool_flush_neighbor_pages
+		= srv_buf_pool_flush_neighbor_pages;
+	export_vars.innodb_buffer_pool_flush_LRU_batch_scanned
+		= srv_buf_pool_flush_LRU_batch_scanned;
+	export_vars.innodb_buffer_pool_flush_LRU_page_count
+		= srv_buf_pool_flush_LRU_page_count;
+	export_vars.innodb_buffer_pool_LRU_search_scanned
+		= srv_buf_pool_LRU_search_scanned;
+	export_vars.innodb_buffer_pool_LRU_unzip_search_scanned
+		= srv_buf_pool_LRU_unzip_search_scanned;
+	export_vars.innodb_buffer_pool_LRU_get_free_search
+		= srv_buf_pool_LRU_get_free_search;
+
+	export_vars.innodb_mysql_master_log_pos
+		= mysql_master_log_pos;
+	memcpy(export_vars.innodb_mysql_master_log_name,
+	       mysql_master_log_name, sizeof(mysql_master_log_name));
+	export_vars.innodb_mysql_master_log_name[TRX_SYS_MYSQL_LOG_NAME_LEN] = 0;
+
+	export_vars.innodb_corrupted_page_reads = srv_n_corrupted_page_reads;
+	export_vars.innodb_corrupted_table_opens = srv_n_corrupted_table_opens;
+
+	export_vars.innodb_btree_page_reorganize = btr_n_page_reorganize;
+	export_vars.innodb_btree_page_split = btr_n_page_split;
+	export_vars.innodb_btree_page_merge = btr_n_page_merge;
+	export_vars.innodb_btree_page_merge_succ = btr_n_page_merge_succ;
+	export_vars.innodb_btree_page_discard = btr_n_page_discard;
+
+	export_vars.innodb_trx_max_id = trx_sys->max_trx_id;
+	export_vars.innodb_purge_trx_no = purge_sys->purge_trx_no;
+	export_vars.innodb_purge_undo_no = purge_sys->purge_undo_no;
+
+	export_vars.innodb_ibuf_discarded_delete_marks =
+		ibuf_stat.n_discarded_ops[IBUF_OP_DELETE_MARK];
+	export_vars.innodb_ibuf_discarded_deletes =
+		ibuf_stat.n_discarded_ops[IBUF_OP_DELETE];
+	export_vars.innodb_ibuf_discarded_inserts =
+		ibuf_stat.n_discarded_ops[IBUF_OP_INSERT];
+	export_vars.innodb_ibuf_merged_delete_marks =
+		ibuf_stat.n_merged_ops[IBUF_OP_DELETE_MARK];
+	export_vars.innodb_ibuf_merged_deletes =
+		ibuf_stat.n_merged_ops[IBUF_OP_DELETE];
+	export_vars.innodb_ibuf_merged_inserts =
+		ibuf_stat.n_merged_ops[IBUF_OP_INSERT];
+	export_vars.innodb_ibuf_merged_pages = ibuf_stat.n_merges;
+	export_vars.innodb_ibuf_pages = ibuf_stat.size;
+
+	export_vars.innodb_semaphore_stalls = srv_n_semaphore_stalls;
+
+	export_vars.innodb_thread_concurrency_active =
+		srv_conc_n_threads;
+	export_vars.innodb_thread_concurrency_waiting =
+		srv_conc_n_waiting_threads;
+	export_vars.innodb_btree_row_searches = btr_cur_n_non_sea;
+	export_vars.innodb_hash_row_searches = btr_cur_n_sea;
+
+#ifdef UNIV_DEBUG
+	{
+		trx_id_t	done_trx_no;
+		trx_id_t	up_limit_id;
+
+		rw_lock_s_lock(&purge_sys->latch);
+		done_trx_no	= purge_sys->done_trx_no;
+		up_limit_id	= purge_sys->view
+			? purge_sys->view->up_limit_id
+			: 0;
+		rw_lock_s_unlock(&purge_sys->latch);
+
+		if (trx_sys->max_trx_id < done_trx_no) {
+			export_vars.innodb_purge_trx_id_age = 0;
+		} else {
+			export_vars.innodb_purge_trx_id_age =
+				trx_sys->max_trx_id - done_trx_no;
+		}
+
+		if (!up_limit_id
+		    || trx_sys->max_trx_id < up_limit_id) {
+			export_vars.innodb_purge_view_trx_id_age = 0;
+		} else {
+			export_vars.innodb_purge_view_trx_id_age =
+				trx_sys->max_trx_id - up_limit_id;
+		}
+	}
+#endif /* UNIV_DEBUG */
 
 	mutex_exit(&srv_innodb_monitor_mutex);
 }
@@ -2398,6 +2626,7 @@ srv_error_monitor_thread(
 {
 	/* number of successive fatal timeouts observed */
 	ulint		fatal_cnt	= 0;
+	ulint		stall_cnt	= 0;
 	ib_uint64_t	old_lsn;
 	ib_uint64_t	new_lsn;
 	ib_int64_t	sig_count;
@@ -2461,7 +2690,7 @@ loop:
 
 	sync_arr_wake_threads_if_sema_free();
 
-	if (sync_array_print_long_waits(&waiter, &sema)
+	if (sync_array_print_long_waits(&waiter, &sema, &stall_cnt)
 	    && sema == old_sema && os_thread_eq(waiter, old_waiter)) {
 		fatal_cnt++;
 		if (fatal_cnt > 10) {
@@ -2480,6 +2709,9 @@ loop:
 		old_waiter = waiter;
 		old_sema = sema;
 	}
+
+	srv_n_semaphore_stalls += stall_cnt;
+	stall_cnt = 0;
 
 	/* Flush stderr so that a database user gets the output
 	to possible MySQL error file */
@@ -2506,21 +2738,23 @@ loop:
 }
 
 /**********************************************************************//**
-Check whether any background thread is active.
-@return FALSE if all are are suspended or have exited. */
+Check whether any background thread is active. If so return the thread
+type
+@return ULINT_UNDEFINED if all are suspended or have exited, thread
+type if any are still active. */
 UNIV_INTERN
-ibool
-srv_is_any_background_thread_active(void)
-/*=====================================*/
+ulint
+srv_get_active_thread_type(void)
+/*============================*/
 {
 	ulint	i;
-	ibool	ret = FALSE;
+	ibool	ret = ULINT_UNDEFINED;
 
 	mutex_enter(&kernel_mutex);
 
 	for (i = 0; i <= SRV_MASTER; ++i) {
 		if (srv_n_threads_active[i] != 0) {
-			ret = TRUE;
+			ret = i;
 			break;
 		}
 	}
@@ -2528,6 +2762,57 @@ srv_is_any_background_thread_active(void)
 	mutex_exit(&kernel_mutex);
 
 	return(ret);
+}
+
+/*********************************************************************//**
+This function prints progress message every 60 seconds during server
+shutdown, for any activities that master thread is pending on. */
+static
+void
+srv_shutdown_print_master_pending(
+/*==============================*/
+	ib_time_t*	last_print_time,	/*!< last time the function
+						print the message */
+	ulint		n_tables_to_drop,	/*!< number of tables to
+						be dropped */
+	ulint		n_bytes_merged,		/*!< number of change buffer
+						just merged */
+	ulint		n_pages_flushed)	/*!< number of pages flushed */
+{
+	ib_time_t	current_time;
+	double		time_elapsed;
+
+	current_time = ut_time();
+	time_elapsed = ut_difftime(current_time, *last_print_time);
+
+	if (time_elapsed > 60) {
+		*last_print_time = ut_time();
+
+		if (n_tables_to_drop) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Waiting for "
+				"%lu table(s) to be dropped\n",
+				(ulong) n_tables_to_drop);
+		}
+
+		/* Check change buffer merge, we only wait for change buffer
+		merge if it is a slow shutdown */
+		if (!srv_fast_shutdown && n_bytes_merged) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Waiting for change "
+				"buffer merge to complete\n"
+				"  InnoDB: number of bytes of change buffer "
+				"just merged:  %lu\n",
+				n_bytes_merged);
+		}
+
+		if (n_pages_flushed) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Waiting for "
+				"%lu pages to be flushed\n",
+				(ulong) n_pages_flushed);
+		}
+        }
 }
 
 /*******************************************************************//**
@@ -2686,7 +2971,9 @@ srv_master_thread(
 	ulint		n_ios_very_old;
 	ulint		n_pend_ios;
 	ulint		next_itr_time;
+	ibool		max_dirty_pages_flush = FALSE;
 	ulint		i;
+	ib_time_t	last_print_time;
 
 #ifdef UNIV_DEBUG_THREAD_CREATION
 	fprintf(stderr, "Master thread starts, id %lu\n",
@@ -2708,6 +2995,7 @@ srv_master_thread(
 
 	mutex_exit(&kernel_mutex);
 
+	last_print_time = ut_time();
 loop:
 	/*****************************************************************/
 	/* ---- When there is database activity by users, we cycle in this
@@ -2740,6 +3028,26 @@ loop:
 
 	for (i = 0; i < 10; i++) {
 		ulint	cur_time = ut_time_ms();
+
+#ifdef UNIV_DEBUG
+		if (btr_cur_limit_optimistic_insert_debug
+		    && srv_n_purge_threads == 0) {
+			/* If btr_cur_limit_optimistic_insert_debug is enabled
+			and no purge_threads, purge opportunity is increased
+			by x100 (1purge/100msec), to speed up debug scripts
+			which should wait for purged. */
+			next_itr_time -= 900;
+
+			srv_main_thread_op_info = "master purging";
+
+			srv_master_do_purge();
+
+			if (srv_fast_shutdown && srv_shutdown_state > 0) {
+
+				goto background_loop;
+			}
+		}
+#endif /* UNIV_DEBUG */
 
 		/* ALTER TABLE in MySQL requires on Unix that the table handler
 		can drop tables lazily after there no longer are SELECT
@@ -2814,6 +3122,8 @@ loop:
 			n_pages_flushed = buf_flush_list(
 				PCT_IO(100), IB_ULONGLONG_MAX);
 
+			srv_buf_pool_flush_max_dirty_pages += n_pages_flushed;
+
 		} else if (srv_adaptive_flushing) {
 
 			/* Try to keep the rate of flushing of dirty
@@ -2829,6 +3139,9 @@ loop:
 					buf_flush_list(
 						n_flush,
 						IB_ULONGLONG_MAX);
+
+				srv_buf_pool_flush_adaptive_pages +=
+					n_pages_flushed;
 			}
 		}
 
@@ -2886,10 +3199,17 @@ loop:
 	srv_main_10_second_loops++;
 	if (n_pend_ios < SRV_PEND_IO_THRESHOLD
 	    && (n_ios - n_ios_very_old < SRV_PAST_IO_ACTIVITY)
-	    && flush_lsn_limit) {
+	    && flush_lsn_limit
+	    && srv_anticipatory_flushing) {
+
+		ulint n_flushed;
 
 		srv_main_thread_op_info = "flushing buffer pool pages";
-		buf_flush_list(PCT_IO(100), flush_lsn_limit);
+		n_flushed = buf_flush_list(PCT_IO(100), flush_lsn_limit);
+
+		if (n_flushed != ULINT_UNDEFINED) {
+			srv_buf_pool_flush_anticipatory_pages += n_flushed;
+		}
 
 		flush_lsn_limit = 0;
 
@@ -2929,13 +3249,17 @@ loop:
 
 		n_pages_flushed = buf_flush_list(
 			PCT_IO(100), IB_ULONGLONG_MAX);
-	} else {
+
+		srv_buf_pool_flush_max_dirty_pages += n_pages_flushed;
+	} else if (srv_anticipatory_flushing) {
 		/* Otherwise, we only flush a small number of pages so that
 		we do not unnecessarily use much disk i/o capacity from
 		other work */
 
 		n_pages_flushed = buf_flush_list(
 			  PCT_IO(10), IB_ULONGLONG_MAX);
+
+		srv_buf_pool_flush_anticipatory_pages += n_pages_flushed;
 	}
 
 	srv_main_thread_op_info = "making checkpoint";
@@ -3024,14 +3348,18 @@ background_loop:
 flush_loop:
 	srv_main_thread_op_info = "flushing buffer pool pages";
 	srv_main_flush_loops++;
-	if (srv_fast_shutdown < 2) {
+	if (srv_fast_shutdown < 2 || srv_shutdown_state == SRV_SHUTDOWN_NONE) {
 		n_pages_flushed = buf_flush_list(
 			  PCT_IO(100), IB_ULONGLONG_MAX);
 	} else {
 		/* In the fastest shutdown we do not flush the buffer pool
 		to data files: we set n_pages_flushed to 0 artificially. */
+		ut_ad(srv_fast_shutdown == 2);
+		ut_ad(srv_shutdown_state > 0);
 
 		n_pages_flushed = 0;
+
+		DBUG_PRINT("master", ("doing very fast shutdown"));
 	}
 
 	srv_main_thread_op_info = "reserving kernel mutex";
@@ -3046,6 +3374,12 @@ flush_loop:
 	srv_main_thread_op_info = "waiting for buffer pool flush to end";
 	buf_flush_wait_batch_end(NULL, BUF_FLUSH_LIST);
 
+	if (max_dirty_pages_flush) {
+		srv_buf_pool_flush_max_dirty_pages += n_pages_flushed;
+	}
+
+	srv_buf_pool_flush_background_pages += n_pages_flushed;
+
 	/* Flush logs if needed */
 	srv_sync_log_buffer_in_background();
 
@@ -3053,12 +3387,21 @@ flush_loop:
 
 	log_checkpoint(TRUE, FALSE);
 
-	if (buf_get_modified_ratio_pct() > srv_max_buf_pool_modified_pct) {
+	if (!(srv_fast_shutdown == 2 && srv_shutdown_state > 0)
+	    && (buf_get_modified_ratio_pct()
+		> srv_max_buf_pool_modified_pct)) {
+
+		/* If the server is doing a very fast shutdown, then
+		we will not come here. */
 
 		/* Try to keep the number of modified pages in the
 		buffer pool under the limit wished by the user */
 
+		max_dirty_pages_flush = TRUE;
+
 		goto flush_loop;
+	} else {
+		max_dirty_pages_flush = FALSE;
 	}
 
 	srv_main_thread_op_info = "reserving kernel mutex";
@@ -3075,6 +3418,14 @@ flush_loop:
 	log_archive_do(FALSE, &n_bytes_archived);
 	*/
 	n_bytes_archived = 0;
+
+	/* Print progress message every 60 seconds during shutdown */
+	if (srv_shutdown_state > 0 && srv_print_verbose_log) {
+		srv_shutdown_print_master_pending(&last_print_time,
+						  n_tables_to_drop,
+						  n_bytes_merged,
+						  n_pages_flushed);
+	}
 
 	/* Keep looping in the background loop if still work to do */
 
@@ -3094,6 +3445,7 @@ flush_loop:
 	} else if (n_tables_to_drop
 		   + n_pages_purged + n_bytes_merged + n_pages_flushed
 		   + n_bytes_archived != 0) {
+
 		/* In a 'slow' shutdown we run purge and the insert buffer
 		merge to completion */
 

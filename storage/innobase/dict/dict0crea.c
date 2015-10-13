@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2011, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2014, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -42,6 +42,22 @@ Created 1/8/1996 Heikki Tuuri
 #include "trx0roll.h"
 #include "usr0sess.h"
 #include "ut0vec.h"
+#include "ha_prototypes.h"
+
+/*************************************************************************
+Checks if a table name contains the string TEMP_TABLE_PATH_PREFIX which
+denotes temporary tables in MySQL. */
+static
+ibool
+row_is_mysql_tmp_table_name(
+/*========================*/
+				/* out: TRUE if temporary table */
+	const char*     name)   /* in: table name in the form
+				'database/tablename' */
+{
+	return(strstr(name, TEMP_TABLE_PATH_PREFIX) != NULL);
+}
+
 
 /*****************************************************************//**
 Based on a table object, this function builds the entry to be inserted
@@ -366,7 +382,7 @@ dict_create_sys_indexes_tuple(
 
 	sys_indexes = dict_sys->sys_indexes;
 
-	table = dict_table_get_low(index->table_name);
+	table = dict_table_get_low(index->table_name, DICT_ERR_IGNORE_NONE);
 
 	entry = dtuple_create(heap, 7 + DATA_N_SYS_COLS);
 
@@ -568,7 +584,7 @@ dict_build_index_def_step(
 
 	index = node->index;
 
-	table = dict_table_get_low(index->table_name);
+	table = dict_table_get_low(index->table_name, DICT_ERR_IGNORE_NONE);
 
 	if (table == NULL) {
 		return(DB_TABLE_NOT_FOUND);
@@ -1203,8 +1219,8 @@ dict_create_or_check_foreign_constraint_tables(void)
 
 	mutex_enter(&(dict_sys->mutex));
 
-	table1 = dict_table_get_low("SYS_FOREIGN");
-	table2 = dict_table_get_low("SYS_FOREIGN_COLS");
+	table1 = dict_table_get_low("SYS_FOREIGN", DICT_ERR_IGNORE_NONE);
+	table2 = dict_table_get_low("SYS_FOREIGN_COLS", DICT_ERR_IGNORE_NONE);
 
 	if (table1 && table2
 	    && UT_LIST_GET_LEN(table1->indexes) == 3
@@ -1427,17 +1443,47 @@ dict_create_add_foreign_to_dictionary(
 {
 	ulint		error;
 	ulint		i;
+	pars_info_t*	info;
 
-	pars_info_t*	info = pars_info_create();
+	ut_ad(mutex_own(&(dict_sys->mutex)));
 
 	if (foreign->id == NULL) {
 		/* Generate a new constraint id */
 		ulint	namelen	= strlen(table->name);
 		char*	id	= mem_heap_alloc(foreign->heap, namelen + 20);
-		/* no overflow if number < 1e13 */
-		sprintf(id, "%s_ibfk_%lu", table->name, (ulong) (*id_nr)++);
+
+		if (row_is_mysql_tmp_table_name(table->name)) {
+			sprintf(id, "%s_ibfk_%lu", table->name,
+				(ulong) (*id_nr)++);
+		} else {
+			char	table_name[MAX_TABLE_NAME_LEN + 20] = "";
+			uint	errors = 0;
+
+			strncpy(table_name, table->name,
+				MAX_TABLE_NAME_LEN + 20);
+
+			innobase_convert_to_system_charset(
+				strchr(table_name, '/') + 1,
+				strchr(table->name, '/') + 1,
+				MAX_TABLE_NAME_LEN, &errors);
+
+			if (errors) {
+				strncpy(table_name, table->name,
+					MAX_TABLE_NAME_LEN + 20);
+			}
+
+			sprintf(id, "%s_ibfk_%lu", table_name,
+				(ulong) (*id_nr)++);
+
+			if (innobase_check_identifier_length(
+				strchr(id,'/') + 1)) {
+				return(DB_IDENTIFIER_TOO_LONG);
+			}
+		}
 		foreign->id = id;
 	}
+
+	info = pars_info_create();
 
 	pars_info_add_str_literal(info, "id", foreign->id);
 
@@ -1479,6 +1525,37 @@ dict_create_add_foreign_to_dictionary(
 				      "END;\n"
 				      , table, foreign, trx);
 
+	if (error == DB_SUCCESS) {
+
+
+		if (foreign->foreign_table != NULL) {
+			ib_rbt_t*	rbt
+				= foreign->foreign_table->foreign_rbt;
+
+			if (rbt == NULL) {
+				rbt = dict_table_init_foreign_rbt(
+					foreign->foreign_table);
+			} else {
+				rbt_delete(rbt, foreign->id);
+			}
+
+			rbt_insert(rbt, foreign->id, &foreign);
+		}
+
+		if (foreign->referenced_table != NULL) {
+			ib_rbt_t* rbt
+				= foreign->referenced_table->referenced_rbt;
+
+			if (rbt == NULL) {
+				rbt = dict_table_init_referenced_rbt(
+					foreign->referenced_table);
+			} else {
+				rbt_delete(rbt, foreign->id);
+			}
+			rbt_insert(rbt, foreign->id, &foreign);
+		}
+	}
+
 	return(error);
 }
 
@@ -1503,15 +1580,16 @@ dict_create_add_foreigns_to_dictionary(
 	dict_foreign_t*	foreign;
 	ulint		number	= start_id + 1;
 	ulint		error;
+	DBUG_ENTER("dict_create_add_foreigns_to_dictionary");
 
 	ut_ad(mutex_own(&(dict_sys->mutex)));
 
-	if (NULL == dict_table_get_low("SYS_FOREIGN")) {
+	if (NULL == dict_table_get_low("SYS_FOREIGN", DICT_ERR_IGNORE_NONE)) {
 		fprintf(stderr,
 			"InnoDB: table SYS_FOREIGN not found"
 			" in internal data dictionary\n");
 
-		return(DB_ERROR);
+		DBUG_RETURN(DB_ERROR);
 	}
 
 	for (foreign = UT_LIST_GET_FIRST(table->foreign_list);
@@ -1523,9 +1601,9 @@ dict_create_add_foreigns_to_dictionary(
 
 		if (error != DB_SUCCESS) {
 
-			return(error);
+			DBUG_RETURN(error);
 		}
 	}
 
-	return(DB_SUCCESS);
+	DBUG_RETURN(DB_SUCCESS);
 }

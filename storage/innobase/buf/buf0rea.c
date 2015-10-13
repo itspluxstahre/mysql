@@ -12,8 +12,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -52,6 +52,44 @@ i/o-fixed buffer blocks */
 #define BUF_READ_AHEAD_PEND_LIMIT	2
 
 /********************************************************************//**
+Unfixes the pages, unlatches the page,
+removes it from page_hash and removes it from LRU. */
+static
+void
+buf_read_page_handle_error(
+/*=======================*/
+	buf_page_t*	bpage)	/*!< in: pointer to the block */
+{
+	buf_pool_t*	buf_pool = buf_pool_from_bpage(bpage);
+	const ibool	uncompressed = (buf_page_get_state(bpage)
+					== BUF_BLOCK_FILE_PAGE);
+
+	/* First unfix and release lock on the bpage */
+	buf_pool_mutex_enter(buf_pool);
+	mutex_enter(buf_page_get_mutex(bpage));
+	ut_ad(buf_page_get_io_fix(bpage) == BUF_IO_READ);
+	ut_ad(bpage->buf_fix_count == 0);
+
+	/* Set BUF_IO_NONE before we remove the block from LRU list */
+	buf_page_set_io_fix(bpage, BUF_IO_NONE);
+
+	if (uncompressed) {
+		rw_lock_x_unlock_gen(
+			&((buf_block_t*) bpage)->lock,
+			BUF_IO_READ);
+	}
+
+	/* remove the block from LRU list */
+	buf_LRU_free_one_page(bpage);
+
+	ut_ad(buf_pool->n_pend_reads > 0);
+	buf_pool->n_pend_reads--;
+
+	mutex_exit(buf_page_get_mutex(bpage));
+	buf_pool_mutex_exit(buf_pool);
+}
+
+/********************************************************************//**
 Low-level function which reads a page asynchronously from a file to the
 buffer buf_pool if it is not already there, in which case does nothing.
 Sets the io_fix flag and sets an exclusive lock on the buffer frame. The
@@ -67,7 +105,8 @@ buf_read_page_low(
 /*==============*/
 	ulint*	err,	/*!< out: DB_SUCCESS or DB_TABLESPACE_DELETED if we are
 			trying to read from a non-existent tablespace, or a
-			tablespace which is just now being dropped */
+			tablespace which is just now being dropped, or
+			DB_CORRUPTION if the page is corrupted */
 	ibool	sync,	/*!< in: TRUE if synchronous aio is desired */
 	ulint	mode,	/*!< in: BUF_READ_IBUF_PAGES_ONLY, ...,
 			ORed to OS_AIO_SIMULATED_WAKE_LATER (see below
@@ -140,7 +179,10 @@ buf_read_page_low(
 
 	ut_ad(buf_page_in_file(bpage));
 
-	thd_wait_begin(NULL, THD_WAIT_DISKIO);
+	if (sync) {
+		thd_wait_begin(NULL, THD_WAIT_DISKIO);
+	}
+
 	if (zip_size) {
 		*err = fil_io(OS_FILE_READ | wake_later,
 			      sync, space, zip_size, offset, 0, zip_size,
@@ -152,13 +194,26 @@ buf_read_page_low(
 			      sync, space, 0, offset, 0, UNIV_PAGE_SIZE,
 			      ((buf_block_t*) bpage)->frame, bpage);
 	}
-	thd_wait_end(NULL);
+
+	if (sync) {
+		thd_wait_end(NULL);
+	}
+
+	if (*err == DB_TABLESPACE_DELETED) {
+		buf_read_page_handle_error(bpage);
+		return(0);
+	}
+
 	ut_a(*err == DB_SUCCESS);
 
 	if (sync) {
 		/* The i/o is already completed when we arrive from
 		fil_read */
-		buf_page_io_complete(bpage);
+		if (!buf_page_io_complete(bpage)) {
+			/* Page corruption on disk. */
+			*err = DB_CORRUPTION;
+			return(0);
+		}
 	}
 
 	return(1);

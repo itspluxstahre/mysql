@@ -1,6 +1,5 @@
 /*
-   Copyright (c) 2005-2007 MySQL AB, 2009 Sun Microsystems, Inc.
-   Use is subject to license terms.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -61,10 +60,6 @@ public:
     void          destroy(pointer p) {p->~T();}
     size_type     max_size() const {return ~size_type(0)/sizeof(T);}
 protected:
-    static void CheckSize(size_t n)
-    {
-        assert(n <= ~size_t(0) / sizeof(T));
-    }
 };
 
 
@@ -79,7 +74,7 @@ typename A::pointer StdReallocate(A& a, T* p, typename A::size_type oldSize,
     if (preserve) {
         A b = A();
         typename A::pointer newPointer = b.allocate(newSize, 0);
-        memcpy(newPointer, p, sizeof(T) * min((word32) oldSize, (word32) newSize));
+        memcpy(newPointer, p, sizeof(T) * min(oldSize, newSize));
         a.deallocate(p, oldSize);
         STL::swap(a, b);
         return newPointer;
@@ -101,7 +96,8 @@ public:
 
     pointer allocate(size_type n, const void* = 0)
     {
-        this->CheckSize(n);
+        if (n > this->max_size())
+            return 0;
         if (n == 0)
             return 0;
         return NEW_TC T[n];
@@ -144,9 +140,8 @@ public:
         return *this;
     }
 
-    T& operator[] (word32 i) { assert(i < sz_); return buffer_[i]; }
-    const T& operator[] (word32 i) const 
-        { assert(i < sz_); return buffer_[i]; }
+    T& operator[] (word32 i) { return buffer_[i]; }
+    const T& operator[] (word32 i) const { return buffer_[i]; }
 
     T* operator+ (word32 i) { return buffer_ + i; }
     const T* operator+ (word32 i) const { return buffer_ + i; }
@@ -191,9 +186,9 @@ public:
 
     ~Block() { allocator_.deallocate(buffer_, sz_); }
 private:
+    A      allocator_;
     word32 sz_;     // size in Ts
     T*     buffer_;
-    A      allocator_;
 };
 
 

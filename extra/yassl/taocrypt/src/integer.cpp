@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -55,8 +55,9 @@
         #include <emmintrin.h>
     #endif
 #elif defined(_MSC_VER) && defined(_M_IX86)
-    #pragma message("You do not seem to have the Visual C++ Processor Pack ")
+/*    #pragma message("You do not seem to have the Visual C++ Processor Pack ")
     #pragma message("installed, so use of SSE2 intrinsics will be disabled.")
+*/
 #elif defined(__GNUC__) && defined(__i386__)
 /*   #warning You do not have GCC 3.3 or later, or did not specify the -msse2 \
              compiler option. Use of SSE2 intrinsics will be disabled.
@@ -73,7 +74,8 @@ template <class T>
 CPP_TYPENAME AlignedAllocator<T>::pointer AlignedAllocator<T>::allocate(
                                            size_type n, const void *)
 {
-    CheckSize(n);
+    if (n > this->max_size())
+        return 0;
     if (n == 0)
         return 0;
     if (n >= 4)
@@ -91,16 +93,13 @@ CPP_TYPENAME AlignedAllocator<T>::pointer AlignedAllocator<T>::allocate(
     #endif
 
     #ifdef TAOCRYPT_NO_ALIGNED_ALLOC
-        assert(m_pBlock == 0);
         m_pBlock = p;
         if (!IsAlignedOn(p, 16))
         {
-            assert(IsAlignedOn(p, 8));
             p = (byte *)p + 8;
         }
     #endif
 
-        assert(IsAlignedOn(p, 16));
         return (T*)p;
     }
     return NEW_TC T[n];
@@ -116,7 +115,6 @@ void AlignedAllocator<T>::deallocate(void* p, size_type n)
         #ifdef TAOCRYPT_MM_MALLOC_AVAILABLE
             _mm_free(p);
         #elif defined(TAOCRYPT_NO_ALIGNED_ALLOC)
-            assert(m_pBlock == p || (byte*)m_pBlock+8 == p);
             free(m_pBlock);
             m_pBlock = 0;
         #else
@@ -283,23 +281,21 @@ DWord() {}
     word GetHighHalfAsBorrow() const {return 0-halfs_.high;}
 
 private:
-    struct dword_struct
-    {
-    #ifdef LITTLE_ENDIAN_ORDER
-        word low;
-        word high;
-    #else
-        word high;
-        word low;
-    #endif
-    };
-
     union
     {
     #ifdef TAOCRYPT_NATIVE_DWORD_AVAILABLE
         dword whole_;
     #endif
-        struct dword_struct halfs_;
+        struct
+        {
+        #ifdef LITTLE_ENDIAN_ORDER
+            word low;
+            word high;
+        #else
+            word high;
+            word low;
+        #endif
+        } halfs_;
     };
 };
 
@@ -365,9 +361,6 @@ private:
 template <class S, class D>
 S DivideThreeWordsByTwo(S* A, S B0, S B1, D* dummy_VC6_WorkAround = 0)
 {
-    // assert {A[2],A[1]} < {B1,B0}, so quotient can fit in a S
-    assert(A[2] < B1 || (A[2]==B1 && A[1] < B0));
-
     // estimate the quotient: do a 2 S by 1 S divide
     S Q;
     if (S(B1+1) == 0)
@@ -393,7 +386,6 @@ S DivideThreeWordsByTwo(S* A, S B0, S B1, D* dummy_VC6_WorkAround = 0)
         A[1] = u.GetLowHalf();
         A[2] += u.GetHighHalf();
         Q++;
-        assert(Q);	// shouldn't overflow
     }
 
     return Q;
@@ -491,7 +483,6 @@ static int Compare(const word *A, const word *B, unsigned int N)
 
 static word Increment(word *A, unsigned int N, word B=1)
 {
-    assert(N);
     word t = A[0];
     A[0] = t+B;
     if (A[0] >= t)
@@ -504,7 +495,6 @@ static word Increment(word *A, unsigned int N, word B=1)
 
 static word Decrement(word *A, unsigned int N, word B=1)
 {
-    assert(N);
     word t = A[0];
     A[0] = t-B;
     if (A[0] <= t)
@@ -538,14 +528,11 @@ static word LinearMultiply(word *C, const word *A, word B, unsigned int N)
 
 static word AtomicInverseModPower2(word A)
 {
-    assert(A%2==1);
-
     word R=A%8;
 
     for (unsigned i=3; i<WORD_BITS; i*=2)
         R = R*(2-R*A);
 
-    assert(word(R*A)==1);
     return R;
 }
 
@@ -576,14 +563,11 @@ public:
 
     static void TAOCRYPT_CDECL Square2(word *R, const word *A);
     static void TAOCRYPT_CDECL Square4(word *R, const word *A);
-    static void TAOCRYPT_CDECL Square8(word *R, const word *A) {assert(false);}
     static unsigned int TAOCRYPT_CDECL SquareRecursionLimit() {return 4;}
 };
 
 word Portable::Add(word *C, const word *A, const word *B, unsigned int N)
 {
-    assert (N%2 == 0);
-
     DWord u(0, 0);
     for (unsigned int i = 0; i < N; i+=2)
     {
@@ -597,8 +581,6 @@ word Portable::Add(word *C, const word *A, const word *B, unsigned int N)
 
 word Portable::Subtract(word *C, const word *A, const word *B, unsigned int N)
 {
-    assert (N%2 == 0);
-
     DWord u(0, 0);
     for (unsigned int i = 0; i < N; i+=2)
     {
@@ -1013,7 +995,7 @@ void Portable::Multiply8Bottom(word *R, const word *A, const word *B)
     static jmp_buf s_env;
     static void SigIllHandler(int)
     {
-    longjmp(s_env, 1);
+        longjmp(s_env, 1);
     }
 #endif
 
@@ -1216,24 +1198,20 @@ public:
     #define AS1(x) #x ";"
     #define AS2(x, y) #x ", " #y ";"
     #define AddPrologue \
-        word res; \
         __asm__ __volatile__ \
         ( \
             "push %%ebx;"	/* save this manually, in case of -fPIC */ \
-            "mov %3, %%ebx;" \
+            "mov %2, %%ebx;" \
             ".intel_syntax noprefix;" \
             "push ebp;"
     #define AddEpilogue \
             "pop ebp;" \
             ".att_syntax prefix;" \
             "pop %%ebx;" \
-            "mov %%eax, %0;" \
-                    : "=g" (res) \
+                    : \
                     : "c" (C), "d" (A), "m" (B), "S" (N) \
                     : "%edi", "memory", "cc" \
-        ); \
-        return res;
-
+        );
     #define MulPrologue \
         __asm__ __volatile__ \
         ( \
@@ -2130,8 +2108,6 @@ void P4Optimized::Multiply8Bottom(word *C, const word *A, const word *B)
 void RecursiveMultiply(word *R, word *T, const word *A, const word *B,
                        unsigned int N)
 {
-    assert(N>=2 && N%2==0);
-
     if (LowLevel::MultiplyRecursionLimit() >= 8 && N==8)
         LowLevel::Multiply8(R, A, B);
     else if (LowLevel::MultiplyRecursionLimit() >= 4 && N==4)
@@ -2188,7 +2164,6 @@ void RecursiveMultiply(word *R, word *T, const word *A, const word *B,
         carry += LowLevel::Add(T0, T0, R2, N);
         carry += LowLevel::Add(R1, R1, T0, N);
 
-        assert (carry >= 0 && carry <= 2);
         Increment(R3, N2, carry);
     }
 }
@@ -2196,9 +2171,6 @@ void RecursiveMultiply(word *R, word *T, const word *A, const word *B,
 
 void RecursiveSquare(word *R, word *T, const word *A, unsigned int N)                     
 {
-    assert(N && N%2==0);
-    if (LowLevel::SquareRecursionLimit() >= 8 && N==8)
-        LowLevel::Square8(R, A);
     if (LowLevel::SquareRecursionLimit() >= 4 && N==4)
         LowLevel::Square4(R, A);
     else if (N==2)
@@ -2227,7 +2199,6 @@ void RecursiveSquare(word *R, word *T, const word *A, unsigned int N)
 void RecursiveMultiplyBottom(word *R, word *T, const word *A, const word *B,
                              unsigned int N)
 {
-    assert(N>=2 && N%2==0);
     if (LowLevel::MultiplyBottomRecursionLimit() >= 8 && N==8)
         LowLevel::Multiply8Bottom(R, A, B);
     else if (LowLevel::MultiplyBottomRecursionLimit() >= 4 && N==4)
@@ -2250,8 +2221,6 @@ void RecursiveMultiplyBottom(word *R, word *T, const word *A, const word *B,
 void RecursiveMultiplyTop(word *R, word *T, const word *L, const word *A,
                           const word *B, unsigned int N)
 {
-    assert(N>=2 && N%2==0);
-
     if (N==4)
     {
         LowLevel::Multiply4(T, A, B);
@@ -2315,7 +2284,6 @@ void RecursiveMultiplyTop(word *R, word *T, const word *L, const word *A,
         carry += Increment(R0, N2, c2+t);
         carry += LowLevel::Add(R0, R0, T1, N2);
         carry += LowLevel::Add(R0, R0, T3, N2);
-        assert (carry >= 0 && carry <= 2);
 
         CopyWords(R1, T3, N2);
         Increment(R1, N2, carry);
@@ -2363,9 +2331,6 @@ void AsymmetricMultiply(word *R, word *T, const word *A, unsigned int NA,
         STL::swap(A, B);
         STL::swap(NA, NB);
     }
-
-    assert(NB % NA == 0);
-    assert((NB/NA)%2 == 0); 	// NB is an even multiple of NA
 
     if (NA==2 && !A[1])
     {
@@ -2433,8 +2398,6 @@ static inline unsigned int EvenWordCount(const word *X, unsigned int N)
 unsigned int AlmostInverse(word *R, word *T, const word *A, unsigned int NA,
                            const word *M, unsigned int N)
 {
-    assert(NA<=N && N && N%2==0);
-
     word *b = T;
     word *c = T+N;
     word *f = T+2*N;
@@ -2460,7 +2423,6 @@ unsigned int AlmostInverse(word *R, word *T, const word *A, unsigned int NA,
 
             ShiftWordsRightByWords(f, fgLen, 1);
             if (c[bcLen-1]) bcLen+=2;
-            assert(bcLen <= N);
             ShiftWordsLeftByWords(c, bcLen, 1);
             k+=WORD_BITS;
             t=f[0];
@@ -2489,7 +2451,6 @@ unsigned int AlmostInverse(word *R, word *T, const word *A, unsigned int NA,
         {
             c[bcLen] = t;
             bcLen+=2;
-            assert(bcLen <= N);
         }
 
         if (f[fgLen-2]==0 && g[fgLen-2]==0 && f[fgLen-1]==0 && g[fgLen-1]==0)
@@ -2508,7 +2469,6 @@ unsigned int AlmostInverse(word *R, word *T, const word *A, unsigned int NA,
         {
             b[bcLen] = 1;
             bcLen+=2;
-            assert(bcLen <= N);
         }
     }
 }
@@ -2622,11 +2582,14 @@ void Integer::Decode(Source& source)
     }
 
     word32 length = GetLength(source);
+    if (length == 0 || source.GetError().What()) return;
 
     if ( (b = source.next()) == 0x00)
         length--;
     else
         source.prev();
+
+    if (source.IsLeft(length) == false) return;
  
     unsigned int words = (length + WORD_SIZE - 1) / WORD_SIZE;
     words = RoundupSize(words);
@@ -2642,18 +2605,20 @@ void Integer::Decode(Source& source)
 void Integer::Decode(const byte* input, unsigned int inputLen, Signedness s)
 {
     unsigned int idx(0);
-    byte b = input[idx++];
+    byte b = 0; 
+    if (inputLen>0)
+        b = input[idx];   // peek
     sign_  = ((s==SIGNED) && (b & 0x80)) ? NEGATIVE : POSITIVE;
 
     while (inputLen>0 && (sign_==POSITIVE ? b==0 : b==0xff))
     {
-        inputLen--;
-        b = input[idx++];
+        idx++;   // skip
+        if (--inputLen>0)
+            b = input[idx];  // peek
     }
 
     reg_.CleanNew(RoundupSize(BytesToWords(inputLen)));
 
-    --idx;
     for (unsigned int i=inputLen; i > 0; i--)
     {
         b = input[idx++];
@@ -2741,8 +2706,6 @@ void Integer::Randomize(RandomNumberGenerator& rng, unsigned int nbits)
 void Integer::Randomize(RandomNumberGenerator& rng, const Integer& min,
                         const Integer& max)
 {
-    assert(min <= max);
-
     Integer range = max - min;
     const unsigned int nbits = range.BitCount();
 
@@ -2881,7 +2844,7 @@ Integer& Integer::operator++()
     else
     {
         word borrow = Decrement(reg_.get_buffer(), reg_.size());
-        assert(!borrow);
+        (void)borrow;           // shut up compiler
         if (WordCount()==0)
             *this = Zero();
     }
@@ -2998,7 +2961,6 @@ void PositiveSubtract(Integer &diff, const Integer &a, const Integer& b)
                                b.reg_.get_buffer(), bSize);
         CopyWords(diff.reg_+bSize, a.reg_+bSize, aSize-bSize);
         borrow = Decrement(diff.reg_+bSize, aSize-bSize, borrow);
-        assert(!borrow);
         diff.sign_ = Integer::POSITIVE;
     }
     else
@@ -3007,7 +2969,6 @@ void PositiveSubtract(Integer &diff, const Integer &a, const Integer& b)
                                a.reg_.get_buffer(), aSize);
         CopyWords(diff.reg_+aSize, b.reg_+aSize, bSize-aSize);
         borrow = Decrement(diff.reg_+aSize, bSize-aSize, borrow);
-        assert(!borrow);
         diff.sign_ = Integer::NEGATIVE;
     }
 }
@@ -3067,7 +3028,6 @@ bool Integer::GetBit(unsigned int n) const
 
 unsigned long Integer::GetBits(unsigned int i, unsigned int n) const
 {
-    assert(n <= sizeof(unsigned long)*8);
     unsigned long v = 0;
     for (unsigned int j=0; j<n; j++)
         v |= GetBit(i+j) << j;
@@ -3127,8 +3087,6 @@ bool Integer::IsConvertableToLong() const
 
 signed long Integer::ConvertToLong() const
 {
-    assert(IsConvertableToLong());
-
     unsigned long value = reg_[0];
     value += SafeLeftShift<WORD_BITS, unsigned long>(reg_[1]);
     return sign_ == POSITIVE ? value : -(signed long)value;
@@ -3227,11 +3185,9 @@ static inline void AtomicDivide(word *Q, const word *A, const word *B)
     {
         // multiply quotient and divisor and add remainder, make sure it 
         // equals dividend
-        assert(!T[2] && !T[3] && (T[1] < B[1] || (T[1]==B[1] && T[0]<B[0])));
         word P[4];
         Portable::Multiply2(P, Q, B);
         Add(P, P, T, 4);
-        assert(memcmp(P, A, 4*WORD_SIZE)==0);
     }
 #endif
 }
@@ -3241,8 +3197,6 @@ static inline void AtomicDivide(word *Q, const word *A, const word *B)
 static void CorrectQuotientEstimate(word *R, word *T, word *Q, const word *B,
                                     unsigned int N)
 {
-    assert(N && N%2==0);
-
     if (Q[1])
     {
         T[N] = T[N+1] = 0;
@@ -3260,13 +3214,12 @@ static void CorrectQuotientEstimate(word *R, word *T, word *Q, const word *B,
     }
 
     word borrow = Subtract(R, R, T, N+2);
-    assert(!borrow && !R[N+1]);
+    (void)borrow;       // shut up compiler
 
     while (R[N] || Compare(R, B, N) >= 0)
     {
         R[N] -= Subtract(R, R, B, N);
         Q[1] += (++Q[0]==0);
-        assert(Q[0] || Q[1]); // no overflow
     }
 }
 
@@ -3280,10 +3233,6 @@ static void CorrectQuotientEstimate(word *R, word *T, word *Q, const word *B,
 void Divide(word* R, word* Q, word* T, const word* A, unsigned int NA,
             const word* B, unsigned int NB)
 {
-    assert(NA && NB && NA%2==0 && NB%2==0);
-    assert(B[NB-1] || B[NB-2]);
-    assert(NB <= NA);
-
     // set up temporary work space
     word *const TA=T;
     word *const TB=T+NA+2;
@@ -3294,7 +3243,6 @@ void Divide(word* R, word* Q, word* T, const word* A, unsigned int NA,
     TB[0] = TB[NB-1] = 0;
     CopyWords(TB+shiftWords, B, NB-shiftWords);
     unsigned shiftBits = WORD_BITS - BitPrecision(TB[NB-1]);
-    assert(shiftBits < WORD_BITS);
     ShiftWordsLeftByBits(TB, NB, shiftBits);
 
     // copy A into TA and normalize it
@@ -3314,7 +3262,6 @@ void Divide(word* R, word* Q, word* T, const word* A, unsigned int NA,
     else
     {
         NA+=2;
-        assert(Compare(TA+NA-NB, TB, NB) < 0);
     }
 
     word BT[2];
@@ -3339,8 +3286,6 @@ void PositiveDivide(Integer& remainder, Integer& quotient,
 {
     unsigned aSize = a.WordCount();
     unsigned bSize = b.WordCount();
-
-    assert(bSize);
 
     if (a.PositiveCompare(b) == -1)
     {
@@ -3429,8 +3374,6 @@ Integer Integer::Modulo(const Integer &b) const
 void Integer::Divide(word &remainder, Integer &quotient,
                      const Integer &dividend, word divisor)
 {
-    assert(divisor);
-
     if ((divisor & (divisor-1)) == 0)	// divisor is a power of 2
     {
         quotient = dividend >> (BitPrecision(divisor)-1);
@@ -3470,8 +3413,6 @@ Integer Integer::DividedBy(word b) const
 
 word Integer::Modulo(word divisor) const
 {
-    assert(divisor);
-
     word remainder;
 
     if ((divisor & (divisor-1)) == 0)	// divisor is a power of 2
@@ -3517,7 +3458,6 @@ Integer Integer::SquareRoot() const
 
     // overestimate square root
     Integer x, y = Power2((BitCount()+1)/2);
-    assert(y*y >= *this);
 
     do
     {
@@ -3562,8 +3502,6 @@ Integer Integer::Gcd(const Integer &a, const Integer &b)
 
 Integer Integer::InverseMod(const Integer &m) const
 {
-    assert(m.NotNegative());
-
     if (IsNegative() || *this>=m)
         return (*this%m).InverseMod(m);
 
@@ -3806,7 +3744,7 @@ void MontgomeryReduce(word *R, word *T, const word *X, const word *M,
     word borrow = Subtract(T, X+N, T, N);
     // defend against timing attack by doing this Add even when not needed
     word carry = Add(T+N, T, M, N);
-    assert(carry || !borrow);
+    (void)carry;            // shut up compiler
     CopyWords(R, T + (borrow ? N : 0), N);
 }
 
@@ -3862,7 +3800,6 @@ MontgomeryRepresentation::MontgomeryRepresentation(const Integer &m)
       u((word)0, modulus.reg_.size()),
       workspace(5*modulus.reg_.size())
 {
-    assert(modulus.IsOdd());
     RecursiveInverseModPower2(u.reg_.get_buffer(), workspace.get_buffer(),
                               modulus.reg_.get_buffer(), modulus.reg_.size());
 }
@@ -3873,7 +3810,6 @@ const Integer& MontgomeryRepresentation::Multiply(const Integer &a,
     word *const T = workspace.begin();
     word *const R = result.reg_.begin();
     const unsigned int N = modulus.reg_.size();
-    assert(a.reg_.size()<=N && b.reg_.size()<=N);
 
     AsymmetricMultiply(T, T+2*N, a.reg_.get_buffer(), a.reg_.size(),
                        b.reg_.get_buffer(), b.reg_.size());
@@ -3888,7 +3824,6 @@ const Integer& MontgomeryRepresentation::Square(const Integer &a) const
     word *const T = workspace.begin();
     word *const R = result.reg_.begin();
     const unsigned int N = modulus.reg_.size();
-    assert(a.reg_.size()<=N);
 
     TaoCrypt::Square(T, T+2*N, a.reg_.get_buffer(), a.reg_.size());
     SetWords(T+2*a.reg_.size(), 0, 2*N-2*a.reg_.size());
@@ -3902,7 +3837,6 @@ Integer MontgomeryRepresentation::ConvertOut(const Integer &a) const
     word *const T = workspace.begin();
     word *const R = result.reg_.begin();
     const unsigned int N = modulus.reg_.size();
-    assert(a.reg_.size()<=N);
 
     CopyWords(T, a.reg_.get_buffer(), a.reg_.size());
     SetWords(T+a.reg_.size(), 0, 2*N-a.reg_.size());
@@ -3919,7 +3853,6 @@ const Integer& MontgomeryRepresentation::MultiplicativeInverse(
     word *const T = workspace.begin();
     word *const R = result.reg_.begin();
     const unsigned int N = modulus.reg_.size();
-    assert(a.reg_.size()<=N);
 
     CopyWords(T, a.reg_.get_buffer(), a.reg_.size());
     SetWords(T+a.reg_.size(), 0, 2*N-a.reg_.size());

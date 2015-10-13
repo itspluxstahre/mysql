@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -156,9 +156,10 @@ page_zip_validate_low(
 /*==================*/
 	const page_zip_des_t*	page_zip,/*!< in: compressed page */
 	const page_t*		page,	/*!< in: uncompressed page */
+	const dict_index_t*	index,	/*!< in: index of the page, if known */
 	ibool			sloppy)	/*!< in: FALSE=strict,
 					TRUE=ignore the MIN_REC_FLAG */
-	__attribute__((nonnull));
+	__attribute__((nonnull(1,2)));
 /**********************************************************************//**
 Check that the compressed and decompressed pages match. */
 UNIV_INTERN
@@ -166,8 +167,9 @@ ibool
 page_zip_validate(
 /*==============*/
 	const page_zip_des_t*	page_zip,/*!< in: compressed page */
-	const page_t*		page)	/*!< in: uncompressed page */
-	__attribute__((nonnull));
+	const page_t*		page,	/*!< in: uncompressed page */
+	const dict_index_t*	index)	/*!< in: index of the page, if known */
+	__attribute__((nonnull(1,2)));
 #endif /* UNIV_ZIP_DEBUG */
 
 /**********************************************************************//**

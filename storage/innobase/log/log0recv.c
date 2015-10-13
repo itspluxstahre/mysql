@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -965,8 +965,11 @@ recv_parse_or_apply_log_rec_body(
 				not NULL, then the log record is
 				applied to the page, and the log
 				record should be complete then */
-	mtr_t*		mtr)	/*!< in: mtr or NULL; should be non-NULL
+	mtr_t*		mtr,	/*!< in: mtr or NULL; should be non-NULL
 				if and only if block is non-NULL */
+	ulint		space_id)
+				/*!< in: tablespace id obtained by
+				parsing initial log record */
 {
 	dict_index_t*	index	= NULL;
 	page_t*		page;
@@ -1238,8 +1241,11 @@ recv_parse_or_apply_log_rec_body(
 		ut_ad(!page || page_type != FIL_PAGE_TYPE_ALLOCATED);
 		ptr = mlog_parse_string(ptr, end_ptr, page, page_zip);
 		break;
-	case MLOG_FILE_CREATE:
 	case MLOG_FILE_RENAME:
+		ptr = fil_op_log_parse_or_replay(ptr, end_ptr, type,
+						 space_id, 0);
+		break;
+	case MLOG_FILE_CREATE:
 	case MLOG_FILE_DELETE:
 	case MLOG_FILE_CREATE2:
 		ptr = fil_op_log_parse_or_replay(ptr, end_ptr, type, 0, 0);
@@ -1611,7 +1617,8 @@ recv_recover_page_func(
 
 			recv_parse_or_apply_log_rec_body(recv->type, buf,
 							 buf + recv->len,
-							 block, &mtr);
+							 block, &mtr,
+							 recv_addr->space);
 
 			end_lsn = recv->start_lsn + recv->len;
 			mach_write_to_8(FIL_PAGE_LSN + page, end_lsn);
@@ -1636,24 +1643,10 @@ recv_recover_page_func(
 	if (fil_page_get_type(page) == FIL_PAGE_INDEX) {
 		page_zip_des_t*	page_zip = buf_block_get_page_zip(block);
 
-		if (page_zip) {
-			ut_a(page_zip_validate_low(page_zip, page, FALSE));
-		}
+		ut_a(!page_zip
+		     || page_zip_validate_low(page_zip, page, NULL, FALSE));
 	}
 #endif /* UNIV_ZIP_DEBUG */
-
-	mutex_enter(&(recv_sys->mutex));
-
-	if (recv_max_page_lsn < page_lsn) {
-		recv_max_page_lsn = page_lsn;
-	}
-
-	recv_addr->state = RECV_PROCESSED;
-
-	ut_a(recv_sys->n_addrs);
-	recv_sys->n_addrs--;
-
-	mutex_exit(&(recv_sys->mutex));
 
 #ifndef UNIV_HOTBACKUP
 	if (modification_to_page) {
@@ -1671,6 +1664,20 @@ recv_recover_page_func(
 	mtr.modifications = FALSE;
 
 	mtr_commit(&mtr);
+
+	mutex_enter(&(recv_sys->mutex));
+
+	if (recv_max_page_lsn < page_lsn) {
+		recv_max_page_lsn = page_lsn;
+	}
+
+	recv_addr->state = RECV_PROCESSED;
+
+	ut_a(recv_sys->n_addrs);
+	recv_sys->n_addrs--;
+
+	mutex_exit(&(recv_sys->mutex));
+
 }
 
 #ifndef UNIV_HOTBACKUP
@@ -2079,7 +2086,7 @@ recv_parse_log_rec(
 #endif /* UNIV_LOG_LSN_DEBUG */
 
 	new_ptr = recv_parse_or_apply_log_rec_body(*type, new_ptr, end_ptr,
-						   NULL, NULL);
+						   NULL, NULL, *space);
 	if (UNIV_UNLIKELY(new_ptr == NULL)) {
 
 		return(0);

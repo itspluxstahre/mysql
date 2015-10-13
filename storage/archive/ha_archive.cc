@@ -1,5 +1,6 @@
 /*
-   Copyright (c) 2004, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2004, 2014, Oracle and/or its affiliates. All rights
+   reserved.
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License
@@ -114,6 +115,10 @@ static HASH archive_open_tables;
 #define DATA_BUFFER_SIZE 2       // Size of the data used in the data file
 #define ARCHIVE_CHECK_HEADER 254 // The number we use to determine corruption
 
+#ifdef HAVE_PSI_INTERFACE
+extern "C" PSI_file_key arch_key_file_data;
+#endif
+
 /* Static declarations for handerton */
 static handler *archive_create_handler(handlerton *hton, 
                                        TABLE_SHARE *table, 
@@ -159,6 +164,14 @@ static PSI_mutex_info all_archive_mutexes[]=
   { &az_key_mutex_ARCHIVE_SHARE_mutex, "ARCHIVE_SHARE::mutex", 0}
 };
 
+PSI_file_key arch_key_file_metadata, arch_key_file_data, arch_key_file_frm;
+static PSI_file_info all_archive_files[]=
+{
+    { &arch_key_file_metadata, "metadata", 0},
+    { &arch_key_file_data, "data", 0},
+    { &arch_key_file_frm, "FRM", 0}
+};
+
 static void init_archive_psi_keys(void)
 {
   const char* category= "archive";
@@ -169,6 +182,9 @@ static void init_archive_psi_keys(void)
 
   count= array_elements(all_archive_mutexes);
   PSI_server->register_mutex(category, all_archive_mutexes, count);
+
+  count= array_elements(all_archive_files);
+  PSI_server->register_file(category, all_archive_files, count);
 }
 
 #endif /* HAVE_PSI_INTERFACE */
@@ -262,7 +278,7 @@ int archive_discover(handlerton *hton, THD* thd, const char *db,
 
   build_table_filename(az_file, sizeof(az_file) - 1, db, name, ARZ, 0);
 
-  if (!(my_stat(az_file, &file_stat, MYF(0))))
+  if (!(mysql_file_stat(/* arch_key_file_data */ 0, az_file, &file_stat, MYF(0))))
     goto err;
 
   if (!(azopen(&frm_stream, az_file, O_RDONLY|O_BINARY)))
@@ -712,7 +728,7 @@ int ha_archive::create(const char *name, TABLE *table_arg,
     There is a chance that the file was "discovered". In this case
     just use whatever file is there.
   */
-  if (!(my_stat(name_buff, &file_stat, MYF(0))))
+  if (!(mysql_file_stat(/* arch_key_file_data */ 0, name_buff, &file_stat, MYF(0))))
   {
     my_errno= 0;
     if (!(azopen(&create_stream, name_buff, O_CREAT|O_RDWR|O_BINARY)))
@@ -729,19 +745,19 @@ int ha_archive::create(const char *name, TABLE *table_arg,
     /*
       Here is where we open up the frm and pass it to archive to store 
     */
-    if ((frm_file= my_open(name_buff, O_RDONLY, MYF(0))) > 0)
+    if ((frm_file= mysql_file_open(arch_key_file_frm, name_buff, O_RDONLY, MYF(0))) >= 0)
     {
       if (!mysql_file_fstat(frm_file, &file_stat, MYF(MY_WME)))
       {
         frm_ptr= (uchar *)my_malloc(sizeof(uchar) * file_stat.st_size, MYF(0));
         if (frm_ptr)
         {
-          my_read(frm_file, frm_ptr, file_stat.st_size, MYF(0));
+          mysql_file_read(frm_file, frm_ptr, file_stat.st_size, MYF(0));
           azwrite_frm(&create_stream, (char *)frm_ptr, file_stat.st_size);
           my_free(frm_ptr);
         }
       }
-      my_close(frm_file, MYF(0));
+      mysql_file_close(frm_file, MYF(0));
     }
 
     if (create_info->comment.str)
@@ -878,15 +894,16 @@ int ha_archive::write_row(uchar *buf)
   if (share->crashed)
     DBUG_RETURN(HA_ERR_CRASHED_ON_USAGE);
 
-  ha_statistic_increment(&SSV::ha_write_count);
+  ha_macro_statistic_inc(ha_write_count);
   if (table->timestamp_field_type & TIMESTAMP_AUTO_SET_ON_INSERT)
     table->timestamp_field->set_time();
   mysql_mutex_lock(&share->mutex);
 
-  if (!share->archive_write_open)
-    if (init_archive_writer())
-      DBUG_RETURN(HA_ERR_CRASHED_ON_USAGE);
-
+  if (!share->archive_write_open && init_archive_writer())
+  {
+    rc= HA_ERR_CRASHED_ON_USAGE;
+    goto error;
+  }
 
   if (table->next_number_field && record == table->record[0])
   {
@@ -965,8 +982,8 @@ int ha_archive::write_row(uchar *buf)
   rc= real_write_row(buf,  &(share->archive_write));
 error:
   mysql_mutex_unlock(&share->mutex);
-  my_free(read_buf);
-
+  if (read_buf)
+    my_free(read_buf);
   DBUG_RETURN(rc);
 }
 
@@ -1062,6 +1079,7 @@ int ha_archive::index_next(uchar * buf)
   }
 
   rc= found ? 0 : HA_ERR_END_OF_FILE;
+  table->status= rc ? STATUS_NOT_FOUND : 0;
   MYSQL_INDEX_READ_ROW_DONE(rc);
   DBUG_RETURN(rc);
 }
@@ -1314,7 +1332,7 @@ int ha_archive::rnd_next(uchar *buf)
   }
   scan_rows--;
 
-  ha_statistic_increment(&SSV::ha_read_rnd_next_count);
+  ha_macro_statistic_inc(ha_read_rnd_next_count);
   current_position= aztell(&archive);
   rc= get_row(&archive, buf);
 
@@ -1353,7 +1371,7 @@ int ha_archive::rnd_pos(uchar * buf, uchar *pos)
   DBUG_ENTER("ha_archive::rnd_pos");
   MYSQL_READ_ROW_START(table_share->db.str,
                        table_share->table_name.str, FALSE);
-  ha_statistic_increment(&SSV::ha_read_rnd_next_count);
+  ha_macro_statistic_inc(ha_read_rnd_next_count);
   current_position= (my_off_t)my_get_ptr(pos, ref_length);
   if (azseek(&archive, current_position, SEEK_SET) == (my_off_t)(-1L))
   {
@@ -1394,6 +1412,7 @@ int ha_archive::optimize(THD* thd, HA_CHECK_OPT* check_opt)
   char writer_filename[FN_REFLEN];
   DBUG_ENTER("ha_archive::optimize");
 
+  mysql_mutex_lock(&share->mutex);
   init_archive_reader();
 
   // now we close both our writer and our reader for the rename
@@ -1408,7 +1427,10 @@ int ha_archive::optimize(THD* thd, HA_CHECK_OPT* check_opt)
             MY_REPLACE_EXT | MY_UNPACK_FILENAME);
 
   if (!(azopen(&writer, writer_filename, O_CREAT|O_RDWR|O_BINARY)))
+  {
+    mysql_mutex_unlock(&share->mutex);
     DBUG_RETURN(HA_ERR_CRASHED_ON_USAGE); 
+  }
 
   /*
     Transfer the embedded FRM so that the file can be discoverable.
@@ -1494,10 +1516,12 @@ int ha_archive::optimize(THD* thd, HA_CHECK_OPT* check_opt)
   rc= my_rename(writer_filename, share->data_file_name, MYF(0));
 
 
+  mysql_mutex_unlock(&share->mutex);
   DBUG_RETURN(rc);
 error:
   DBUG_PRINT("ha_archive", ("Failed to recover, error was %d", rc));
   azclose(&writer);
+  mysql_mutex_unlock(&share->mutex);
 
   DBUG_RETURN(rc); 
 }
@@ -1601,7 +1625,7 @@ int ha_archive::info(uint flag)
   {
     MY_STAT file_stat;  // Stat information for the data file
 
-    (void) my_stat(share->data_file_name, &file_stat, MYF(MY_WME));
+    (void) mysql_file_stat(/* arch_key_file_data */ 0, share->data_file_name, &file_stat, MYF(MY_WME));
 
     if (flag & HA_STATUS_TIME)
       stats.update_time= (ulong) file_stat.st_mtime;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -97,6 +97,9 @@
 
 #include "sql_timer.h"        // thd_timer_set, thd_timer_reset
 
+#include "my_rdtsc.h"         // my_timer_microseconds
+#include "query_stats.h"
+
 #define FLAGSTR(V,F) ((V)&(F)?#F" ":"")
 
 /**
@@ -116,6 +119,9 @@
 
 static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables);
 static void sql_kill(THD *thd, ulong id, bool only_kill_query);
+
+// Uses the THD to update the global stats by user name and client IP
+void update_global_user_stats(THD* thd, bool create_user, time_t now);
 
 const char *any_db="*any*";	// Special symbol for check_access
 
@@ -239,8 +245,8 @@ void init_update_queries(void)
   /* Initialize the server command flags array. */
   memset(server_command_flags, 0, sizeof(server_command_flags));
 
-  server_command_flags[COM_STATISTICS]= CF_SKIP_QUERY_ID | CF_SKIP_QUESTIONS;
-  server_command_flags[COM_PING]=       CF_SKIP_QUERY_ID | CF_SKIP_QUESTIONS;
+  server_command_flags[COM_STATISTICS]=   CF_SKIP_QUESTIONS;
+  server_command_flags[COM_PING]=         CF_SKIP_QUESTIONS;
   server_command_flags[COM_STMT_PREPARE]= CF_SKIP_QUESTIONS;
   server_command_flags[COM_STMT_CLOSE]=   CF_SKIP_QUESTIONS;
   server_command_flags[COM_STMT_RESET]=   CF_SKIP_QUESTIONS;
@@ -699,6 +705,12 @@ bool do_command(THD *thd)
   */
   thd->clear_error();				// Clear error message
   thd->stmt_da->reset_diagnostics_area();
+  thd->updated_row_count=    0;
+  thd->busy_time=            0;
+  thd->cpu_time=             0;
+  thd->bytes_received=       0;
+  thd->bytes_sent=           0;
+  thd->binlog_bytes_written= 0;
 
   net_new_transaction(net);
 
@@ -991,6 +1003,10 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
                       (char *) thd->security_ctx->host_or_ip);
   
   thd->command=command;
+  /* To increment the corrent command counter for user stats, 'command' must
+     be saved because it is set to COM_SLEEP at the end of this function.
+  */
+  thd->old_command= command;
   /*
     Commands which always take a long time are logged into
     the slow log only if opt_log_slow_admin_statements is set.
@@ -1010,9 +1026,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
     thd->security_ctx->master_access|= SHUTDOWN_ACL;
     command= COM_SHUTDOWN;
   }
-  thd->set_query_id(get_query_id());
-  if (!(server_command_flags[command] & CF_SKIP_QUERY_ID))
-    next_query_id();
+  thd->set_query_id(next_query_id());
   inc_thread_running();
 
   if (!(server_command_flags[command] & CF_SKIP_QUESTIONS))
@@ -1058,7 +1072,8 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
 
     uint save_db_length= thd->db_length;
     char *save_db= thd->db;
-    USER_CONN *save_user_connect= thd->user_connect;
+    USER_CONN *save_user_connect=
+      const_cast<USER_CONN*>(thd->get_user_connect());
     Security_context save_security_ctx= *thd->security_ctx;
     CHARSET_INFO *save_character_set_client=
       thd->variables.character_set_client;
@@ -1067,18 +1082,35 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
     CHARSET_INFO *save_character_set_results=
       thd->variables.character_set_results;
 
-    rc= acl_authenticate(thd, 0, packet_length);
+    /* Ensure we don't free security_ctx->user in case we have to revert */
+    thd->security_ctx->user= 0;
+    thd->set_user_connect(0);
+
+    /*
+      to limit COM_CHANGE_USER ability to brute-force passwords,
+      we only allow three unsuccessful COM_CHANGE_USER per connection.
+    */
+    if (thd->failed_com_change_user >= 3)
+    {
+      my_message(ER_UNKNOWN_COM_ERROR, ER(ER_UNKNOWN_COM_ERROR), MYF(0));
+      rc= 1;
+    }
+    else
+      rc= acl_authenticate(thd, 0, packet_length);
+
     MYSQL_AUDIT_NOTIFY_CONNECTION_CHANGE_USER(thd);
     if (rc)
     {
       my_free(thd->security_ctx->user);
       *thd->security_ctx= save_security_ctx;
-      thd->user_connect= save_user_connect;
+      thd->set_user_connect(save_user_connect);
       thd->reset_db (save_db, save_db_length);
       thd->variables.character_set_client= save_character_set_client;
       thd->variables.collation_connection= save_collation_connection;
       thd->variables.character_set_results= save_character_set_results;
       thd->update_charset();
+      thd->failed_com_change_user++;
+      sleep(1);
     }
     else
     {
@@ -1087,7 +1119,9 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       if (save_user_connect)
 	decrease_user_connections(save_user_connect);
 #endif /* NO_EMBEDDED_ACCESS_CHECKS */
+      mysql_mutex_lock(&thd->LOCK_thd_data);
       my_free(save_db);
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
       my_free(save_security_ctx.user);
     }
     break;
@@ -1156,6 +1190,11 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       thd->update_server_status();
       thd->protocol->end_statement();
       query_cache_end_of_result(thd);
+
+      mysql_audit_general(thd, MYSQL_AUDIT_GENERAL_STATUS,
+                          thd->stmt_da->is_error() ? thd->stmt_da->sql_errno()
+                          : 0, command_name[command].str);
+
       ulong length= (ulong)(packet_end - beginning_of_next_stmt);
 
       log_slow_statement(thd);
@@ -1285,6 +1324,18 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
     DBUG_ASSERT(thd->transaction.stmt.is_empty());
     close_thread_tables(thd);
     thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
+
+    if (thd->transaction_rollback_request)
+    {
+      /*
+        Transaction rollback was requested since MDL deadlock was
+        discovered while trying to open tables. Rollback transaction
+        in all storage engines including binary log and release all
+        locks.
+      */
+      trans_rollback_implicit(thd);
+      thd->mdl_context.release_transactional_locks();
+    }
 
     thd->cleanup_after_query();
     break;
@@ -1688,6 +1739,13 @@ int prepare_schema_table(THD *thd, LEX *lex, Table_ident *table_ident,
     thd->profiling.discard_current_query();
 #endif
     break;
+  case SCH_USER_STATS:
+  case SCH_CLIENT_STATS:
+  case SCH_THREAD_STATS:
+    if (check_global_access(thd, SUPER_ACL | PROCESS_ACL))
+      DBUG_RETURN(1);
+  case SCH_TABLE_STATS:
+  case SCH_INDEX_STATS:
   case SCH_OPEN_TABLES:
   case SCH_VARIABLES:
   case SCH_STATUS:
@@ -1861,6 +1919,7 @@ bool sp_process_definer(THD *thd)
                        thd->security_ctx->priv_host)) &&
         check_global_access(thd, SUPER_ACL))
     {
+      thd->diff_access_denied_errors++;
       my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), "SUPER");
       DBUG_RETURN(TRUE);
     }
@@ -1936,7 +1995,7 @@ err:
     can free its locks if LOCK TABLES locked some tables before finding
     that it can't lock a table in its list
   */
-  trans_commit_implicit(thd);
+  trans_rollback(thd);
   /* Close tables and release metadata locks. */
   close_thread_tables(thd);
   DBUG_ASSERT(!thd->locked_tables_mode);
@@ -1981,12 +2040,26 @@ mysql_execute_command(THD *thd)
   /* have table map for update for multi-update statement (BUG#37051) */
   bool have_table_map_for_update= FALSE;
 #endif
+  ulonglong query_start_time= 0;
   DBUG_ENTER("mysql_execute_command");
 #ifdef WITH_PARTITION_STORAGE_ENGINE
   thd->work_part_info= 0;
 #endif
 
+  if (opt_twitter_query_stats && TRACK_QUERY(lex->sql_command))
+  {
+    thd->query_stats= track_query_stats(thd->query(), thd->query_length());
+    query_start_time= my_timer_microseconds();
+  }
+
   DBUG_ASSERT(thd->transaction.stmt.is_empty() || thd->in_sub_stmt);
+  /*
+    Each statement or replication event which might produce deadlock
+    should handle transaction rollback on its own. So by the start of
+    the next statement transaction rollback request should be fulfilled
+    already.
+  */
+  DBUG_ASSERT(! thd->transaction_rollback_request || thd->in_sub_stmt);
   /*
     In many cases first table of main SELECT_LEX have special meaning =>
     check that it is first table in global list and relink it first in 
@@ -2134,6 +2207,11 @@ mysql_execute_command(THD *thd)
       }
       DBUG_RETURN(0);
     }
+    /* 
+       Execute deferred events first
+    */
+    if (slave_execute_deferred_events(thd))
+      DBUG_RETURN(-1);
   }
   else
   {
@@ -2181,8 +2259,8 @@ mysql_execute_command(THD *thd)
       or triggers as all such statements prohibited there.
     */
     DBUG_ASSERT(! thd->in_sub_stmt);
-    /* Commit or rollback the statement transaction. */
-    thd->is_error() ? trans_rollback_stmt(thd) : trans_commit_stmt(thd);
+    /* Statement transaction still should not be started. */
+    DBUG_ASSERT(thd->transaction.stmt.is_empty());
     /* Commit the normal transaction if one is active. */
     if (trans_commit_implicit(thd))
       goto error;
@@ -2799,7 +2877,7 @@ end_with_restore_list:
     goto error;
 #else
     {
-      if (check_global_access(thd, SUPER_ACL))
+      if (check_global_access(thd, SUPER_ACL | REPL_CLIENT_ACL))
 	goto error;
       res = show_binlogs(thd);
       break;
@@ -3040,6 +3118,9 @@ end_with_restore_list:
       thd->first_successful_insert_id_in_cur_stmt=
         thd->first_successful_insert_id_in_prev_stmt;
 
+    /* maintain global count of inserts that touch zero rows */
+    if (0 == thd->get_row_count_func())
+      my_atomic_add64((longlong*)&com_insert_noop, 1);
     DBUG_EXECUTE_IF("after_mysql_insert",
                     {
                       const char act[]=
@@ -3597,7 +3678,8 @@ end_with_restore_list:
         check_global_access(thd,CREATE_USER_ACL))
       break;
     /* Conditionally writes to binlog */
-    if (!(res= mysql_drop_user(thd, lex->users_list)))
+    if (!(res= mysql_drop_user(thd, lex->users_list)) ||
+        thd->lex->drop_if_exists)
       my_ok(thd);
     break;
   }
@@ -4581,6 +4663,19 @@ finish:
   if (reset_timer)
     reset_statement_timer(thd);
 
+  if (opt_twitter_query_stats && thd->query_stats)
+  {
+    QUERY_STATS *qry_stats = thd->query_stats;
+    DBUG_ASSERT(qry_stats->magic == QUERY_STATS_MAGIC);
+    ulonglong elapsed = my_timer_microseconds() - query_start_time;
+    my_atomic_add64((longlong*)&qry_stats->latency, elapsed);
+    my_atomic_add64((longlong*)&qry_stats->count, 1);
+    ulonglong old_max_latency = qry_stats->max_latency;
+    if (elapsed > old_max_latency)
+      my_atomic_cas64((longlong*)&qry_stats->max_latency,
+                      (longlong*)&old_max_latency, elapsed);
+  }
+
   if (! thd->in_sub_stmt)
   {
     /* report error issued during command execution */
@@ -4618,7 +4713,17 @@ finish:
     DEBUG_SYNC(thd, "execute_command_after_close_tables");
 #endif
 
-  if (stmt_causes_implicit_commit(thd, CF_IMPLICIT_COMMIT_END))
+  if (! thd->in_sub_stmt && thd->transaction_rollback_request)
+  {
+    /*
+      We are not in sub-statement and transaction rollback was requested by
+      one of storage engines (e.g. due to deadlock). Rollback transaction in
+      all storage engines including binary log.
+    */
+    trans_rollback_implicit(thd);
+    thd->mdl_context.release_transactional_locks();
+  }
+  else if (stmt_causes_implicit_commit(thd, CF_IMPLICIT_COMMIT_END))
   {
     /* No transaction control allowed in sub-statements. */
     DBUG_ASSERT(! thd->in_sub_stmt);
@@ -4895,6 +5000,7 @@ check_access(THD *thd, ulong want_access, const char *db, ulong *save_priv,
       case ACL_INTERNAL_ACCESS_DENIED:
         if (! no_errors)
         {
+          thd->diff_access_denied_errors++;
           my_error(ER_DBACCESS_DENIED_ERROR, MYF(0),
                    sctx->priv_user, sctx->priv_host, db);
         }
@@ -4921,8 +5027,8 @@ check_access(THD *thd, ulong want_access, const char *db, ulong *save_priv,
     if (!(sctx->master_access & SELECT_ACL))
     {
       if (db && (!thd->db || db_is_pattern || strcmp(db, thd->db)))
-        db_access= acl_get(sctx->host, sctx->ip, sctx->priv_user, db,
-                           db_is_pattern);
+        db_access= acl_get(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
+                           sctx->priv_user, db, db_is_pattern);
       else
       {
         /* get access for current db */
@@ -4945,6 +5051,7 @@ check_access(THD *thd, ulong want_access, const char *db, ulong *save_priv,
     DBUG_PRINT("error",("No possible access"));
     if (!no_errors)
     {
+      thd->diff_access_denied_errors++;
       if (thd->password == 2)
         my_error(ER_ACCESS_DENIED_NO_PASSWORD_ERROR, MYF(0),
                  sctx->priv_user,
@@ -4970,8 +5077,8 @@ check_access(THD *thd, ulong want_access, const char *db, ulong *save_priv,
   }
 
   if (db && (!thd->db || db_is_pattern || strcmp(db,thd->db)))
-    db_access= acl_get(sctx->host, sctx->ip, sctx->priv_user, db,
-                       db_is_pattern);
+    db_access= acl_get(sctx->get_host()->ptr(), sctx->get_ip()->ptr(),
+                       sctx->priv_user, db, db_is_pattern);
   else
     db_access= sctx->db_access;
   DBUG_PRINT("info",("db_access: %lu  want_access: %lu",
@@ -5059,6 +5166,7 @@ static bool check_show_access(THD *thd, TABLE_LIST *table)
 
     if (!thd->col_access && check_grant_db(thd, dst_db_name))
     {
+      thd->diff_access_denied_errors++;
       my_error(ER_DBACCESS_DENIED_ERROR, MYF(0),
                thd->security_ctx->priv_user,
                thd->security_ctx->priv_host,
@@ -5329,12 +5437,128 @@ bool check_global_access(THD *thd, ulong want_access)
   if ((thd->security_ctx->master_access & want_access))
     return 0;
   get_privilege_desc(command, sizeof(command), want_access);
+  thd->diff_access_denied_errors++;
   my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), command);
   return 1;
 #else
   return 0;
 #endif
 }
+
+
+/**
+  Checks foreign key's parent table access.
+
+  @param thd	       [in]	Thread handler
+  @param create_info   [in]     Create information (like MAX_ROWS, ENGINE or
+                                temporary table flag)
+  @param alter_info    [in]     Initial list of columns and indexes for the
+                                table to be created
+
+  @retval
+   false  ok.
+  @retval
+   true	  error or access denied. Error is sent to client in this case.
+*/
+bool check_fk_parent_table_access(THD *thd,
+                                  HA_CREATE_INFO *create_info,
+                                  Alter_info *alter_info)
+{
+  Key *key;
+  List_iterator<Key> key_iterator(alter_info->key_list);
+  handlerton *db_type= create_info->db_type ? create_info->db_type :
+                                             ha_default_handlerton(thd);
+
+  // Return if engine does not support Foreign key Constraint.
+  if (!ha_check_storage_engine_flag(db_type, HTON_SUPPORTS_FOREIGN_KEYS))
+    return false;
+
+  while ((key= key_iterator++))
+  {
+    if (key->type == Key::FOREIGN_KEY)
+    {
+      TABLE_LIST parent_table;
+      bool is_qualified_table_name;
+      Foreign_key *fk_key= (Foreign_key *)key;
+      LEX_STRING db_name;
+      LEX_STRING table_name= { fk_key->ref_table->table.str,
+                               fk_key->ref_table->table.length };
+      const ulong privileges= (SELECT_ACL | INSERT_ACL | UPDATE_ACL |
+                               DELETE_ACL | REFERENCES_ACL);
+
+      // Check if tablename is valid or not.
+      DBUG_ASSERT(table_name.str != NULL);
+      if (check_table_name(table_name.str, table_name.length, false))
+      {
+        my_error(ER_WRONG_TABLE_NAME, MYF(0), table_name.str);
+        return true;
+      }
+
+      if (fk_key->ref_table->db.str)
+      {
+        is_qualified_table_name= true;
+        db_name.str= (char *) thd->memdup(fk_key->ref_table->db.str,
+                                          fk_key->ref_table->db.length+1);
+        db_name.length= fk_key->ref_table->db.length;
+
+        // Check if database name is valid or not.
+        if (fk_key->ref_table->db.str && check_db_name(&db_name))
+        {
+          my_error(ER_WRONG_DB_NAME, MYF(0), db_name.str);
+          return true;
+        }
+      }
+      else if (thd->lex->copy_db_to(&db_name.str, &db_name.length))
+        return true;
+      else
+        is_qualified_table_name= false;
+
+      // if lower_case_table_names is set then convert tablename to lower case.
+      if (lower_case_table_names)
+      {
+        table_name.str= (char *) thd->memdup(fk_key->ref_table->table.str,
+                                             fk_key->ref_table->table.length+1);
+        table_name.length= my_casedn_str(files_charset_info, table_name.str);
+      }
+
+      parent_table.init_one_table(db_name.str, db_name.length,
+                                  table_name.str, table_name.length,
+                                  table_name.str, TL_IGNORE);
+
+      /*
+       Check if user has any of the "privileges" at table level on
+       "parent_table".
+       Having privilege on any of the parent_table column is not
+       enough so checking whether user has any of the "privileges"
+       at table level only here.
+      */
+      if (check_some_access(thd, privileges, &parent_table) ||
+          parent_table.grant.want_privilege)
+      {
+        if (is_qualified_table_name)
+        {
+          const size_t qualified_table_name_len= NAME_LEN + 1 + NAME_LEN + 1;
+          char *qualified_table_name= (char *) thd->alloc(qualified_table_name_len);
+
+          my_snprintf(qualified_table_name, qualified_table_name_len, "%s.%s",
+                      db_name.str, table_name.str);
+          table_name.str= qualified_table_name;
+        }
+
+        my_error(ER_TABLEACCESS_DENIED_ERROR, MYF(0),
+                 "REFERENCES",
+                 thd->security_ctx->priv_user,
+                 thd->security_ctx->host_or_ip,
+                 table_name.str);
+
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 
 /****************************************************************************
 	Check stack size; Send error if there isn't enough stack to continue
@@ -5486,6 +5710,18 @@ void THD::reset_for_next_command()
   thd->stmt_da->reset_diagnostics_area();
   thd->warning_info->reset_for_next_command();
   thd->rand_used= 0;
+
+  /* maintain global stats before resetting per-thread stats */
+  my_atomic_add64((longlong*)&rows_sent, thd->sent_row_count);
+  my_atomic_add64((longlong*)&rows_examined, thd->examined_row_count);
+  /* maintain query row stats before clear per-thread query stats */
+  if (thd->query_stats)
+  {
+    DBUG_ASSERT(thd->query_stats->magic == QUERY_STATS_MAGIC);
+    my_atomic_add64((longlong*)&thd->query_stats->rows_sent, thd->sent_row_count);
+    my_atomic_add64((longlong*)&thd->query_stats->rows_examined, thd->examined_row_count);
+    thd->query_stats= 0;
+  }
   thd->sent_row_count= thd->examined_row_count= 0;
 
   thd->reset_current_stmt_binlog_format_row();
@@ -5652,6 +5888,10 @@ void mysql_init_multi_delete(LEX *lex)
   lex->query_tables_last= &lex->query_tables;
 }
 
+/** Twitter write query throttling apply to mutations only */
+#define TWITTER_QUERY_THROTTLE_WRITES(sqlcmd) \
+  (sqlcmd == SQLCOM_UPDATE || sqlcmd == SQLCOM_INSERT || sqlcmd == SQLCOM_DELETE || \
+   sqlcmd == SQLCOM_INSERT_SELECT || sqlcmd == SQLCOM_REPLACE || sqlcmd == SQLCOM_REPLACE_SELECT)
 
 /*
   When you modify mysql_parse(), you may need to mofify
@@ -5672,6 +5912,9 @@ void mysql_parse(THD *thd, char *rawbuf, uint length,
                  Parser_state *parser_state)
 {
   int error __attribute__((unused));
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  my_bool twitter_audit = opt_twitter_audit_log;
+#endif
   DBUG_ENTER("mysql_parse");
 
   DBUG_EXECUTE_IF("parser_debug", turn_parser_debug_on(););
@@ -5695,16 +5938,79 @@ void mysql_parse(THD *thd, char *rawbuf, uint length,
   lex_start(thd);
   mysql_reset_thd_for_next_command(thd);
 
+  int start_time_error=   0;
+  int end_time_error=     0;
+  struct timeval start_time, end_time;
+  double start_usecs=     0;
+  double end_usecs=       0;
+  /* cpu time */
+  int cputime_error=      0;
+  struct timespec tp;
+  double start_cpu_nsecs= 0;
+  double end_cpu_nsecs=   0;
+  uint32 writes_running=  -1;
+  bool write_query=       false;
+
+  if (unlikely(opt_userstat))
+  {
+#ifdef HAVE_CLOCK_GETTIME
+    /* get start cputime */
+    if (!(cputime_error = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tp)))
+      start_cpu_nsecs = tp.tv_sec*1000000000.0+tp.tv_nsec;
+#endif
+
+    // Gets the start time, in order to measure how long this command takes.
+    if (!(start_time_error = gettimeofday(&start_time, NULL)))
+    {
+      start_usecs = start_time.tv_sec * 1000000.0 + start_time.tv_usec;
+    }
+  }
+
   if (query_cache_send_result_to_client(thd, rawbuf, length) <= 0)
   {
     LEX *lex= thd->lex;
 
     bool err= parse_sql(thd, parser_state, NULL);
 
-    if (!err)
+    write_query= TWITTER_QUERY_THROTTLE_WRITES(lex->sql_command);
+    if (write_query)
+    {
+      my_atomic_add64((longlong*)&write_queries, 1);
+      writes_running= inc_write_query_running();
+    }
+    else if (lex->sql_command == SQLCOM_SELECT)
+      my_atomic_add64((longlong*)&read_queries, 1);
+
+    /* throttle the server by denying non-superuser query */
+    bool query_throttled= FALSE;
+    if (!(thd->security_ctx->master_access & SUPER_ACL)) {
+      /* general query throttling applies to select and mutation queries */
+      if (opt_twitter_query_throttling_limit &&
+          (lex->sql_command == SQLCOM_SELECT || write_query))
+      {
+        uint32 running_threads= get_thread_running();
+        if (running_threads > opt_twitter_query_throttling_limit)
+        {
+          query_throttled= TRUE;
+          my_atomic_add64((longlong*)&total_query_rejected, 1);
+          my_error(ER_QUERY_THROTTLED, MYF(0));
+        }
+      }
+      /* write throttling applies to mutation queries only */
+      if (opt_twitter_write_throttling_limit && write_query && !query_throttled &&
+          writes_running > opt_twitter_write_throttling_limit)
+      {
+        query_throttled= TRUE;
+        my_atomic_add64((longlong*)&total_query_rejected, 1);
+        my_atomic_add64((longlong*)&write_query_rejected, 1);
+        my_error(ER_QUERY_THROTTLED, MYF(0));
+      }
+    }
+
+    if (!err && !query_throttled)
     {
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
-      if (mqh_used && thd->user_connect &&
+      if (mqh_used && thd->get_user_connect() &&
 	  check_mqh(thd, lex->sql_command))
       {
 	thd->net.error = 0;
@@ -5752,17 +6058,76 @@ void mysql_parse(THD *thd, char *rawbuf, uint length,
     else
     {
       DBUG_ASSERT(thd->is_error());
-      DBUG_PRINT("info",("Command aborted. Fatal_error: %d",
-			 thd->is_fatal_error));
+      /* no need of logging throttled query in error log */
+      if (!query_throttled)
+        DBUG_PRINT("info",("Command aborted. Fatal_error: %d",
+                           thd->is_fatal_error));
 
       query_cache_abort(&thd->query_cache_tls);
     }
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+    twitter_audit_log(thd, COM_QUERY, thd->query(), thd->query_length(),
+                      twitter_audit);
+#endif
     thd_proc_info(thd, "freeing items");
     sp_cache_enforce_limit(thd->sp_proc_cache, stored_program_cache_size);
     sp_cache_enforce_limit(thd->sp_func_cache, stored_program_cache_size);
     thd->end_statement();
     thd->cleanup_after_query();
     DBUG_ASSERT(thd->change_list.is_empty());
+  }
+
+  if (write_query)
+    dec_write_query_running();
+
+  if (unlikely(opt_userstat))
+  {
+    // Gets the end time.
+    if (!(end_time_error= gettimeofday(&end_time, NULL)))
+    {
+      end_usecs= end_time.tv_sec * 1000000.0 + end_time.tv_usec;
+    }
+
+    // Calculates the difference between the end and start times.
+    if (start_usecs && end_usecs >= start_usecs && !start_time_error && !end_time_error)
+    {
+      thd->busy_time= (end_usecs - start_usecs) / 1000000;
+      // In case there are bad values, 2629743 is the #seconds in a month.
+      if (thd->busy_time > 2629743)
+      {
+        thd->busy_time= 0;
+      }
+    }
+    else
+    {
+      // end time went back in time, or gettimeofday() failed.
+      thd->busy_time= 0;
+    }
+
+#ifdef HAVE_CLOCK_GETTIME
+    /* get end cputime */
+    if (!cputime_error &&
+        !(cputime_error = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tp)))
+      end_cpu_nsecs = tp.tv_sec*1000000000.0+tp.tv_nsec;
+#endif
+    if (start_cpu_nsecs && !cputime_error)
+    {
+      thd->cpu_time = (end_cpu_nsecs - start_cpu_nsecs) / 1000000000;
+      // In case there are bad values, 2629743 is the #seconds in a month.
+      if (thd->cpu_time > 2629743)
+      {
+        thd->cpu_time = 0;
+      }
+    }
+    else
+      thd->cpu_time = 0;
+  }
+
+  // Updates THD stats and the global user stats.
+  if (unlikely(opt_userstat))
+  {
+    thd->update_stats(true);
+    update_global_user_stats(thd, true, time(NULL));
   }
 
   DBUG_VOID_RETURN;
@@ -6071,6 +6436,7 @@ TABLE_LIST *st_select_lex::add_table_to_list(THD *thd,
   ptr->cacheable_table= 1;
   ptr->index_hints= index_hints_arg;
   ptr->option= option ? option->str : 0;
+  ptr->lock_table_no_wait = thd->lex->lock_table_no_wait ? TRUE : FALSE;
   /* check that used name is unique */
   if (lock_type != TL_IGNORE)
   {
@@ -6120,8 +6486,13 @@ TABLE_LIST *st_select_lex::add_table_to_list(THD *thd,
   ptr->next_name_resolution_table= NULL;
   /* Link table in global list (all used tables) */
   lex->add_to_query_tables(ptr);
-  ptr->mdl_request.init(MDL_key::TABLE, ptr->db, ptr->table_name, mdl_type,
-                        MDL_TRANSACTION);
+
+  // Pure table aliases do not need to be locked:
+  if (!test(table_options & TL_OPTION_ALIAS))
+  {
+    ptr->mdl_request.init(MDL_key::TABLE, ptr->db, ptr->table_name, mdl_type,
+                          MDL_TRANSACTION);
+  }
   DBUG_RETURN(ptr);
 }
 
@@ -6591,8 +6962,14 @@ uint kill_one_thread(THD *thd, ulong id, bool only_kill_query)
     if ((thd->security_ctx->master_access & SUPER_ACL) ||
         thd->security_ctx->user_matches(tmp->security_ctx))
     {
-      tmp->awake(only_kill_query ? THD::KILL_QUERY : THD::KILL_CONNECTION);
-      error=0;
+      /* process the kill only if thread is not already undergoing any kill
+         connection.
+      */
+      if (tmp->killed != THD::KILL_CONNECTION)
+      {
+        tmp->awake(only_kill_query ? THD::KILL_QUERY : THD::KILL_CONNECTION);
+      }
+      error= 0;
     }
     else
       error=ER_KILL_DENIED_ERROR;
@@ -7146,8 +7523,11 @@ bool create_table_precheck(THD *thd, TABLE_LIST *tables,
     if (check_table_access(thd, SELECT_ACL, tables, FALSE, UINT_MAX, FALSE))
       goto err;
   }
-  error= FALSE;
 
+  if (check_fk_parent_table_access(thd, &lex->create_info, &lex->alter_info))
+    goto err;
+
+  error= FALSE;
 err:
   DBUG_RETURN(error);
 }
@@ -7433,7 +7813,7 @@ bool check_host_name(LEX_STRING *str)
 }
 
 
-extern int MYSQLparse(void *thd); // from sql_yacc.cc
+extern int MYSQLparse(class THD *thd); // from sql_yacc.cc
 
 
 /**

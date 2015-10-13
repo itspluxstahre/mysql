@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -33,6 +33,7 @@
 #include "sql_audit.h"
 #include <mysql/plugin_auth.h>
 #include "lock.h"                               // MYSQL_LOCK_IGNORE_TIMEOUT
+#include "debug_sync.h"
 #define REPORT_TO_LOG  1
 #define REPORT_TO_USER 2
 
@@ -132,6 +133,12 @@ static int cur_plugin_info_interface_version[MYSQL_MAX_PLUGIN_TYPE_NUM]=
 #include "sql_plugin_services.h"
 
 /*
+  A mutex LOCK_plugin_delete must be acquired before calling plugin_del
+  function. 
+*/
+mysql_mutex_t LOCK_plugin_delete;
+
+/*
   A mutex LOCK_plugin must be acquired before accessing the
   following variables/structures.
   We are always manipulating ref count, so a rwlock here is unneccessary.
@@ -223,7 +230,7 @@ public:
              (plugin_var_arg->flags & PLUGIN_VAR_THDLOCAL ? SESSION : GLOBAL) |
              (plugin_var_arg->flags & PLUGIN_VAR_READONLY ? READONLY : 0),
              0, -1, NO_ARG, pluginvar_show_type(plugin_var_arg), 0, 0,
-             VARIABLE_NOT_IN_BINLOG, 0, 0, 0, 0, PARSE_NORMAL),
+             VARIABLE_NOT_IN_BINLOG, NULL, NULL, NULL, PARSE_NORMAL),
     plugin_var(plugin_var_arg), orig_pluginvar_name(plugin_var_arg->name)
   { plugin_var->name= name_arg; }
   sys_var_pluginvar *cast_pluginvar() { return this; }
@@ -714,7 +721,7 @@ bool plugin_is_ready(const LEX_STRING *name, int type)
 }
 
 
-SHOW_COMP_OPTION plugin_status(const char *name, int len, size_t type)
+SHOW_COMP_OPTION plugin_status(const char *name, size_t len, int type)
 {
   LEX_STRING plugin_name= { (char *) name, len };
   return plugin_status(&plugin_name, type);
@@ -949,6 +956,7 @@ static void plugin_del(struct st_plugin_int *plugin)
 {
   DBUG_ENTER("plugin_del(plugin)");
   mysql_mutex_assert_owner(&LOCK_plugin);
+  mysql_mutex_assert_owner(&LOCK_plugin_delete);
   /* Free allocated strings before deleting the plugin. */
   mysql_rwlock_wrlock(&LOCK_system_variables_hash);
   mysql_del_sys_var_chain(plugin->system_vars);
@@ -996,10 +1004,13 @@ static void reap_plugins(void)
   while ((plugin= *(--list)))
     plugin_deinitialize(plugin, true);
 
+  mysql_mutex_lock(&LOCK_plugin_delete);
   mysql_mutex_lock(&LOCK_plugin);
 
   while ((plugin= *(--reap)))
     plugin_del(plugin);
+
+  mysql_mutex_unlock(&LOCK_plugin_delete);
 
   my_afree(reap);
 }
@@ -1205,10 +1216,12 @@ static inline void convert_underscore_to_dash(char *str, int len)
 
 #ifdef HAVE_PSI_INTERFACE
 static PSI_mutex_key key_LOCK_plugin;
+static PSI_mutex_key key_LOCK_plugin_delete;
 
 static PSI_mutex_info all_plugin_mutexes[]=
 {
-  { &key_LOCK_plugin, "LOCK_plugin", PSI_FLAG_GLOBAL}
+  { &key_LOCK_plugin, "LOCK_plugin", PSI_FLAG_GLOBAL},
+  { &key_LOCK_plugin_delete, "LOCK_plugin_delete", PSI_FLAG_GLOBAL}
 };
 
 static void init_plugin_psi_keys(void)
@@ -1259,6 +1272,7 @@ int plugin_init(int *argc, char **argv, int flags)
 
 
   mysql_mutex_init(key_LOCK_plugin, &LOCK_plugin, MY_MUTEX_INIT_FAST);
+  mysql_mutex_init(key_LOCK_plugin_delete, &LOCK_plugin_delete, MY_MUTEX_INIT_FAST);
 
   if (my_init_dynamic_array(&plugin_dl_array,
                             sizeof(struct st_plugin_dl *),16,16) ||
@@ -1401,8 +1415,10 @@ int plugin_init(int *argc, char **argv, int flags)
         plugin_ptr->load_option == PLUGIN_FORCE_PLUS_PERMANENT)
       reaped_mandatory_plugin= TRUE;
     plugin_deinitialize(plugin_ptr, true);
+    mysql_mutex_lock(&LOCK_plugin_delete);
     mysql_mutex_lock(&LOCK_plugin);
     plugin_del(plugin_ptr);
+    mysql_mutex_unlock(&LOCK_plugin_delete);
   }
 
   mysql_mutex_unlock(&LOCK_plugin);
@@ -1692,10 +1708,11 @@ void plugin_shutdown(void)
       }
 
     /*
-      It's perfectly safe not to lock LOCK_plugin, as there're no
-      concurrent threads anymore. But some functions called from here
-      use mysql_mutex_assert_owner(), so we lock the mutex to satisfy it
+      It's perfectly safe not to lock LOCK_plugin, LOCK_plugin_delete, as
+      there're no concurrent threads anymore. But some functions called from
+      here use mysql_mutex_assert_owner(), so we lock the mutex to satisfy it
     */
+    mysql_mutex_lock(&LOCK_plugin_delete);
     mysql_mutex_lock(&LOCK_plugin);
 
     /*
@@ -1718,9 +1735,11 @@ void plugin_shutdown(void)
     cleanup_variables(NULL, &global_system_variables);
     cleanup_variables(NULL, &max_system_variables);
     mysql_mutex_unlock(&LOCK_plugin);
+    mysql_mutex_unlock(&LOCK_plugin_delete);
 
     initialized= 0;
     mysql_mutex_destroy(&LOCK_plugin);
+    mysql_mutex_destroy(&LOCK_plugin_delete);
 
     my_afree(plugins);
   }
@@ -1795,6 +1814,7 @@ bool mysql_install_plugin(THD *thd, const LEX_STRING *name, const LEX_STRING *dl
   mysql_audit_acquire_plugins(thd, MYSQL_AUDIT_GENERAL_CLASS);
 
   mysql_mutex_lock(&LOCK_plugin);
+  DEBUG_SYNC(thd, "acquired_LOCK_plugin");
   mysql_rwlock_wrlock(&LOCK_system_variables_hash);
 
   if (my_load_defaults(MYSQL_CONFIG_NAME, load_default_groups, &argc, &argv, NULL))
@@ -1820,6 +1840,7 @@ bool mysql_install_plugin(THD *thd, const LEX_STRING *name, const LEX_STRING *dl
   {
     if (plugin_initialize(tmp))
     {
+      mysql_mutex_unlock(&LOCK_plugin);
       my_error(ER_CANT_INITIALIZE_UDF, MYF(0), name->str,
                "Plugin initialization function failed.");
       goto deinit;
@@ -1831,6 +1852,7 @@ bool mysql_install_plugin(THD *thd, const LEX_STRING *name, const LEX_STRING *dl
     of the insert into the plugin table, so that it is not replicated in
     row based mode.
   */
+  mysql_mutex_unlock(&LOCK_plugin);
   tmp_disable_binlog(thd);
   table->use_all_columns();
   restore_record(table, s->default_values);
@@ -1843,10 +1865,9 @@ bool mysql_install_plugin(THD *thd, const LEX_STRING *name, const LEX_STRING *dl
     table->file->print_error(error, MYF(0));
     goto deinit;
   }
-
-  mysql_mutex_unlock(&LOCK_plugin);
   DBUG_RETURN(FALSE);
 deinit:
+  mysql_mutex_lock(&LOCK_plugin);
   tmp->state= PLUGIN_IS_DELETED;
   reap_needed= true;
   reap_plugins();
@@ -1900,7 +1921,8 @@ bool mysql_uninstall_plugin(THD *thd, const LEX_STRING *name)
   mysql_audit_acquire_plugins(thd, MYSQL_AUDIT_GENERAL_CLASS);
 
   mysql_mutex_lock(&LOCK_plugin);
-  if (!(plugin= plugin_find_internal(name, MYSQL_ANY_PLUGIN)))
+  if (!(plugin= plugin_find_internal(name, MYSQL_ANY_PLUGIN)) ||
+      plugin->state & (PLUGIN_IS_UNINITIALIZED | PLUGIN_IS_DYING))
   {
     my_error(ER_SP_DOES_NOT_EXIST, MYF(0), "PLUGIN", name->str);
     goto err;
@@ -1927,6 +1949,49 @@ bool mysql_uninstall_plugin(THD *thd, const LEX_STRING *name)
     my_error(ER_PLUGIN_NO_UNINSTALL, MYF(0), plugin->plugin->name);
     goto err;
   }
+
+#ifdef HAVE_REPLICATION
+  /* Block Uninstallation of semi_sync plugins (Master/Slave)
+     when they are busy
+   */
+  char buff[20];
+  /*
+    Master: If there are active semi sync slaves for this Master,
+    then that means it is busy and rpl_semi_sync_master plugin
+    cannot be uninstalled. To check whether the master
+    has any semi sync slaves or not, check Rpl_semi_sync_master_cliens
+    status variable value, if it is not 0, that means it is busy.
+  */
+  if (!strcmp(name->str, "rpl_semi_sync_master") &&
+      get_status_var(thd,
+                     plugin->plugin->status_vars,
+                     "Rpl_semi_sync_master_clients",buff) &&
+      strcmp(buff,"0") )
+  {
+    sql_print_error("Plugin 'rpl_semi_sync_master' cannot be uninstalled now. "
+                    "Stop any active semisynchronous slaves of this master "
+                    "first.\n");
+    my_error(ER_UNKNOWN_ERROR, MYF(0), name->str);
+    goto err;
+  }
+  /* Slave: If there is semi sync enabled IO thread active on this Slave,
+    then that means plugin is busy and rpl_semi_sync_slave plugin
+    cannot be uninstalled. To check whether semi sync
+    IO thread is active or not, check Rpl_semi_sync_slave_status status
+    variable value, if it is ON, that means it is busy.
+  */
+  if (!strcmp(name->str, "rpl_semi_sync_slave") &&
+      get_status_var(thd, plugin->plugin->status_vars,
+                     "Rpl_semi_sync_slave_status", buff) &&
+      !strcmp(buff,"ON") )
+  {
+    sql_print_error("Plugin 'rpl_semi_sync_slave' cannot be uninstalled now. "
+                    "Stop any active semisynchronous I/O threads on this slave "
+                    "first.\n");
+    my_error(ER_UNKNOWN_ERROR, MYF(0), name->str);
+    goto err;
+  }
+#endif
 
   plugin->state= PLUGIN_IS_DELETED;
   if (plugin->ref_count)
@@ -2057,6 +2122,7 @@ typedef DECLARE_MYSQL_SYSVAR_SIMPLE(sysvar_longlong_t, longlong);
 typedef DECLARE_MYSQL_SYSVAR_SIMPLE(sysvar_uint_t, uint);
 typedef DECLARE_MYSQL_SYSVAR_SIMPLE(sysvar_ulong_t, ulong);
 typedef DECLARE_MYSQL_SYSVAR_SIMPLE(sysvar_ulonglong_t, ulonglong);
+typedef DECLARE_MYSQL_SYSVAR_SIMPLE(sysvar_double_t, double);
 
 typedef DECLARE_MYSQL_THDVAR_SIMPLE(thdvar_int_t, int);
 typedef DECLARE_MYSQL_THDVAR_SIMPLE(thdvar_long_t, long);
@@ -2064,7 +2130,7 @@ typedef DECLARE_MYSQL_THDVAR_SIMPLE(thdvar_longlong_t, longlong);
 typedef DECLARE_MYSQL_THDVAR_SIMPLE(thdvar_uint_t, uint);
 typedef DECLARE_MYSQL_THDVAR_SIMPLE(thdvar_ulong_t, ulong);
 typedef DECLARE_MYSQL_THDVAR_SIMPLE(thdvar_ulonglong_t, ulonglong);
-
+typedef DECLARE_MYSQL_THDVAR_SIMPLE(thdvar_double_t, double);
 
 /****************************************************************************
   default variable data check and update functions
@@ -2186,6 +2252,7 @@ static int check_func_longlong(THD *thd, struct st_mysql_sys_var *var,
                               value->is_unsigned(value), (longlong) orig);
 }
 
+
 static int check_func_str(THD *thd, struct st_mysql_sys_var *var,
                           void *save, st_mysql_value *value)
 {
@@ -2279,6 +2346,20 @@ err:
   return 1;
 }
 
+static int check_func_double(THD *thd, struct st_mysql_sys_var *var,
+                             void *save, st_mysql_value *value)
+{
+  double v;
+  my_bool fixed;
+  struct my_option option;
+
+  value->val_real(value, &v);
+  plugin_opt_set_limits(&option, var);
+  *(double *) save= getopt_double_limit_value(v, &option, &fixed);
+
+  return throw_bounds_warning(thd, var->name, fixed, v);
+}
+
 
 static void update_func_bool(THD *thd, struct st_mysql_sys_var *var,
                              void *tgt, const void *save)
@@ -2314,6 +2395,11 @@ static void update_func_str(THD *thd, struct st_mysql_sys_var *var,
   *(char **) tgt= *(char **) save;
 }
 
+static void update_func_double(THD *thd, struct st_mysql_sys_var *var,
+                               void *tgt, const void *save)
+{
+  *(double *) tgt= *(double *) save;
+}
 
 /****************************************************************************
   System Variables support
@@ -2427,6 +2513,9 @@ static st_bookmark *register_var(const char *plugin, const char *name,
     break;
   case PLUGIN_VAR_STR:
     size= sizeof(char*);
+    break;
+  case PLUGIN_VAR_DOUBLE:
+    size= sizeof(double);
     break;
   default:
     DBUG_ASSERT(0);
@@ -2639,6 +2728,11 @@ static char **mysql_sys_var_str(THD* thd, int offset)
   return (char **) intern_sys_var_ptr(thd, offset, true);
 }
 
+static double *mysql_sys_var_double(THD* thd, int offset)
+{
+  return (double *) intern_sys_var_ptr(thd, offset, true);
+}
+
 void plugin_thdvar_init(THD *thd)
 {
   plugin_ref old_table_plugin= thd->variables.table_plugin;
@@ -2771,6 +2865,8 @@ static SHOW_TYPE pluginvar_show_type(st_mysql_sys_var *plugin_var)
   case PLUGIN_VAR_ENUM:
   case PLUGIN_VAR_SET:
     return SHOW_CHAR;
+  case PLUGIN_VAR_DOUBLE:
+    return SHOW_DOUBLE;
   default:
     DBUG_ASSERT(0);
     return SHOW_UNDEF;
@@ -2921,6 +3017,8 @@ bool sys_var_pluginvar::check_update_type(Item_result type)
   case PLUGIN_VAR_BOOL:
   case PLUGIN_VAR_SET:
     return type != STRING_RESULT && type != INT_RESULT;
+  case PLUGIN_VAR_DOUBLE:
+    return type != INT_RESULT && type != REAL_RESULT && type != DECIMAL_RESULT;
   default:
     return true;
   }
@@ -3046,6 +3144,9 @@ bool sys_var_pluginvar::global_update(THD *thd, set_var *var)
     case PLUGIN_VAR_STR:
       src= &((sysvar_str_t*) plugin_var)->def_val;
       break;
+    case PLUGIN_VAR_DOUBLE:
+      src= &((sysvar_double_t*) plugin_var)->def_val;
+      break;
     case PLUGIN_VAR_INT | PLUGIN_VAR_THDLOCAL:
       src= &((thdvar_uint_t*) plugin_var)->def_val;
       break;
@@ -3066,6 +3167,9 @@ bool sys_var_pluginvar::global_update(THD *thd, set_var *var)
       break;
     case PLUGIN_VAR_STR | PLUGIN_VAR_THDLOCAL:
       src= &((thdvar_str_t*) plugin_var)->def_val;
+      break;
+    case PLUGIN_VAR_DOUBLE | PLUGIN_VAR_THDLOCAL:
+      src= &((thdvar_double_t*) plugin_var)->def_val;
       break;
     default:
       DBUG_ASSERT(0);
@@ -3089,6 +3193,13 @@ bool sys_var_pluginvar::global_update(THD *thd, set_var *var)
   options->min_value= (opt)->min_val; \
   options->max_value= (opt)->max_val; \
   options->block_size= (long) (opt)->blk_sz
+
+#define OPTION_SET_LIMITS_DOUBLE(options, opt) \
+  options->var_type= GET_DOUBLE; \
+  options->def_value= (longlong) getopt_double2ulonglong((opt)->def_val); \
+  options->min_value= (longlong) getopt_double2ulonglong((opt)->min_val); \
+  options->max_value= getopt_double2ulonglong((opt)->max_val); \
+  options->block_size= (long) (opt)->blk_sz;
 
 
 static void plugin_opt_set_limits(struct my_option *options,
@@ -3116,6 +3227,9 @@ static void plugin_opt_set_limits(struct my_option *options,
     break;
   case PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED:
     OPTION_SET_LIMITS(GET_ULL, options, (sysvar_ulonglong_t*) opt);
+    break;
+  case PLUGIN_VAR_DOUBLE:
+    OPTION_SET_LIMITS_DOUBLE(options, (sysvar_double_t*) opt);
     break;
   case PLUGIN_VAR_ENUM:
     options->var_type= GET_ENUM;
@@ -3158,6 +3272,9 @@ static void plugin_opt_set_limits(struct my_option *options,
     break;
   case PLUGIN_VAR_LONGLONG | PLUGIN_VAR_UNSIGNED | PLUGIN_VAR_THDLOCAL:
     OPTION_SET_LIMITS(GET_ULL, options, (thdvar_ulonglong_t*) opt);
+    break;
+  case PLUGIN_VAR_DOUBLE | PLUGIN_VAR_THDLOCAL:
+    OPTION_SET_LIMITS_DOUBLE(options, (thdvar_double_t*) opt);
     break;
   case PLUGIN_VAR_ENUM | PLUGIN_VAR_THDLOCAL:
     options->var_type= GET_ENUM;
@@ -3321,6 +3438,9 @@ static int construct_options(MEM_ROOT *mem_root, struct st_plugin_int *tmp,
     case PLUGIN_VAR_SET:
       ((thdvar_set_t *) opt)->resolve= mysql_sys_var_ulonglong;
       break;
+    case PLUGIN_VAR_DOUBLE:
+      ((thdvar_double_t *) opt)->resolve= mysql_sys_var_double;
+      break;
     default:
       sql_print_error("Unknown variable type code 0x%x in plugin '%s'.",
                       opt->flags, plugin_name);
@@ -3383,6 +3503,12 @@ static int construct_options(MEM_ROOT *mem_root, struct st_plugin_int *tmp,
         opt->check= check_func_set;
       if (!opt->update)
         opt->update= update_func_longlong;
+      break;
+    case PLUGIN_VAR_DOUBLE:
+      if (!opt->check)
+        opt->check= check_func_double;
+      if (!opt->update)
+        opt->update= update_func_double;
       break;
     default:
       sql_print_error("Unknown variable type code 0x%x in plugin '%s'.",

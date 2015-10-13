@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -444,7 +444,8 @@ int init_key_cache(KEY_CACHE *keycache, uint key_cache_block_size,
       if (blocks < 8)
       {
         my_errno= ENOMEM;
-        my_error(EE_OUTOFMEMORY, MYF(0), blocks * keycache->key_cache_block_size);
+        my_error(EE_OUTOFMEMORY, MYF(ME_FATALERROR),
+                 blocks * keycache->key_cache_block_size);
         goto err;
       }
       blocks= blocks / 4*3;

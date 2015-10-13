@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -36,5 +36,9 @@ ENDIF()
 
 ADD_CONVENIENCE_LIBRARY(yassl ${YASSL_SOURCES})
 RESTRICT_SYMBOL_EXPORTS(yassl)
+
+IF(MSVC)
+   INSTALL_DEBUG_TARGET(yassl DESTINATION ${INSTALL_LIBDIR}/debug)
+ENDIF()
 
 

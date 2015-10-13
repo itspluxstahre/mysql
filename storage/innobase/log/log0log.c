@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2010, Innobase Oy. All Rights Reserved.
+Copyright (c) 1995, 2010, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -18,8 +18,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -213,6 +213,85 @@ log_buf_pool_get_oldest_modification(void)
 	return(lsn);
 }
 
+/** Extends the log buffer.
+@param[in] len	requested minimum size in bytes */
+static
+void
+log_buffer_extend(
+	ulint	len)
+{
+	ulint	move_start;
+	ulint	move_end;
+	byte	tmp_buf[OS_FILE_LOG_BLOCK_SIZE];
+
+	mutex_enter(&(log_sys->mutex));
+
+	while (log_sys->is_extending) {
+		/* Another thread is trying to extend already.
+		Needs to wait for. */
+		mutex_exit(&(log_sys->mutex));
+
+		log_buffer_flush_to_disk();
+
+		mutex_enter(&(log_sys->mutex));
+
+		if (srv_log_buffer_size > len / UNIV_PAGE_SIZE) {
+			/* Already extended enough by the others */
+			mutex_exit(&(log_sys->mutex));
+			return;
+		}
+	}
+
+	log_sys->is_extending = TRUE;
+
+	while (log_sys->n_pending_writes != 0
+	       || ut_calc_align_down(log_sys->buf_free,
+				     OS_FILE_LOG_BLOCK_SIZE)
+		  != ut_calc_align_down(log_sys->buf_next_to_write,
+					OS_FILE_LOG_BLOCK_SIZE)) {
+		/* Buffer might have >1 blocks to write still. */
+		mutex_exit(&(log_sys->mutex));
+
+		log_buffer_flush_to_disk();
+
+		mutex_enter(&(log_sys->mutex));
+	}
+
+	move_start = ut_calc_align_down(
+		log_sys->buf_free,
+		OS_FILE_LOG_BLOCK_SIZE);
+	move_end = log_sys->buf_free;
+
+	/* store the last log block in buffer */
+	ut_memcpy(tmp_buf, log_sys->buf + move_start,
+		  move_end - move_start);
+
+	log_sys->buf_free -= move_start;
+	log_sys->buf_next_to_write -= move_start;
+
+	/* reallocate log buffer */
+	srv_log_buffer_size = len / UNIV_PAGE_SIZE + 1;
+	mem_free(log_sys->buf_ptr);
+	log_sys->buf_ptr = mem_alloc(LOG_BUFFER_SIZE + OS_FILE_LOG_BLOCK_SIZE);
+	log_sys->buf = ut_align(log_sys->buf_ptr, OS_FILE_LOG_BLOCK_SIZE);
+	log_sys->buf_size = LOG_BUFFER_SIZE;
+	memset(log_sys->buf, '\0', LOG_BUFFER_SIZE);
+	log_sys->max_buf_free = log_sys->buf_size / LOG_BUF_FLUSH_RATIO
+		- LOG_BUF_FLUSH_MARGIN;
+
+	/* restore the last log block */
+	ut_memcpy(log_sys->buf, tmp_buf, move_end - move_start);
+
+	ut_ad(log_sys->is_extending);
+	log_sys->is_extending = FALSE;
+
+	mutex_exit(&(log_sys->mutex));
+
+	fprintf(stderr,
+		"InnoDB: innodb_log_buffer_size was extended to %lu.\n",
+		LOG_BUFFER_SIZE);
+}
+
 /************************************************************//**
 Opens the log for log_write_low. The log must be closed with log_close and
 released with log_release.
@@ -233,10 +312,38 @@ log_reserve_and_open(
 	ulint	count			= 0;
 #endif /* UNIV_DEBUG */
 
-	ut_a(len < log->buf_size / 2);
+	if (len >= log->buf_size / 2) {
+		DBUG_EXECUTE_IF("ib_log_buffer_is_short_crash",
+				DBUG_SUICIDE(););
+
+		/* log_buffer is too small. try to extend instead of crash. */
+		ut_print_timestamp(stderr);
+		fprintf(stderr,
+			" InnoDB: Warning: "
+			"The transaction log size is too large"
+			" for innodb_log_buffer_size (%lu >= %lu / 2). "
+			"Trying to extend it.\n",
+			len, LOG_BUFFER_SIZE);
+
+		log_buffer_extend((len + 1) * 2);
+	}
 loop:
 	mutex_enter(&(log->mutex));
 	ut_ad(!recv_no_log_write);
+
+	if (log->is_extending) {
+
+		mutex_exit(&(log->mutex));
+
+		/* Log buffer size is extending. Writing up to the next block
+		should wait for the extending finished. */
+
+		os_thread_sleep(100000);
+
+		ut_ad(++count < 50);
+
+		goto loop;
+	}
 
 	/* Calculate an upper limit for the space the string may take in the
 	log buffer */
@@ -788,6 +895,7 @@ log_init(void)
 	log_sys->buf = ut_align(log_sys->buf_ptr, OS_FILE_LOG_BLOCK_SIZE);
 
 	log_sys->buf_size = LOG_BUFFER_SIZE;
+	log_sys->is_extending = FALSE;
 
 	memset(log_sys->buf, '\0', LOG_BUFFER_SIZE);
 
@@ -1664,6 +1772,12 @@ log_preflush_pool_modified_pages(
 	if (n_pages == ULINT_UNDEFINED) {
 
 		return(FALSE);
+	}
+
+	if (sync) {
+		srv_buf_pool_flush_sync_page += n_pages;
+	} else {
+		srv_buf_pool_flush_async_page += n_pages;
 	}
 
 	return(TRUE);
@@ -3076,13 +3190,16 @@ void
 logs_empty_and_mark_files_at_shutdown(void)
 /*=======================================*/
 {
-	ib_uint64_t	lsn;
-	ulint		arch_log_no;
-	ibool		server_busy;
+	ib_uint64_t		lsn;
+	ulint			arch_log_no;
+	ibool			server_busy;
+	ulint			count = 0;
+	ulint			pending_io;
+	ulint			active_thd;
 
 	if (srv_print_verbose_log) {
 		ut_print_timestamp(stderr);
-		fprintf(stderr, "  InnoDB: Starting shutdown...\n");
+		fprintf(stderr, " InnoDB: Starting shutdown...\n");
 	}
 	/* Wait until the master thread and all other operations are idle: our
 	algorithm only works if the server is idle at shutdown */
@@ -3090,6 +3207,8 @@ logs_empty_and_mark_files_at_shutdown(void)
 	srv_shutdown_state = SRV_SHUTDOWN_CLEANUP;
 loop:
 	os_thread_sleep(100000);
+
+	count++;
 
 	mutex_enter(&kernel_mutex);
 
@@ -3099,12 +3218,34 @@ loop:
 	if (srv_error_monitor_active
 	    || srv_lock_timeout_active
 	    || srv_monitor_active) {
+		const char*	thread_active = NULL;
+
+		/* Print a message every 60 seconds if we are waiting
+		for the monitor thread to exit. Master and worker threads
+		check will be done later. */
+		if (srv_print_verbose_log && count > 600) {
+
+		       if (srv_error_monitor_active) {
+			       thread_active = "srv_error_monitor_thread";
+		       } else if (srv_lock_timeout_active) {
+			       thread_active = "srv_lock_timeout thread";
+		       } else if (srv_monitor_active) {
+			       thread_active = "srv_monitor_thread";
+		       }
+		}
 
 		mutex_exit(&kernel_mutex);
 
 		os_event_set(srv_error_event);
 		os_event_set(srv_monitor_event);
 		os_event_set(srv_timeout_event);
+
+		if (thread_active) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Waiting for %s to exit\n",
+				thread_active);
+			count = 0;
+		}
 
 		goto loop;
 	}
@@ -3116,9 +3257,54 @@ loop:
 
 	server_busy = trx_n_mysql_transactions > 0
 		|| UT_LIST_GET_LEN(trx_sys->trx_list) > trx_n_prepared;
+
+	if (server_busy) {
+		ulint	total_trx = UT_LIST_GET_LEN(trx_sys->trx_list)
+				    + trx_n_mysql_transactions;
+
+		mutex_exit(&kernel_mutex);
+
+		if (srv_print_verbose_log && count > 600) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Waiting for %lu "
+				"active transactions to finish\n",
+				(ulong) total_trx);
+			count = 0;
+		}
+
+		goto loop;
+	}
+
 	mutex_exit(&kernel_mutex);
 
-	if (server_busy || srv_is_any_background_thread_active()) {
+	/* Check that the background threads are suspended */
+	active_thd = srv_get_active_thread_type();
+
+	if (active_thd != ULINT_UNDEFINED) {
+
+		/* The srv_lock_timeout_thread, srv_error_monitor_thread
+		and srv_monitor_thread should already exit by now. The
+		only threads to be suspended are the master threads
+		and worker threads (purge threads). Print the thread
+		type if any of such threads not in suspended mode */
+		if (srv_print_verbose_log && count > 600) {
+			const char*     thread_type = "<null>";
+
+			switch (active_thd) {
+			case SRV_WORKER:
+				thread_type = "worker threads";
+				break;
+			case SRV_MASTER:
+				thread_type = "master thread";
+				break;
+			}
+
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Waiting for %s "
+				"to be suspended\n", thread_type);
+			count = 0;
+		}
+
 		goto loop;
 	}
 
@@ -3130,9 +3316,34 @@ loop:
 		|| log_sys->n_pending_writes;
 	mutex_exit(&log_sys->mutex);
 
-	if (server_busy || !buf_pool_check_no_pending_io()) {
+	if (server_busy) {
+		if (srv_print_verbose_log && count > 600) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr,
+				"  InnoDB: Pending checkpoint_writes: %lu\n"
+				"  InnoDB: Pending log flush writes: %lu\n",
+				(ulong) log_sys->n_pending_checkpoint_writes,
+				(ulong) log_sys->n_pending_writes);
+			count = 0;
+		}
+
 		goto loop;
 	}
+
+	pending_io = buf_pool_check_num_pending_io();
+
+	if (pending_io) {
+		if (srv_print_verbose_log && count > 600) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, "  InnoDB: Waiting for %lu buffer page "
+				"I/Os to complete\n",
+				(ulong) pending_io);
+			count = 0;
+		}
+
+		goto loop;
+	}
+
 
 #ifdef UNIV_LOG_ARCHIVE
 	log_archive_all();
@@ -3157,7 +3368,7 @@ loop:
 		log_buffer_flush_to_disk();
 
 		/* Check that the background threads stay suspended */
-		if (srv_is_any_background_thread_active()) {
+		if (srv_get_active_thread_type() != ULINT_UNDEFINED) {
 			fprintf(stderr,
 				"InnoDB: Warning: some background thread"
 				" woke up during shutdown\n");
@@ -3166,7 +3377,7 @@ loop:
 
 		srv_shutdown_state = SRV_SHUTDOWN_LAST_PHASE;
 		fil_close_all_files();
-		ut_a(!srv_is_any_background_thread_active());
+		ut_a(srv_get_active_thread_type() == ULINT_UNDEFINED);
 		return;
 	}
 
@@ -3204,7 +3415,7 @@ loop:
 	mutex_exit(&log_sys->mutex);
 
 	/* Check that the background threads stay suspended */
-	if (srv_is_any_background_thread_active()) {
+	if (srv_get_active_thread_type() != ULINT_UNDEFINED) {
 		fprintf(stderr,
 			"InnoDB: Warning: some background thread woke up"
 			" during shutdown\n");
@@ -3222,13 +3433,20 @@ loop:
 
 	if (!buf_all_freed()) {
 
+		if (srv_print_verbose_log && count > 600) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr, " InnoDB: Waiting for dirty buffer "
+				"pages to be flushed\n");
+			count = 0;
+		}
+
 		goto loop;
 	}
 
 	srv_shutdown_state = SRV_SHUTDOWN_LAST_PHASE;
 
 	/* Make some checks that the server really is quiet */
-	ut_a(!srv_is_any_background_thread_active());
+	ut_a(srv_get_active_thread_type() == ULINT_UNDEFINED);
 
 	ut_a(buf_all_freed());
 	ut_a(lsn == log_sys->lsn);
@@ -3250,7 +3468,7 @@ loop:
 	fil_close_all_files();
 
 	/* Make some checks that the server really is quiet */
-	ut_a(!srv_is_any_background_thread_active());
+	ut_a(srv_get_active_thread_type() == ULINT_UNDEFINED);
 
 	ut_a(buf_all_freed());
 	ut_a(lsn == log_sys->lsn);

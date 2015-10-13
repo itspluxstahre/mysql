@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2012, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -209,6 +209,16 @@ foreach my $option (@ARGV)
   if ($option =~ /with-gcov/)
   {
       $cmakeargs = $cmakeargs." -DENABLE_GCOV=ON"; 
+      next;
+  }
+  if ($option =~ /with-client-ldflags/)
+  {
+      print("configure.pl : ignoring $option\n");
+      next;
+  }
+  if ($option =~ /with-mysqld-ldflags=/)
+  {
+      print("configure.pl : ignoring $option\n");
       next;
   }
 

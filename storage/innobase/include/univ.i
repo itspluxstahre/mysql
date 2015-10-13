@@ -25,8 +25,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -49,9 +49,10 @@ Created 1/20/1994 Heikki Tuuri
 #define _IB_TO_STR(s)	#s
 #define IB_TO_STR(s)	_IB_TO_STR(s)
 
-#define INNODB_VERSION_MAJOR	1
-#define INNODB_VERSION_MINOR	1
-#define INNODB_VERSION_BUGFIX	8
+#include <mysql_version.h>
+
+#define INNODB_VERSION_MAJOR	MYSQL_MAJOR_VERSION
+#define INNODB_VERSION_MINOR	MYSQL_MINOR_VERSION
 
 /* The following is the InnoDB version as shown in
 SELECT plugin_version FROM information_schema.plugins;
@@ -62,10 +63,7 @@ component, i.e. we show M.N.P as M.N */
 #define INNODB_VERSION_SHORT	\
 	(INNODB_VERSION_MAJOR << 8 | INNODB_VERSION_MINOR)
 
-#define INNODB_VERSION_STR			\
-	IB_TO_STR(INNODB_VERSION_MAJOR) "."	\
-	IB_TO_STR(INNODB_VERSION_MINOR) "."	\
-	IB_TO_STR(INNODB_VERSION_BUGFIX)
+#define INNODB_VERSION_STR	MYSQL_SERVER_VERSION
 
 #define REFMAN "http://dev.mysql.com/doc/refman/"	\
 	IB_TO_STR(MYSQL_MAJOR_VERSION) "."		\
@@ -295,6 +293,24 @@ management to ensure correct alignment for doubles etc. */
 			========================
 */
 
+/** There are currently two InnoDB file formats which are used to group
+features with similar restrictions and dependencies. Using an enum allows
+switch statements to give a compiler warning when a new one is introduced. */
+enum innodb_file_formats_enum {
+	/** Antelope File Format: InnoDB/MySQL up to 5.1.
+	This format includes REDUNDANT and COMPACT row formats */
+	UNIV_FORMAT_A		= 0,
+
+	/** Barracuda File Format: Introduced in InnoDB plugin for 5.1:
+	This format includes COMPRESSED and DYNAMIC row formats.  It
+	includes the ability to create secondary indexes from data that
+	is not on the clustered index page and the ability to store more
+	data off the clustered index page. */
+	UNIV_FORMAT_B		= 1
+};
+
+typedef enum innodb_file_formats_enum innodb_file_formats_t;
+
 /* The 2-logarithm of UNIV_PAGE_SIZE: */
 #define UNIV_PAGE_SIZE_SHIFT	14
 /* The universal page size of the database */
@@ -303,11 +319,17 @@ management to ensure correct alignment for doubles etc. */
 /* Maximum number of parallel threads in a parallelized operation */
 #define UNIV_MAX_PARALLELISM	32
 
-/* The maximum length of a table name. This is the MySQL limit and is
-defined in mysql_com.h like NAME_CHAR_LEN*SYSTEM_CHARSET_MBMAXLEN, the
-number does not include a terminating '\0'. InnoDB probably can handle
-longer names internally */
-#define MAX_TABLE_NAME_LEN	192
+/** This is the "mbmaxlen" for my_charset_filename (defined in
+strings/ctype-utf8.c), which is used to encode File and Database names. */
+#define FILENAME_CHARSET_MAXNAMLEN	5
+
+/** The maximum length of an encode table name in bytes.  The max
+table and database names are NAME_CHAR_LEN (64) characters. After the
+encoding, the max length would be NAME_CHAR_LEN (64) *
+FILENAME_CHARSET_MAXNAMLEN (5) = 320 bytes. The number does not include a
+terminating '\0'. InnoDB can handle longer names internally */
+#define MAX_TABLE_NAME_LEN	320
+
 
 /* The maximum length of a database name. Like MAX_TABLE_NAME_LEN this is
 the MySQL's NAME_LEN, see check_and_convert_db_name(). */

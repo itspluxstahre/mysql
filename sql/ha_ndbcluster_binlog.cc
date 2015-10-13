@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2006, 2011, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2006, 2015, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -2401,6 +2401,12 @@ add_ndb_binlog_index_err:
   thd->is_error() ? trans_rollback_stmt(thd) : trans_commit_stmt(thd);
   thd->stmt_da->can_overwrite_status= FALSE;
   close_thread_tables(thd);
+  /*
+    There should be no need for rolling back transaction due to deadlock
+    (since ndb_binlog_index is non transactional).
+  */
+  DBUG_ASSERT(! thd->transaction_rollback_request);
+
   thd->mdl_context.release_transactional_locks();
   ndb_binlog_index= 0;
   thd->variables.option_bits= saved_options;
@@ -2515,7 +2521,8 @@ ndbcluster_check_if_local_tables_in_db(THD *thd, const char *dbname)
   char path[FN_REFLEN + 1];
 
   build_table_filename(path, sizeof(path) - 1, dbname, "", "", 0);
-  if (find_files(thd, &files, dbname, path, NullS, 0) != FIND_FILES_OK)
+  if (find_files(thd, &files, dbname, path, NullS, 0, NULL) !=
+      FIND_FILES_OK)
   {
     DBUG_PRINT("info", ("Failed to find files"));
     DBUG_RETURN(true);

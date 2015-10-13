@@ -1,7 +1,7 @@
 #ifndef SQL_STRING_INCLUDED
 #define SQL_STRING_INCLUDED
 
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -174,6 +174,10 @@ public:
     str_charset=cs;
   }
   bool set_ascii(const char *str, uint32 arg_length);
+  bool set_ascii(const char *str)
+  {
+    return set_ascii(str, (uint32) strlen(str));
+  }
   inline void set_quick(char *str,uint32 arg_length, CHARSET_INFO *cs)
   {
     if (!alloced)
@@ -235,8 +239,12 @@ public:
   }
   bool real_alloc(uint32 arg_length);			// Empties old string
   bool realloc(uint32 arg_length);
-  inline void shrink(uint32 arg_length)		// Shrink buffer
+
+  // Shrink the buffer, but only if it is allocated on the heap.
+  inline void shrink(uint32 arg_length)
   {
+    if (!is_alloced())
+      return;
     if (arg_length < Alloced_length)
     {
       char *new_ptr;
@@ -252,7 +260,7 @@ public:
       }
     }
   }
-  bool is_alloced() { return alloced; }
+  bool is_alloced() const { return alloced; }
   inline String& operator = (const String &s)
   {
     if (&s != this)
@@ -264,6 +272,7 @@ public:
       DBUG_ASSERT(!s.uses_buffer_owned_by(this));
       free();
       Ptr=s.Ptr ; str_length=s.str_length ; Alloced_length=s.Alloced_length;
+      str_charset=s.str_charset;
       alloced=0;
     }
     return *this;
@@ -275,6 +284,9 @@ public:
   static bool needs_conversion(uint32 arg_length,
   			       CHARSET_INFO *cs_from, CHARSET_INFO *cs_to,
 			       uint32 *offset);
+  static bool needs_conversion_on_storage(uint32 arg_length,
+                                          CHARSET_INFO *cs_from,
+                                          CHARSET_INFO *cs_to);
   bool copy_aligned(const char *s, uint32 arg_length, uint32 offset,
 		    CHARSET_INFO *cs);
   bool set_or_copy_aligned(const char *s, uint32 arg_length, CHARSET_INFO *cs);

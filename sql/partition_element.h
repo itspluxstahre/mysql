@@ -106,9 +106,8 @@ public:
   enum partition_state part_state;
   uint16 nodegroup_id;
   bool has_null_value;
-  /* signed_flag and max_value only relevant for subpartitions */
-  bool signed_flag;
-  bool max_value;
+  bool signed_flag;                          // Range value signed
+  bool max_value;                            // MAXVALUE range
 
   partition_element()
   : part_max_rows(0), part_min_rows(0), range_value(0),

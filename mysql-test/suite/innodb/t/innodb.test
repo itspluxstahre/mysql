@@ -1,9 +1,3 @@
---source include/not_windows_embedded.inc
-# remove this when
-# Bug#53947 InnoDB: Assertion failure in thread 4224 in file
-#   .\sync\sync0sync.c line 324
-# is fixed
-
 #######################################################################
 #                                                                     #
 # Please, DO NOT TOUCH this file as well as the innodb.result file.   #
@@ -1348,6 +1342,10 @@ SELECT variable_value - @innodb_row_lock_current_waits_orig FROM information_sch
 SELECT variable_value - @innodb_row_lock_time_orig FROM information_schema.global_status WHERE LOWER(variable_name) = 'innodb_row_lock_time';
 SELECT variable_value - @innodb_row_lock_time_max_orig FROM information_schema.global_status WHERE LOWER(variable_name) = 'innodb_row_lock_time_max';
 SELECT variable_value - @innodb_row_lock_time_avg_orig FROM information_schema.global_status WHERE LOWER(variable_name) = 'innodb_row_lock_time_avg';
+SET @innodb_rows_search_btree_index_orig = (SELECT variable_value FROM information_schema.global_status WHERE LOWER(variable_name) = 'innodb_rows_search_btree_index');
+SET @innodb_rows_search_hash_index_orig = (SELECT variable_value FROM information_schema.global_status WHERE LOWER(variable_name) = 'innodb_rows_search_hash_index');
+SELECT variable_value - @innodb_rows_search_btree_index_orig FROM information_schema.global_status WHERE LOWER(variable_name) = 'innodb_rows_search_btree_index';
+SELECT variable_value - @innodb_rows_search_hash_index_orig FROM information_schema.global_status WHERE LOWER(variable_name) = 'innodb_rows_search_hash_index';
 
 # Test for innodb_sync_spin_loops variable
 SET @innodb_sync_spin_loops_orig = @@innodb_sync_spin_loops;
@@ -1362,6 +1360,7 @@ set global innodb_sync_spin_loops=@innodb_sync_spin_loops_orig;
 
 # Test for innodb_thread_concurrency variable
 show variables like "innodb_thread_concurrency";
+--error ER_WRONG_VALUE_FOR_VAR
 set global innodb_thread_concurrency=1001;
 show variables like "innodb_thread_concurrency";
 set global innodb_thread_concurrency=0;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -63,6 +63,8 @@ my_b_copy_to_file(IO_CACHE *cache, FILE *file)
       DBUG_RETURN(1);
     cache->read_pos= cache->read_end;
   } while ((bytes_in_cache= my_b_fill(cache)));
+  if(cache->error == -1)
+    DBUG_RETURN(1);
   DBUG_RETURN(0);
 }
 
@@ -219,6 +221,8 @@ size_t my_b_fill(IO_CACHE *info)
     info->error= 0;
     return 0;					/* EOF */
   }
+  DBUG_EXECUTE_IF ("simulate_my_b_fill_error",
+                   {DBUG_SET("+d,simulate_file_read_error");});
   if ((length= my_read(info->file,info->buffer,max_length,
                        info->myflags)) == (size_t) -1)
   {
@@ -404,6 +408,13 @@ process_flags:
       if (my_b_write(info, (uchar*) par, length2))
 	goto err;
     }
+    else if (*fmt == 'c')                     /* char type parameter */
+    {
+      char par[2];
+      par[0] = va_arg(args, int);
+      if (my_b_write(info, (uchar*) par, 1))
+        goto err;
+    }
     else if (*fmt == 'b')                       /* Sized buffer parameter, only precision makes sense */
     {
       char *par = va_arg(args, char *);
@@ -415,7 +426,7 @@ process_flags:
     {
       register int iarg;
       size_t length2;
-      char buff[17];
+      char buff[32];
 
       iarg = va_arg(args, int);
       if (*fmt == 'd')
@@ -433,7 +444,11 @@ process_flags:
           memset(buffz, '0', minimum_width - length2);
         else
           memset(buffz, ' ', minimum_width - length2);
-        my_b_write(info, buffz, minimum_width - length2);
+        if (my_b_write(info, buffz, minimum_width - length2))
+        {
+          my_afree(buffz);
+          goto err;
+        }
         my_afree(buffz);
       }
 
@@ -446,7 +461,7 @@ process_flags:
     {
       register long iarg;
       size_t length2;
-      char buff[17];
+      char buff[32];
 
       iarg = va_arg(args, long);
       if (*++fmt == 'd')

@@ -1,4 +1,4 @@
-# Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2013, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -83,12 +83,20 @@ IF(NOT VERSION)
         MATH(EXPR VER  "${VER} -4")
         SET(DEFAULT_PLATFORM "osx10.${VER}")
       ENDIF()
-      LIST(LENGTH CMAKE_OSX_ARCHITECTURES LEN)
-      IF(LEN GREATER 1)
-        SET(DEFAULT_MACHINE "universal")
+
+      IF(CMAKE_OSX_ARCHITECTURES)
+        LIST(LENGTH CMAKE_OSX_ARCHITECTURES LEN)
+        IF(LEN GREATER 1)
+          SET(DEFAULT_MACHINE "universal")
+        ELSE()
+          SET(DEFAULT_MACHINE "${CMAKE_OSX_ARCHITECTURES}")
+        ENDIF()
       ELSE()
-        SET(DEFAULT_MACHINE "${CMAKE_OSX_ARCHITECTURES}")
+        IF(64BIT)
+          SET(DEFAULT_MACHINE "x86_64")
+        ENDIF()
       ENDIF()
+
       IF(DEFAULT_MACHINE MATCHES "i386")
         SET(DEFAULT_MACHINE "x86")
       ENDIF()
@@ -116,8 +124,15 @@ IF(NOT VERSION)
     SET(PRODUCT_TAG)
   ENDIF()
 
-  SET(package_name "mysql${PRODUCT_TAG}-${VERSION}-${SYSTEM_NAME_AND_PROCESSOR}")
-  
+  IF("${VERSION}" MATCHES "-ndb-")
+    STRING(REGEX REPLACE "^.*-ndb-" "" NDBVERSION "${VERSION}")
+    SET(package_name "mysql-cluster${PRODUCT_TAG}-${NDBVERSION}-${SYSTEM_NAME_AND_PROCESSOR}")
+  ELSE()
+    SET(package_name "mysql${PRODUCT_TAG}-${VERSION}-${SYSTEM_NAME_AND_PROCESSOR}")
+  ENDIF()
+
+  MESSAGE(STATUS "Packaging as: ${package_name}")
+
   # Sometimes package suffix is added (something like "-icc-glibc23")
   IF(PACKAGE_SUFFIX)
     SET(package_name "${package_name}${PACKAGE_SUFFIX}")

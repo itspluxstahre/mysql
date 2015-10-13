@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2012, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,7 +25,7 @@ MACRO (MYSQL_USE_BUNDLED_SSL)
   SET(SSL_LIBRARIES  yassl taocrypt)
   SET(SSL_INCLUDE_DIRS ${INC_DIRS})
   SET(SSL_INTERNAL_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/extra/yassl/taocrypt/mySTL)
-  SET(SSL_DEFINES "-DHAVE_YASSL -DYASSL_PURE_C -DYASSL_PREFIX -DHAVE_OPENSSL -DYASSL_THREAD_SAFE")
+  SET(SSL_DEFINES "-DHAVE_YASSL -DYASSL_PURE_C -DYASSL_PREFIX -DHAVE_OPENSSL -DMULTI_THREADED")
   CHANGE_SSL_SETTINGS("bundled")
   #Remove -fno-implicit-templates 
   #(yassl sources cannot  be compiled with  it)

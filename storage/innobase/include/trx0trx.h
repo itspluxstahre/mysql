@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -580,6 +580,23 @@ struct trx_struct{
 	ib_int64_t	mysql_log_offset;/* if MySQL binlog is used, this field
 					contains the end offset of the binlog
 					entry */
+	const char*	mysql_master_log_file_name;
+					/* if the database server is a MySQL
+					replication slave, we have here the
+					master binlog name up to which
+					replication has processed; otherwise
+					this is a pointer to a null
+					character */
+	ib_int64_t	mysql_master_log_pos;
+					/* if the database server is a MySQL
+					replication slave, this is the
+					position in the log file up to which
+					replication has processed */
+					/* For true crash safe slave */
+	const char*	css_mysql_master_log_file_name;
+	ib_int64_t	css_mysql_master_log_pos;
+	const char*	css_mysql_relay_log_file_name;
+	ib_int64_t	css_mysql_relay_log_pos;
 	/*------------------------------*/
 	ulint		n_mysql_tables_in_use; /* number of Innobase tables
 					used in the processing of the current

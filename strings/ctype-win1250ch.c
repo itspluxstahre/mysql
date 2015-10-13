@@ -1,4 +1,4 @@
-/* Copyright (c) 2002, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -500,7 +500,7 @@ static size_t my_strnxfrm_win1250ch(CHARSET_INFO * cs  __attribute__((unused)),
 
   do {
     NEXT_CMP_VALUE(src, p, pass, value, (int)srclen);
-    if (totlen <= len)
+    if (totlen < len)
       dest[totlen] = value;
     totlen++;
   } while (value) ;

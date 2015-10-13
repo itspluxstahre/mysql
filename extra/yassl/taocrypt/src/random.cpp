@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -27,6 +27,7 @@
 #include <time.h>
 
 #if defined(_WIN32)
+    #define _WIN32_WINNT 0x0400
     #include <windows.h>
     #include <wincrypt.h>
 #else
@@ -96,13 +97,13 @@ void OS_Seed::GenerateSeed(byte* output, word32 sz)
 
 /* The default OS_Seed implementation */
 
-OS_Seed::OS_Seed() 
+OS_Seed::OS_Seed()
 {
     fd_ = open("/dev/urandom",O_RDONLY);
     if (fd_ == -1) {
         fd_ = open("/dev/random",O_RDONLY);
-    if (fd_ == -1)
-        error_.SetError(OPEN_RAN_E);
+        if (fd_ == -1)
+            error_.SetError(OPEN_RAN_E);
     }
 }
 

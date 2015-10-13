@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -145,6 +145,28 @@ void my_printv_error(uint error, const char *format, myf MyFlags, va_list ap)
 
   (void) my_vsnprintf(ebuff, sizeof(ebuff), format, ap);
   (*error_handler_hook)(error, ebuff, MyFlags);
+  DBUG_VOID_RETURN;
+}
+
+/*
+  Warning as printf
+
+  SYNOPSIS
+    my_printf_warning()
+      format>   Format string
+      ...>      variable list
+*/
+void(*sql_print_warning_hook)(const char *format,...);
+void my_printf_warning(const char *format, ...)
+{
+  va_list args;
+  char wbuff[ERRMSGSIZE];
+  DBUG_ENTER("my_printf_warning");
+  DBUG_PRINT("my", ("Format: %s", format));
+  va_start(args,format);
+  (void) my_vsnprintf (wbuff, sizeof(wbuff), format, args);
+  va_end(args);
+  (*sql_print_warning_hook)(wbuff);
   DBUG_VOID_RETURN;
 }
 

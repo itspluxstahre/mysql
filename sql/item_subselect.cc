@@ -1,4 +1,4 @@
-/* Copyright (c) 2002, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -182,6 +182,7 @@ bool Item_subselect::fix_fields(THD *thd_param, Item **ref)
 
       (*ref)= substitution;
       substitution->name= name;
+      substitution->name_length= name_length;
       if (have_to_be_excluded)
 	engine->exclude();
       substitution= 0;
@@ -1030,12 +1031,19 @@ Item_in_subselect::single_value_transformer(JOIN *join,
                    print_where(item, "rewrite with MIN/MAX", QT_ORDINARY););
       if (thd->variables.sql_mode & MODE_ONLY_FULL_GROUP_BY)
       {
-        DBUG_ASSERT(select_lex->non_agg_field_used());
+        /*
+          If the argument is a field, we assume that fix_fields() has
+          tagged the select_lex with non_agg_field_used.
+          We reverse that decision after this rewrite with MIN/MAX.
+         */
+        if (item->get_arg(0)->type() == Item::FIELD_ITEM)
+          DBUG_ASSERT(select_lex->non_agg_field_used());
         select_lex->set_non_agg_field_used(false);
       }
 
       save_allow_sum_func= thd->lex->allow_sum_func;
-      thd->lex->allow_sum_func|= 1 << thd->lex->current_select->nest_level;
+      thd->lex->allow_sum_func|=
+        (nesting_map)1 << thd->lex->current_select->nest_level;
       /*
 	Item_sum_(max|min) can't substitute other item => we can use 0 as
         reference, also Item_sum_(max|min) can't be fixed after creation, so
@@ -1057,8 +1065,15 @@ Item_in_subselect::single_value_transformer(JOIN *join,
       if (upper_item)
         upper_item->set_sub_test(item);
     }
-    /* fix fields is already called for  left expression */
-    substitution= func->create(left_expr, subs);
+    /*
+      fix fields is already called for  left expression.
+      Note that real_item() should be used instead of
+      original left expression because left_expr can be
+      runtime created Ref item which is deleted at the end
+      of the statement. Thus one of 'substitution' arguments
+      can be broken in case of PS.
+    */ 
+    substitution= func->create(left_expr->real_item(), subs);
     DBUG_RETURN(RES_OK);
   }
 
@@ -1078,6 +1093,9 @@ Item_in_subselect::single_value_transformer(JOIN *join,
       DBUG_RETURN(RES_ERROR);
     }
     thd->lex->current_select= current;
+
+    /* We will refer to upper level cache array => we have to save it for SP */
+    optimizer->keep_top_level_cache();
 
     /*
       As far as  Item_ref_in_optimizer do not substitute itself on fix_fields
@@ -1139,7 +1157,7 @@ Item_in_subselect::single_value_transformer(JOIN *join,
   }
   else
   {
-    Item *item= (Item*) select_lex->item_list.head();
+    Item *item= (Item*) select_lex->item_list.head()->real_item();
 
     if (select_lex->table_list.elements)
     {
@@ -1253,8 +1271,16 @@ Item_in_subselect::single_value_transformer(JOIN *join,
         // select and is not outer anymore.
         item->walk(&Item::remove_dependence_processor, 0,
                            (uchar *) select_lex->outer_select());
-	item= func->create(left_expr, item);
-	// fix_field of item will be done in time of substituting
+        item= func->create(left_expr->real_item(), item);
+        /*
+          fix_field of substitution item will be done in time of
+          substituting.
+          Note that real_item() should be used instead of
+          original left expression because left_expr can be
+          runtime created Ref item which is deleted at the end
+          of the statement. Thus one of 'substitution' arguments
+          can be broken in case of PS.
+        */ 
 	substitution= item;
 	have_to_be_excluded= 1;
 	if (thd->lex->describe)
@@ -2051,10 +2077,14 @@ int subselect_uniquesubquery_engine::scan_table()
   TABLE *table= tab->table;
   DBUG_ENTER("subselect_uniquesubquery_engine::scan_table");
 
-  if (table->file->inited)
-    table->file->ha_index_end();
- 
-  table->file->ha_rnd_init(1);
+  if ((table->file->inited &&
+       (error= table->file->ha_index_end())) ||
+      (error= table->file->ha_rnd_init(1)))
+  {
+    (void) report_error(table, error);
+    DBUG_RETURN(true);
+  }
+
   table->file->extra_opt(HA_EXTRA_CACHE,
                          current_thd->variables.read_buff_size);
   table->null_row= 0;
@@ -2231,9 +2261,14 @@ int subselect_uniquesubquery_engine::exec()
 
   if (null_keypart)
     DBUG_RETURN(scan_table());
- 
-  if (!table->file->inited)
-    table->file->ha_index_init(tab->ref.key, 0);
+
+  if (!table->file->inited &&
+      (error= table->file->ha_index_init(tab->ref.key, 0)))
+  {
+    (void) report_error(table, error);
+    DBUG_RETURN(true);
+  }
+
   error= table->file->index_read_map(table->record[0],
                                      tab->ref.key_buff,
                                      make_prev_keypart_map(tab->ref.key_parts),
@@ -2353,8 +2388,12 @@ int subselect_indexsubquery_engine::exec()
   if (null_keypart)
     DBUG_RETURN(scan_table());
 
-  if (!table->file->inited)
-    table->file->ha_index_init(tab->ref.key, 1);
+  if (!table->file->inited &&
+      (error= table->file->ha_index_init(tab->ref.key, 1)))
+  {
+    (void) report_error(table, error);
+    DBUG_RETURN(true);
+  }
   error= table->file->index_read_map(table->record[0],
                                      tab->ref.key_buff,
                                      make_prev_keypart_map(tab->ref.key_parts),

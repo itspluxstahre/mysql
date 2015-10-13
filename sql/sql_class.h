@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2015, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 
 #ifndef SQL_CLASS_INCLUDED
@@ -56,6 +56,7 @@ class User_level_lock;
 class user_var_entry;
 
 struct st_thd_timer;
+struct query_stats_st;
 
 enum enum_enable_or_disable { LEAVE_AS_IS, ENABLE, DISABLE };
 enum enum_ha_read_modes { RFIRST, RNEXT, RPREV, RLAST, RKEY, RNEXT_SAME };
@@ -393,6 +394,7 @@ extern const LEX_STRING Diag_condition_item_names[];
 
 #include "sql_lex.h"				/* Must be here */
 
+extern LEX_CSTRING sql_statement_names[(uint) SQLCOM_END + 1];
 class Delayed_insert;
 class select_result;
 class Time_zone;
@@ -511,8 +513,12 @@ typedef struct system_variables
 
   double long_query_time_double;
 
+  my_bool pseudo_slave_mode;
+
   ulong protocol_mode;
   ulong max_statement_time;
+  my_bool binlog_row_write_table_metadata;
+  my_bool binlog_write_user_info;
 } SV;
 
 
@@ -602,8 +608,6 @@ typedef struct system_status_var
 */
 
 #define last_system_status_var questions
-
-void mark_transaction_to_rollback(THD *thd, bool all);
 
 #ifdef MYSQL_SERVER
 
@@ -904,6 +908,11 @@ void xid_cache_delete(XID_STATE *xid_state);
 */
 
 class Security_context {
+private:
+
+String host;
+String ip;
+String external_user;
 public:
   Security_context() {}                       /* Remove gcc warning */
   /*
@@ -913,13 +922,11 @@ public:
     priv_user - The user privilege we are using. May be "" for anonymous user.
     ip - client IP
   */
-  char   *host, *user, *ip;
+  char   *user;
   char   priv_user[USERNAME_LENGTH];
   char   proxy_user[USERNAME_LENGTH + MAX_HOSTNAME + 5];
   /* The host privilege we are using */
   char   priv_host[MAX_HOSTNAME];
-  /* The external user (if available) */
-  char   *external_user;
   /* points to host if host is available, otherwise points to ip */
   const char *host_or_ip;
   ulong master_access;                 /* Global privileges from mysql.user */
@@ -934,7 +941,13 @@ public:
   }
   
   bool set_user(char *user_arg);
-
+  String *get_host();
+  String *get_ip();
+  String *get_external_user();
+  void set_host(const char *p);
+  void set_ip(const char *p);
+  void set_external_user(const char *p);
+  void set_host(const char *str, size_t len);
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
   bool
   change_security_context(THD *thd,
@@ -1456,6 +1469,8 @@ public:
 
   /* Used to execute base64 coded binlog events in MySQL server */
   Relay_log_info* rli_fake;
+  /* Slave applier execution context */
+  Relay_log_info* rli_slave;
 
   void reset_for_next_command();
   /*
@@ -1552,6 +1567,9 @@ public:
   */
   const char *proc_info;
 
+  /* Abstract method to set a formatted info-string. */
+  virtual void print_proc_info(const char *fmt, ...);
+
   /*
     Used in error messages to tell user in what part of MySQL we found an
     error. E. g. when where= "having clause", if fix_fields() fails, user
@@ -1579,6 +1597,8 @@ public:
   */
   enum enum_server_command command;
   uint32     server_id;
+  // Used to save the command, before it is set to COM_SLEEP.
+  enum enum_server_command old_command;
   uint32     file_id;			// for LOAD DATA INFILE
   /* remote (peer) port */
   uint16 peer_port;
@@ -1593,6 +1613,17 @@ public:
   /* <> 0 if we are inside of trigger or stored function. */
   uint in_sub_stmt;
 
+  /** 
+    Used by fill_status() to avoid acquiring LOCK_status mutex twice
+    when this function is called recursively (e.g. queries 
+    that contains SELECT on I_S.GLOBAL_STATUS with subquery on the 
+    same I_S table).
+    Incremented each time fill_status() function is entered and 
+    decremented each time before it returns from the function.
+  */
+  uint fill_status_recursion_level;
+  uint fill_variables_recursion_level;
+
   /* container for handler's private per-connection data */
   Ha_data ha_data[MAX_HA];
 
@@ -1605,6 +1636,7 @@ public:
   void binlog_start_trans_and_stmt();
   void binlog_set_stmt_begin();
   int binlog_write_table_map(TABLE *table, bool is_transactional);
+  int binlog_write_table_metadata(TABLE *table, bool is_transactional);
   int binlog_write_row(TABLE* table, bool is_transactional,
                        MY_BITMAP const* cols, size_t colcnt,
                        const uchar *buf);
@@ -1953,6 +1985,7 @@ public:
   }
 
   ha_rows    cuted_fields;
+  uint8      failed_com_change_user;
 
   /*
     number of rows we actually sent to the client, including "synthetic"
@@ -1972,7 +2005,26 @@ public:
   */
   ha_rows    examined_row_count;
 
-  USER_CONN *user_connect;
+private:
+  USER_CONN *m_user_connect;
+
+public:
+  void set_user_connect(USER_CONN *uc);
+  const USER_CONN* get_user_connect()
+  { return m_user_connect; }
+
+  void increment_user_connections_counter();
+  void decrement_user_connections_counter();
+
+  void increment_con_per_hour_counter();
+
+  void increment_updates_counter();
+
+  void increment_questions_counter();
+
+  void time_out_user_resource_limits();
+
+public:
   CHARSET_INFO *db_charset;
   Warning_info *warning_info;
   Diagnostics_area *stmt_da;
@@ -2026,6 +2078,8 @@ public:
   */
   enum_tx_isolation tx_isolation;
   enum_check_fields count_cuted_fields;
+  ha_rows    updated_row_count;
+  ha_rows    sent_row_count_2; /* for userstat */
 
   DYNAMIC_ARRAY user_var_events;        /* For user variables replication */
   MEM_ROOT      *user_var_events_alloc; /* Allocate above array elements here */
@@ -2106,6 +2160,7 @@ public:
   /* set during loop of derived table processing */
   bool       derived_tables_processing;
   my_bool    tablespace_op;	/* This is TRUE in DISCARD/IMPORT TABLESPACE */
+  bool       deadlock_report;
 
   sp_rcontext *spcont;		// SP runtime context
   sp_cache   *sp_proc_cache;
@@ -2121,6 +2176,59 @@ public:
   */
   LOG_INFO*  current_linfo;
   NET*       slave_net;			// network connection from slave -> m.
+
+  /*
+    Used to update global user stats.  The global user stats are updated
+    occasionally with the 'diff' variables.  After the update, the 'diff'
+    variables are reset to 0.
+  */
+  // Time when the current thread connected to MySQL.
+  time_t current_connect_time;
+  // Last time when THD stats were updated in global_user_stats.
+  time_t last_global_update_time;
+  // Busy (non-idle) time for just one command.
+  double busy_time;
+  // Busy time not updated in global_user_stats yet.
+  double diff_total_busy_time;
+  // Cpu (non-idle) time for just one thread.
+  double cpu_time;
+  // Cpu time not updated in global_user_stats yet.
+  double diff_total_cpu_time;
+  /* bytes counting */
+  ulonglong bytes_received;
+  ulonglong diff_total_bytes_received;
+  ulonglong bytes_sent;
+  ulonglong diff_total_bytes_sent;
+  ulonglong binlog_bytes_written;
+  ulonglong diff_total_binlog_bytes_written;
+
+  // Number of rows not reflected in global_user_stats yet.
+  ha_rows diff_total_sent_rows, diff_total_updated_rows, diff_total_read_rows;
+  ha_rows diff_total_read_rows_first;
+  ha_rows diff_total_read_rows_last;
+  ha_rows diff_total_read_rows_key;
+  ha_rows diff_total_read_rows_next;
+  ha_rows diff_total_read_rows_prev;
+  ha_rows diff_total_read_rows_rnd;
+  ha_rows diff_total_read_rows_rnd_next;
+  ha_rows diff_total_delete_rows;
+  ha_rows diff_total_update_rows;
+  ha_rows diff_total_write_rows;
+  // Number of commands not reflected in global_user_stats yet.
+  ulonglong diff_select_commands, diff_update_commands, diff_other_commands;
+  // Number of transactions not reflected in global_user_stats yet.
+  ulonglong diff_commit_trans, diff_rollback_trans;
+  // Number of connection errors not reflected in global_user_stats yet.
+  ulonglong diff_denied_connections, diff_lost_connections;
+  // Number of db access denied, not reflected in global_user_stats yet.
+  ulonglong diff_access_denied_errors;
+  // Number of queries that return 0 rows
+  ulonglong diff_empty_queries;
+
+  // Per account query delay in miliseconds. When not 0, sleep this number of
+  // milliseconds before every SQL command.
+  ulonglong query_delay_millis;
+
   /* Used by the sys_var class to store temporary values */
   union
   {
@@ -2187,6 +2295,10 @@ public:
   /* Debug Sync facility. See debug_sync.cc. */
   struct st_debug_sync_control *debug_sync_control;
 #endif /* defined(ENABLED_DEBUG_SYNC) */
+
+  /* current query statistics structure */
+  query_stats_st *query_stats;
+
   THD();
   ~THD();
 
@@ -2201,6 +2313,11 @@ public:
     alloc_root. 
   */
   void init_for_queries();
+  void reset_stats(void);
+  void reset_diff_stats(void);
+  // ran_command is true when this is called immediately after a
+  // command has been run.
+  void update_stats(bool ran_command);
   void change_user(void);
   void cleanup(void);
   void cleanup_after_query();
@@ -2624,6 +2741,12 @@ public:
   */
   bool set_db(const char *new_db, size_t new_db_len)
   {
+    /*
+      Acquiring mutex LOCK_thd_data as we either free the memory allocated
+      for the database and reallocating the memory for the new db or memcpy
+      the new_db to the db.
+    */
+    mysql_mutex_lock(&LOCK_thd_data);
     /* Do not reallocate memory if current chunk is big enough. */
     if (db && new_db && db_length >= new_db_len)
       memcpy(db, new_db, new_db_len+1);
@@ -2636,6 +2759,7 @@ public:
         db= NULL;
     }
     db_length= db ? new_db_len : 0;
+    mysql_mutex_unlock(&LOCK_thd_data);
     return new_db && !db;
   }
 
@@ -2672,6 +2796,15 @@ public:
     return FALSE;
   }
   thd_scheduler scheduler;
+
+  /* Returns string as 'IP:port' for the client-side
+     of the connnection represented
+     by 'client' as displayed by SHOW PROCESSLIST.
+     Allocates memory from the heap of
+     this THD and that is not reclaimed
+     immediately, so use sparingly. May return NULL.
+  */
+  char *get_client_host_port(THD *client);
 
 public:
   inline Internal_error_handler *get_internal_handler()
@@ -2829,6 +2962,7 @@ public:
   LEX_STRING get_invoker_user() { return invoker_user; }
   LEX_STRING get_invoker_host() { return invoker_host; }
   bool has_invoker() { return invoker_user.length > 0; }
+  void mark_transaction_to_rollback(bool all);
 private:
 
   /** The current internal error handler for this thread, or NULL. */
@@ -2873,6 +3007,10 @@ private:
   LEX_STRING invoker_host;
 };
 
+/* Returns string as 'IP' for the client-side of the connection represented by
+   'client'. Does not allocate memory. May return "".
+*/
+const char *get_client_host(THD *client);
 
 /** A short cut for thd->stmt_da->set_ok_status(). */
 
@@ -3419,11 +3557,13 @@ public:
   bool get(TABLE *table);
   static double get_use_cost(uint *buffer, uint nkeys, uint key_size, 
                              ulonglong max_in_memory_size);
+
+  // Returns the number of bytes needed in imerge_cost_buf.
   inline static int get_cost_calc_buff_size(ulong nkeys, uint key_size, 
                                             ulonglong max_in_memory_size)
   {
     register ulonglong max_elems_in_tree=
-      (1 + max_in_memory_size / ALIGN_SIZE(sizeof(TREE_ELEMENT)+key_size));
+      (max_in_memory_size / ALIGN_SIZE(sizeof(TREE_ELEMENT)+key_size));
     return (int) (sizeof(uint)*(1 + nkeys/max_elems_in_tree));
   }
 
@@ -3630,7 +3770,9 @@ public:
 /**
   Skip the increase of the global query id counter. Commonly set for
   commands that are stateless (won't cause any change on the server
-  internal states).
+  internal states). This is made obsolete as query id is incremented for
+  ping and statistics commands as well because of race condition 
+  (Bug#58785).
 */
 #define CF_SKIP_QUERY_ID        (1U << 0)
 
@@ -3646,7 +3788,6 @@ void add_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var);
 
 void add_diff_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var,
                         STATUS_VAR *dec_var);
-void mark_transaction_to_rollback(THD *thd, bool all);
 
 /* Inline functions */
 
@@ -3663,6 +3804,11 @@ inline bool add_value_to_list(THD *thd, Item *value)
 inline bool add_order_to_list(THD *thd, Item *item, bool asc)
 {
   return thd->lex->current_select->add_order_to_list(thd, item, asc);
+}
+
+inline bool add_gorder_to_list(THD *thd, Item *item, bool asc)
+{
+  return thd->lex->current_select->add_gorder_to_list(thd, item, asc);
 }
 
 inline bool add_group_to_list(THD *thd, Item *item, bool asc)
@@ -3684,5 +3830,36 @@ const char *set_thd_proc_info(void *thd_arg, const char *info,
 
 #define thd_proc_info(thd, msg) \
   set_thd_proc_info(thd, msg, __func__, __FILE__, __LINE__)
+
+/**
+  Ensures that a thread state is set when control enters a scope and the
+  thread state is reset automatically when control leaves the scope.
+*/
+struct Scoped_proc_info
+{
+  THD *m_thd;
+  const char *m_prev_proc_info;
+
+  Scoped_proc_info(THD *thd = current_thd)
+    : m_thd(thd), m_prev_proc_info(NULL) {}
+
+  ~Scoped_proc_info() { reset(); }
+
+  void set(const char *info, const char *func, const char *file, uint line)
+  {
+    if (m_thd)
+      m_prev_proc_info= set_thd_proc_info(m_thd, info, func, file, line);
+  }
+
+  void reset()
+  {
+    if (m_thd)
+      set_thd_proc_info(m_thd, m_prev_proc_info, NULL, NULL, 0);
+    m_prev_proc_info = NULL;
+  }
+};
+
+#define scoped_proc_info(state, info) \
+  state.set(info, __func__, __FILE__, __LINE__)
 
 #endif /* SQL_CLASS_INCLUDED */

@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -18,6 +18,7 @@
 #ifndef MYSQL_CLIENT
 #include "unireg.h"                      // REQUIRED by later includes
 #include "rpl_rli.h"
+#include "log_event.h"
 #include "sql_select.h"
 
 /**
@@ -185,7 +186,7 @@ int compare_lengths(Field *field, enum_field_types source_type, uint16 metadata)
   DBUG_PRINT("result", ("%d", result));
   DBUG_RETURN(result);
 }
-
+#endif //MYSQL_CLIENT
 /*********************************************************************
  *                   table_def member definitions                    *
  *********************************************************************/
@@ -196,7 +197,7 @@ int compare_lengths(Field *field, enum_field_types source_type, uint16 metadata)
 */
 uint32 table_def::calc_field_size(uint col, uchar *master_data) const
 {
-  uint32 length;
+  uint32 length= 0;
 
   switch (type(col)) {
   case MYSQL_TYPE_NEWDECIMAL:
@@ -284,7 +285,6 @@ uint32 table_def::calc_field_size(uint col, uchar *master_data) const
   case MYSQL_TYPE_VARCHAR:
   {
     length= m_field_metadata[col] > 255 ? 2 : 1; // c&p of Field_varstring::data_length()
-    DBUG_ASSERT(uint2korr(master_data) > 0);
     length+= length == 1 ? (uint32) *master_data : uint2korr(master_data);
     break;
   }
@@ -294,17 +294,6 @@ uint32 table_def::calc_field_size(uint col, uchar *master_data) const
   case MYSQL_TYPE_BLOB:
   case MYSQL_TYPE_GEOMETRY:
   {
-#if 1
-    /*
-      BUG#29549: 
-      This is currently broken for NDB, which is using big-endian
-      order when packing length of BLOB. Once they have decided how to
-      fix the issue, we can enable the code below to make sure to
-      always read the length in little-endian order.
-    */
-    Field_blob fb(m_field_metadata[col]);
-    length= fb.get_packed_size(master_data, TRUE);
-#else
     /*
       Compute the length of the data. We cannot use get_length() here
       since it is dependent on the specific table (and also checks the
@@ -330,7 +319,6 @@ uint32 table_def::calc_field_size(uint col, uchar *master_data) const
     }
 
     length+= m_field_metadata[col];
-#endif
     break;
   }
   default:
@@ -339,7 +327,7 @@ uint32 table_def::calc_field_size(uint col, uchar *master_data) const
   return length;
 }
 
-
+#ifndef MYSQL_CLIENT
 /**
  */
 void show_sql_type(enum_field_types type, uint16 metadata, String *str, CHARSET_INFO *field_cs)
@@ -877,8 +865,14 @@ TABLE *table_def::create_conversion_table(THD *thd, Relay_log_info *rli, TABLE *
   DBUG_ENTER("table_def::create_conversion_table");
 
   List<Create_field> field_list;
-
-  for (uint col= 0 ; col < size() ; ++col)
+  TABLE *conv_table= NULL;
+  /*
+    At slave, columns may differ. So we should create
+    min(columns@master, columns@slave) columns in the
+    conversion table.
+  */
+  uint const cols_to_create= min(target_table->s->fields, size());
+  for (uint col= 0 ; col < cols_to_create; ++col)
   {
     Create_field *field_def=
       (Create_field*) alloc_root(thd->mem_root, sizeof(Create_field));
@@ -913,10 +907,15 @@ TABLE *table_def::create_conversion_table(THD *thd, Relay_log_info *rli, TABLE *
       break;
 
     case MYSQL_TYPE_DECIMAL:
-      precision= field_metadata(col);
-      decimals= static_cast<Field_num*>(target_table->field[col])->dec;
-      max_length= field_metadata(col);
-      break;
+      sql_print_error("In RBR mode, Slave received incompatible DECIMAL field "
+                      "(old-style decimal field) from Master while creating "
+                      "conversion table. Please consider changing datatype on "
+                      "Master to new style decimal by executing ALTER command for"
+                      " column Name: %s.%s.%s.",
+                      target_table->s->db.str,
+                      target_table->s->table_name.str,
+                      target_table->field[col]->field_name);
+      goto err;
 
     case MYSQL_TYPE_TINY_BLOB:
     case MYSQL_TYPE_MEDIUM_BLOB:
@@ -944,7 +943,9 @@ TABLE *table_def::create_conversion_table(THD *thd, Relay_log_info *rli, TABLE *
     field_def->interval= interval;
   }
 
-  TABLE *conv_table= create_virtual_tmp_table(thd, field_list);
+  conv_table= create_virtual_tmp_table(thd, field_list);
+
+err:
   if (conv_table == NULL)
     rli->report(ERROR_LEVEL, ER_SLAVE_CANT_CREATE_CONVERSION,
                 ER(ER_SLAVE_CANT_CREATE_CONVERSION),
@@ -1056,3 +1057,67 @@ table_def::~table_def()
 #endif
 }
 
+
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+
+Deferred_log_events::Deferred_log_events(Relay_log_info *rli) : last_added(NULL)
+{
+  my_init_dynamic_array(&array, sizeof(Log_event *), 32, 16);
+}
+
+Deferred_log_events::~Deferred_log_events() 
+{
+  delete_dynamic(&array);
+}
+
+int Deferred_log_events::add(Log_event *ev)
+{
+  last_added= ev;
+  insert_dynamic(&array, (uchar*) &ev);
+  return 0;
+}
+
+bool Deferred_log_events::is_empty()
+{  
+  return array.elements == 0;
+}
+
+bool Deferred_log_events::execute(Relay_log_info *rli)
+{
+  bool res= false;
+
+  DBUG_ASSERT(rli->deferred_events_collecting);
+
+  rli->deferred_events_collecting= false;
+  for (uint i=  0; !res && i < array.elements; i++)
+  {
+    Log_event *ev= (* (Log_event **)
+                    dynamic_array_ptr(&array, i));
+    res= ev->apply_event(rli);
+  }
+  rli->deferred_events_collecting= true;
+  return res;
+}
+
+void Deferred_log_events::rewind()
+{
+  /*
+    Reset preceeding Query log event events which execution was
+    deferred because of slave side filtering.
+  */
+  if (!is_empty())
+  {
+    for (uint i=  0; i < array.elements; i++)
+    {
+      Log_event *ev= *(Log_event **) dynamic_array_ptr(&array, i);
+      delete ev;
+    }
+    last_added= NULL;
+    if (array.elements > array.max_element)
+      freeze_size(&array);
+    reset_dynamic(&array);
+    last_added= NULL;
+  }
+}
+
+#endif

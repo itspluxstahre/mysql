@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -62,6 +62,21 @@ typedef enum {
 
 /** Operations that can currently be buffered. */
 extern ibuf_use_t	ibuf_use;
+
+/** Insert buffer statistics struct */
+struct ibuf_stat_struct{
+	ulint		size;		/*!< current size of the ibuf index
+					tree, in pages */
+	ulint		n_merges;	/*!< number of pages merged */
+	ulint		n_merged_ops[IBUF_OP_COUNT];
+					/*!< number of operations of each type
+					merged to index pages */
+	ulint		n_discarded_ops[IBUF_OP_COUNT];
+					/*!< number of operations of each type
+					discarded without merging due to the
+					tablespace being deleted or the
+					index being dropped */
+};
 
 #if defined UNIV_DEBUG || defined UNIV_IBUF_DEBUG
 /** Flag to control insert buffer debugging. */
@@ -423,6 +438,13 @@ void
 ibuf_print(
 /*=======*/
 	FILE*	file);	/*!< in: file where to print */
+/******************************************************************//**
+Collect insert buffer stats. */
+UNIV_INTERN
+void
+ibuf_get_stats(
+/*===========*/
+	ibuf_stat_t*	stat);	/*!< out: ibuf stats */
 /********************************************************************
 Read the first two bytes from a record's fourth field (counter field in new
 records; something else in older records).

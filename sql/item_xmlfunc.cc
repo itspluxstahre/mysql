@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -226,6 +226,9 @@ public:
   {
     max_length= MAX_BLOB_WIDTH;
     collation.collation= pxml->charset();
+    // To avoid premature evaluation, mark all nodeset functions as non-const.
+    used_tables_cache= RAND_TABLE_BIT;
+    const_item_cache= false;
   }
   const char *func_name() const { return "nodeset"; }
 };
@@ -2692,8 +2695,12 @@ int xml_enter(MY_XML_PARSER *st,const char *attr, size_t len)
 
   node.parent= data->parent; // Set parent for the new node to old parent
   data->parent= numnodes;    // Remember current node as new parent
+  DBUG_ASSERT(data->level <= MAX_LEVEL);
   data->pos[data->level]= numnodes;
-  node.level= data->level++;
+  if (data->level < MAX_LEVEL)
+    node.level= data->level++;
+  else
+    return MY_XML_ERROR;
   node.type= st->current_node_type; // TAG or ATTR
   node.beg= attr;
   node.end= attr + len;

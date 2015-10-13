@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -70,7 +70,7 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/sql_list.cc ../sql/sql_load.cc ../sql/sql_locale.cc 
            ../sql/sql_binlog.cc ../sql/sql_manager.cc
            ../sql/sql_parse.cc ../sql/sql_partition.cc ../sql/sql_plugin.cc 
-           ../sql/debug_sync.cc
+           ../sql/debug_sync.cc ../sql/slave.cc
            ../sql/sql_prepare.cc ../sql/sql_rename.cc ../sql/sql_repl.cc 
            ../sql/sql_select.cc ../sql/sql_servers.cc
            ../sql/sql_show.cc ../sql/sql_state.c ../sql/sql_string.cc
@@ -88,12 +88,21 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/sys_vars.cc
            ${CMAKE_BINARY_DIR}/sql/sql_builtin.cc
            ../sql/mdl.cc ../sql/transaction.cc
+           ../sql/query_stats.cc
            ${GEN_SOURCES}
            ${MYSYS_LIBWRAP_SOURCE}
 )
 
 IF(HAVE_MY_TIMER)
   SET(SQL_EMBEDDED_SOURCES ${SQL_EMBEDDED_SOURCES} ../sql/sql_timer.cc)
+ENDIF()
+
+# These files have unused result errors, so we skip Werror
+CHECK_C_COMPILER_FLAG("-Werror" HAVE_WERROR_FLAG)
+IF(HAVE_WERROR_FLAG)
+  INCLUDE(${MYSQL_CMAKE_SCRIPT_DIR}/compile_flags.cmake)
+  ADD_COMPILE_FLAGS(../sql/filesort.cc  COMPILE_FLAGS "-Wno-error")
+  ADD_COMPILE_FLAGS(../sql/opt_range.cc COMPILE_FLAGS "-Wno-error")
 ENDIF()
 
 ADD_CONVENIENCE_LIBRARY(sql_embedded ${SQL_EMBEDDED_SOURCES})
@@ -145,4 +154,38 @@ ENDIF()
 IF(MSVC AND NOT DISABLE_SHARED)
   MERGE_LIBRARIES(libmysqld SHARED ${LIBS} EXPORTS ${CLIENT_API_FUNCTIONS}
   COMPONENT Embedded)
+ENDIF()
+
+OPTION(WITH_EMBEDDED_SHARED_LIBRARY
+  "Generate shared version of embedded library (in addition to the static one)"
+  OFF)
+IF(WITH_EMBEDDED_SHARED_LIBRARY)
+  MERGE_LIBRARIES(libmysqld SHARED
+    mysqlserver
+    EXPORTS ${CLIENT_API_FUNCTIONS}
+    OUTPUT_NAME "mysqld"
+    COMPONENT Embedded)
+  SET_TARGET_PROPERTIES(libmysqld PROPERTIES
+    VERSION "${SHARED_LIB_MAJOR_VERSION}.${SHARED_LIB_MINOR_VERSION}.0"
+    SOVERSION "${SHARED_LIB_MAJOR_VERSION}"
+    )
+
+  GET_TARGET_PROPERTY(libmysqld_link_flags libmysqld LINK_FLAGS)
+  IF(NOT libmysqld_link_flag)
+    SET(libmysqld_link_flags)
+  ENDIF()
+  SET(libmysqld_link_flags
+    "${CMAKE_SHARED_LIBRARY_C_FLAGS} ${libmysqld_link_flags}")
+  SET_TARGET_PROPERTIES(libmysqld
+    PROPERTIES LINK_FLAGS "${libmysqld_link_flags}")
+
+  IF(LINK_FLAG_NO_UNDEFINED)
+    SET(libmysqld_link_flags
+      "${libmysqld_link_flags} ${LINK_FLAG_NO_UNDEFINED}")
+    SET_TARGET_PROPERTIES(libmysqld
+      PROPERTIES LINK_FLAGS "${libmysqld_link_flags}")
+  ENDIF()
+
+  SET_TARGET_PROPERTIES(libmysqld PROPERTIES CLEAN_DIRECT_OUTPUT 1)
+  SET_TARGET_PROPERTIES(mysqlserver PROPERTIES CLEAN_DIRECT_OUTPUT 1)
 ENDIF()

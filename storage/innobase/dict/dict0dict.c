@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2011, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2015, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -23,7 +23,10 @@ Data dictionary system
 Created 1/8/1996 Heikki Tuuri
 ***********************************************************************/
 
+#include <my_sys.h>
+
 #include "dict0dict.h"
+#include "ut0rbt.h"
 
 #ifdef UNIV_NONINL
 #include "dict0dict.ic"
@@ -33,6 +36,17 @@ Created 1/8/1996 Heikki Tuuri
 UNIV_INTERN dict_index_t*	dict_ind_redundant;
 /** dummy index for ROW_FORMAT=COMPACT supremum and infimum records */
 UNIV_INTERN dict_index_t*	dict_ind_compact;
+
+#if defined UNIV_DEBUG || defined UNIV_IBUF_DEBUG
+/** Flag to control insert buffer debugging. */
+UNIV_INTERN uint	ibuf_debug;
+#endif /* UNIV_DEBUG || UNIV_IBUF_DEBUG */
+
+/**********************************************************************
+Issue a warning that the row is too big. */
+void
+ib_warn_row_too_big(const dict_table_t*	table);
+
 
 #ifndef UNIV_HOTBACKUP
 #include "buf0buf.h"
@@ -55,6 +69,8 @@ UNIV_INTERN dict_index_t*	dict_ind_compact;
 #include "m_ctype.h" /* my_isspace() */
 #include "ha_prototypes.h" /* innobase_strcasecmp(), innobase_casedn_str()*/
 #include "row0upd.h"
+#include "m_string.h"
+#include "my_sys.h"
 
 #include <ctype.h>
 
@@ -167,6 +183,7 @@ void
 dict_field_print_low(
 /*=================*/
 	const dict_field_t*	field);	/*!< in: field */
+#ifndef UNIV_HOTBACKUP
 /*********************************************************************//**
 Frees a foreign key struct. */
 static
@@ -180,6 +197,7 @@ and unique key errors */
 UNIV_INTERN FILE*	dict_foreign_err_file		= NULL;
 /* mutex protecting the foreign and unique error buffers */
 UNIV_INTERN mutex_t	dict_foreign_err_mutex;
+#endif /* !UNIV_HOTBACKUP */
 
 /******************************************************************//**
 Makes all characters in a NUL-terminated UTF-8 string lower case. */
@@ -484,10 +502,12 @@ Looks for column n in an index.
 ULINT_UNDEFINED if not contained */
 UNIV_INTERN
 ulint
-dict_index_get_nth_col_pos(
-/*=======================*/
-	const dict_index_t*	index,	/*!< in: index */
-	ulint			n)	/*!< in: column number */
+dict_index_get_nth_col_or_prefix_pos(
+/*=================================*/
+	const dict_index_t*	index,		/*!< in: index */
+	ulint			n,		/*!< in: column number */
+	ibool			inc_prefix)	/*!< in: TRUE=consider
+						column prefixes too */
 {
 	const dict_field_t*	field;
 	const dict_col_t*	col;
@@ -509,13 +529,28 @@ dict_index_get_nth_col_pos(
 	for (pos = 0; pos < n_fields; pos++) {
 		field = dict_index_get_nth_field(index, pos);
 
-		if (col == field->col && field->prefix_len == 0) {
+		if (col == field->col
+		    && (inc_prefix || field->prefix_len == 0)) {
 
 			return(pos);
 		}
 	}
 
 	return(ULINT_UNDEFINED);
+}
+
+/********************************************************************//**
+Looks for column n in an index.
+@return position in internal representation of the index;
+ULINT_UNDEFINED if not contained */
+UNIV_INTERN
+ulint
+dict_index_get_nth_col_pos(
+/*=======================*/
+	const dict_index_t*	index,	/*!< in: index */
+	ulint			n)	/*!< in: column number */
+{
+	return(dict_index_get_nth_col_or_prefix_pos(index, n, FALSE));
 }
 
 #ifndef UNIV_HOTBACKUP
@@ -730,15 +765,18 @@ UNIV_INTERN
 dict_table_t*
 dict_table_get(
 /*===========*/
-	const char*	table_name,	/*!< in: table name */
-	ibool		inc_mysql_count)/*!< in: whether to increment the open
-					handle count on the table */
+	const char*		table_name,	/*!< in: table name */
+	ibool			inc_mysql_count,/*!< in: whether to increment
+						the open handle count on the
+						table */
+	dict_err_ignore_t	ignore_err)	/*!< in: errors to ignore when
+						loading the table */
 {
 	dict_table_t*	table;
 
 	mutex_enter(&(dict_sys->mutex));
 
-	table = dict_table_get_low(table_name);
+	table = dict_table_get_low(table_name, ignore_err);
 
 	if (inc_mysql_count && table) {
 		table->n_mysql_handles_opened++;
@@ -750,8 +788,10 @@ dict_table_get(
 		/* If table->ibd_file_missing == TRUE, this will
 		print an error message and return without doing
 		anything. */
-		dict_update_statistics(table, TRUE /* only update stats
-				       if they have not been initialized */);
+		dict_update_statistics(
+			table,
+			TRUE, /* only update stats if not initialized */
+			FALSE /* update even if not changed too much */);
 	}
 
 	return(table);
@@ -1071,6 +1111,10 @@ dict_table_rename_in_cache(
 
 		UT_LIST_INIT(table->referenced_list);
 
+		if (table->referenced_rbt != NULL) {
+			rbt_clear(table->referenced_rbt);
+		}
+
 		return(TRUE);
 	}
 
@@ -1081,6 +1125,15 @@ dict_table_rename_in_cache(
 	foreign = UT_LIST_GET_FIRST(table->foreign_list);
 
 	while (foreign != NULL) {
+
+		/* The id will be changed.  So remove old one */
+		rbt_delete(foreign->foreign_table->foreign_rbt, foreign->id);
+
+		if (foreign->referenced_table) {
+			rbt_delete(foreign->referenced_table->referenced_rbt,
+				   foreign->id);
+		}
+
 		if (ut_strlen(foreign->foreign_table_name)
 		    < ut_strlen(table->name)) {
 			/* Allocate a longer name buffer;
@@ -1094,21 +1147,77 @@ dict_table_rename_in_cache(
 			dict_mem_foreign_table_name_lookup_set(foreign, FALSE);
 		}
 		if (strchr(foreign->id, '/')) {
+			/* This is a >= 4.0.18 format id */
+
 			ulint	db_len;
 			char*	old_id;
+			char    old_name_cs_filename[MAX_TABLE_NAME_LEN+20];
+			uint    errors = 0;
 
-			/* This is a >= 4.0.18 format id */
+			/* All table names are internally stored in charset
+			my_charset_filename (except the temp tables and the
+			partition identifier suffix in partition tables). The
+			foreign key constraint names are internally stored
+			in UTF-8 charset.  The variable fkid here is used
+			to store foreign key constraint name in charset
+			my_charset_filename for comparison further below. */
+			char    fkid[MAX_TABLE_NAME_LEN+20];
+			ibool	on_tmp = FALSE;
+
+			/* The old table name in my_charset_filename is stored
+			in old_name_cs_filename */
+
+			strncpy(old_name_cs_filename, old_name,
+				MAX_TABLE_NAME_LEN);
+			if (strstr(old_name, TEMP_TABLE_PATH_PREFIX) == NULL) {
+
+				innobase_convert_to_system_charset(
+					strchr(old_name_cs_filename, '/') + 1,
+					strchr(old_name, '/') + 1,
+					MAX_TABLE_NAME_LEN, &errors);
+
+				if (errors) {
+					/* There has been an error to convert
+					old table into UTF-8.  This probably
+					means that the old table name is
+					actually in UTF-8. */
+					innobase_convert_to_filename_charset(
+						strchr(old_name_cs_filename,
+						       '/') + 1,
+						strchr(old_name, '/') + 1,
+						MAX_TABLE_NAME_LEN);
+				} else {
+					/* Old name already in
+					my_charset_filename */
+					strncpy(old_name_cs_filename, old_name,
+						MAX_TABLE_NAME_LEN);
+				}
+			}
+
+			strncpy(fkid, foreign->id, MAX_TABLE_NAME_LEN);
+
+			if (strstr(fkid, TEMP_TABLE_PATH_PREFIX) == NULL) {
+				innobase_convert_to_filename_charset(
+					strchr(fkid, '/') + 1,
+					strchr(foreign->id, '/') + 1,
+					MAX_TABLE_NAME_LEN+20);
+			} else {
+				on_tmp = TRUE;
+			}
 
 			old_id = mem_strdup(foreign->id);
 
-			if (ut_strlen(foreign->id) > ut_strlen(old_name)
+			if (ut_strlen(fkid) > ut_strlen(old_name_cs_filename)
 			    + ((sizeof dict_ibfk) - 1)
-			    && !memcmp(foreign->id, old_name,
-				       ut_strlen(old_name))
-			    && !memcmp(foreign->id + ut_strlen(old_name),
+			    && !memcmp(fkid, old_name_cs_filename,
+				       ut_strlen(old_name_cs_filename))
+			    && !memcmp(fkid + ut_strlen(old_name_cs_filename),
 				       dict_ibfk, (sizeof dict_ibfk) - 1)) {
 
 				/* This is a generated >= 4.0.18 format id */
+
+				char	table_name[MAX_TABLE_NAME_LEN] = "";
+				uint	errors = 0;
 
 				if (strlen(table->name) > strlen(old_name)) {
 					foreign->id = mem_heap_alloc(
@@ -1117,11 +1226,36 @@ dict_table_rename_in_cache(
 						+ strlen(old_id) + 1);
 				}
 
+				/* Convert the table name to UTF-8 */
+				strncpy(table_name, table->name,
+					MAX_TABLE_NAME_LEN);
+				innobase_convert_to_system_charset(
+					strchr(table_name, '/') + 1,
+					strchr(table->name, '/') + 1,
+					MAX_TABLE_NAME_LEN, &errors);
+
+				if (errors) {
+					/* Table name could not be converted
+					from charset my_charset_filename to
+					UTF-8. This means that the table name
+					is already in UTF-8 (#mysql#50). */
+					strncpy(table_name, table->name,
+						MAX_TABLE_NAME_LEN);
+				}
+
 				/* Replace the prefix 'databasename/tablename'
 				with the new names */
-				strcpy(foreign->id, table->name);
-				strcat(foreign->id,
-				       old_id + ut_strlen(old_name));
+				strcpy(foreign->id, table_name);
+				if (on_tmp) {
+					strcat(foreign->id,
+					       old_id + ut_strlen(old_name));
+				} else {
+					sprintf(strchr(foreign->id, '/') + 1,
+						"%s%s",
+						strchr(table_name, '/') +1,
+						strstr(old_id, "_ibfk_") );
+				}
+
 			} else {
 				/* This is a >= 4.0.18 format id where the user
 				gave the id name */
@@ -1145,6 +1279,14 @@ dict_table_rename_in_cache(
 			}
 
 			mem_free(old_id);
+		}
+
+		rbt_insert(foreign->foreign_table->foreign_rbt,
+			   foreign->id, &foreign);
+
+		if (foreign->referenced_table) {
+			rbt_insert(foreign->referenced_table->referenced_rbt,
+				   foreign->id, &foreign);
 		}
 
 		foreign = UT_LIST_GET_NEXT(foreign_list, foreign);
@@ -1446,6 +1588,10 @@ dict_index_too_big_for_tree(
 	/* maximum allowed size of a node pointer record */
 	ulint	page_ptr_max;
 
+	DBUG_EXECUTE_IF(
+		"ib_force_create_table",
+		return(FALSE););
+
 	comp = dict_table_is_comp(table);
 	zip_size = dict_table_zip_size(table);
 
@@ -1460,7 +1606,10 @@ dict_index_too_big_for_tree(
 		number in the page modification log.  The maximum
 		allowed node pointer size is half that. */
 		page_rec_max = page_zip_empty_size(new_index->n_fields,
-						   zip_size) - 1;
+						   zip_size);
+		if (page_rec_max) {
+			page_rec_max--;
+		}
 		page_ptr_max = page_rec_max / 2;
 		/* On a compressed page, there is a two-byte entry in
 		the dense page directory for every record.  But there
@@ -1622,11 +1771,18 @@ dict_index_add_to_cache(
 
 	new_index->n_fields = new_index->n_def;
 
-	if (strict && dict_index_too_big_for_tree(table, new_index)) {
+	if (dict_index_too_big_for_tree(table, new_index)) {
+
+		if (strict) {
 too_big:
-		dict_mem_index_free(new_index);
-		dict_mem_index_free(index);
-		return(DB_TOO_BIG_RECORD);
+			dict_mem_index_free(new_index);
+			dict_mem_index_free(index);
+			return(DB_TOO_BIG_RECORD);
+		} else {
+
+			ib_warn_row_too_big(table);
+
+		}
 	}
 
 	if (UNIV_UNLIKELY(index->type & DICT_UNIVERSAL)) {
@@ -1721,6 +1877,11 @@ undo_size_ok:
 	rw_lock_create(index_tree_rw_lock_key, &new_index->lock,
 		       dict_index_is_ibuf(index)
 		       ? SYNC_IBUF_INDEX_TREE : SYNC_INDEX_TREE);
+
+	DBUG_EXECUTE_IF(
+		"index_partially_created_should_kick",
+		DEBUG_SYNC_C("index_partially_created");
+	);
 
 	if (!UNIV_UNLIKELY(new_index->type & DICT_UNIVERSAL)) {
 
@@ -2014,7 +2175,6 @@ dict_index_build_internal_clust(
 {
 	dict_index_t*	new_index;
 	dict_field_t*	field;
-	ulint		fixed_size;
 	ulint		trx_id_pos;
 	ulint		i;
 	ibool*		indexed;
@@ -2091,7 +2251,7 @@ dict_index_build_internal_clust(
 
 		for (i = 0; i < trx_id_pos; i++) {
 
-			fixed_size = dict_col_get_fixed_size(
+			ulint	fixed_size = dict_col_get_fixed_size(
 				dict_index_get_nth_col(new_index, i),
 				dict_table_is_comp(table));
 
@@ -2108,7 +2268,20 @@ dict_index_build_internal_clust(
 				break;
 			}
 
-			new_index->trx_id_offset += (unsigned int) fixed_size;
+			/* Add fixed_size to new_index->trx_id_offset.
+			Because the latter is a bit-field, an overflow
+			can theoretically occur. Check for it. */
+			fixed_size += new_index->trx_id_offset;
+
+			new_index->trx_id_offset = fixed_size;
+
+			if (new_index->trx_id_offset != fixed_size) {
+				/* Overflow. Pretend that this is a
+				variable-length PRIMARY KEY. */
+				ut_ad(0);
+				new_index->trx_id_offset = 0;
+				break;
+			}
 		}
 
 	}
@@ -2245,6 +2418,7 @@ dict_index_build_internal_non_clust(
 	return(new_index);
 }
 
+#ifndef UNIV_HOTBACKUP
 /*====================== FOREIGN KEY PROCESSING ========================*/
 
 /*********************************************************************//**
@@ -2329,6 +2503,8 @@ dict_foreign_free(
 /*==============*/
 	dict_foreign_t*	foreign)	/*!< in, own: foreign key struct */
 {
+	ut_a(foreign->foreign_table->n_foreign_key_checks_running == 0);
+
 	mem_heap_free(foreign->heap);
 }
 
@@ -2340,22 +2516,53 @@ dict_foreign_remove_from_cache(
 /*===========================*/
 	dict_foreign_t*	foreign)	/*!< in, own: foreign constraint */
 {
+	DBUG_ENTER("dict_foreign_remove_from_cache");
+
 	ut_ad(mutex_own(&(dict_sys->mutex)));
 	ut_a(foreign);
 
 	if (foreign->referenced_table) {
+		ib_rbt_t*	rbt;
+
 		UT_LIST_REMOVE(referenced_list,
 			       foreign->referenced_table->referenced_list,
 			       foreign);
+
+		rbt = foreign->referenced_table->referenced_rbt;
+
+		if (rbt != NULL && foreign->id != NULL) {
+			const ib_rbt_node_t*	node
+				= rbt_lookup(rbt, foreign->id);
+			dict_foreign_t*	val = *(dict_foreign_t**) node->value;
+
+			if (val == foreign) {
+				rbt_delete(rbt, foreign->id);
+			}
+		}
 	}
 
 	if (foreign->foreign_table) {
+		ib_rbt_t*	rbt;
+
 		UT_LIST_REMOVE(foreign_list,
 			       foreign->foreign_table->foreign_list,
 			       foreign);
+		rbt = foreign->foreign_table->foreign_rbt;
+
+		if (rbt != NULL && foreign->id != NULL) {
+			const ib_rbt_node_t*	node
+				= rbt_lookup(rbt, foreign->id);
+			dict_foreign_t*	val = *(dict_foreign_t**) node->value;
+
+			if (val == foreign) {
+				rbt_delete(rbt, foreign->id);
+			}
+		}
 	}
 
 	dict_foreign_free(foreign);
+
+	DBUG_VOID_RETURN;
 }
 
 /**********************************************************************//**
@@ -2369,33 +2576,36 @@ dict_foreign_find(
 	dict_table_t*	table,	/*!< in: table object */
 	const char*	id)	/*!< in: foreign constraint id */
 {
-	dict_foreign_t*	foreign;
+	const ib_rbt_node_t*	node;
+
+	DBUG_ENTER("dict_foreign_find");
 
 	ut_ad(mutex_own(&(dict_sys->mutex)));
+	ut_ad(dict_table_check_foreign_keys(table));
 
-	foreign = UT_LIST_GET_FIRST(table->foreign_list);
-
-	while (foreign) {
-		if (ut_strcmp(id, foreign->id) == 0) {
-
-			return(foreign);
+	if (table->foreign_rbt != NULL) {
+		ut_a(UT_LIST_GET_LEN(table->foreign_list)
+		     == rbt_size(table->foreign_rbt));
+		node = rbt_lookup(table->foreign_rbt, id);
+		if (node != NULL) {
+			DBUG_RETURN(*(dict_foreign_t**) node->value);
 		}
-
-		foreign = UT_LIST_GET_NEXT(foreign_list, foreign);
+	} else {
+		ut_a(UT_LIST_GET_LEN(table->foreign_list) == 0);
 	}
 
-	foreign = UT_LIST_GET_FIRST(table->referenced_list);
-
-	while (foreign) {
-		if (ut_strcmp(id, foreign->id) == 0) {
-
-			return(foreign);
+	if (table->referenced_rbt != NULL) {
+		ut_a(UT_LIST_GET_LEN(table->referenced_list)
+		     == rbt_size(table->referenced_rbt));
+		node = rbt_lookup(table->referenced_rbt, id);
+		if (node != NULL) {
+			DBUG_RETURN(*(dict_foreign_t**) node->value);
 		}
-
-		foreign = UT_LIST_GET_NEXT(referenced_list, foreign);
+	} else {
+		ut_a(UT_LIST_GET_LEN(table->referenced_list) == 0);
 	}
 
-	return(NULL);
+	DBUG_RETURN(NULL);
 }
 
 /*********************************************************************//**
@@ -2507,6 +2717,7 @@ dict_foreign_find_equiv_index(
 		       FALSE/* allow columns to be NULL */));
 }
 
+#endif /* !UNIV_HOTBACKUP */
 /**********************************************************************//**
 Returns an index object by matching on the name and column names and
 if more than one index matches return the index with the max id
@@ -2566,6 +2777,7 @@ dict_table_get_index_by_max_id(
 	return(found);
 }
 
+#ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Report an error in a foreign key definition. */
 static
@@ -2618,9 +2830,11 @@ UNIV_INTERN
 ulint
 dict_foreign_add_to_cache(
 /*======================*/
-	dict_foreign_t*	foreign,	/*!< in, own: foreign key constraint */
-	ibool		check_charsets)	/*!< in: TRUE=check charset
-					compatibility */
+	dict_foreign_t*		foreign,	/*!< in, own: foreign key
+						constraint */
+	ibool			check_charsets,	/*!< in: TRUE=check charset
+						compatibility */
+	dict_err_ignore_t	ignore_err)	/*!< in: error to be ignored */
 {
 	dict_table_t*	for_table;
 	dict_table_t*	ref_table;
@@ -2628,6 +2842,8 @@ dict_foreign_add_to_cache(
 	dict_index_t*	index;
 	ibool		added_to_referenced_list= FALSE;
 	FILE*		ef			= dict_foreign_err_file;
+
+	DBUG_ENTER("dict_foreign_add_to_cache");
 
 	ut_ad(mutex_own(&(dict_sys->mutex)));
 
@@ -2638,7 +2854,14 @@ dict_foreign_add_to_cache(
 		foreign->referenced_table_name_lookup);
 	ut_a(for_table || ref_table);
 
+	if (ref_table != NULL && ref_table->referenced_rbt == NULL) {
+		dict_table_init_referenced_rbt(ref_table);
+	}
+
 	if (for_table) {
+		if (for_table->foreign_rbt == NULL) {
+			dict_table_init_foreign_rbt(for_table);
+		}
 		for_in_cache = dict_foreign_find(for_table, foreign->id);
 	}
 
@@ -2660,7 +2883,8 @@ dict_foreign_add_to_cache(
 			for_in_cache->n_fields, for_in_cache->foreign_index,
 			check_charsets, FALSE);
 
-		if (index == NULL) {
+		if (index == NULL
+		    && !(ignore_err & DICT_ERR_IGNORE_FK_NOKEY)) {
 			dict_foreign_error_report(
 				ef, for_in_cache,
 				"there is no index in referenced table"
@@ -2674,18 +2898,22 @@ dict_foreign_add_to_cache(
 				mem_heap_free(foreign->heap);
 			}
 
-			return(DB_CANNOT_ADD_CONSTRAINT);
+			DBUG_RETURN(DB_CANNOT_ADD_CONSTRAINT);
 		}
 
 		for_in_cache->referenced_table = ref_table;
 		for_in_cache->referenced_index = index;
+
 		UT_LIST_ADD_LAST(referenced_list,
-				 ref_table->referenced_list,
-				 for_in_cache);
+				 ref_table->referenced_list, for_in_cache);
 		added_to_referenced_list = TRUE;
+
+		rbt_insert(ref_table->referenced_rbt,
+			   for_in_cache->id, &for_in_cache);
 	}
 
 	if (for_in_cache->foreign_table == NULL && for_table) {
+
 		index = dict_foreign_find_index(
 			for_table,
 			for_in_cache->foreign_col_names,
@@ -2695,7 +2923,8 @@ dict_foreign_add_to_cache(
 			& (DICT_FOREIGN_ON_DELETE_SET_NULL
 			   | DICT_FOREIGN_ON_UPDATE_SET_NULL));
 
-		if (index == NULL) {
+		if (index == NULL
+		    && !(ignore_err & DICT_ERR_IGNORE_FK_NOKEY)) {
 			dict_foreign_error_report(
 				ef, for_in_cache,
 				"there is no index in the table"
@@ -2713,24 +2942,31 @@ dict_foreign_add_to_cache(
 						referenced_list,
 						ref_table->referenced_list,
 						for_in_cache);
+					rbt_delete(ref_table->referenced_rbt,
+						   for_in_cache->id);
 				}
 
 				mem_heap_free(foreign->heap);
 			}
 
-			return(DB_CANNOT_ADD_CONSTRAINT);
+			DBUG_RETURN(DB_CANNOT_ADD_CONSTRAINT);
 		}
 
 		for_in_cache->foreign_table = for_table;
 		for_in_cache->foreign_index = index;
+
 		UT_LIST_ADD_LAST(foreign_list,
 				 for_table->foreign_list,
 				 for_in_cache);
+
+		rbt_insert(for_table->foreign_rbt, for_in_cache->id,
+			   &for_in_cache);
 	}
 
-	return(DB_SUCCESS);
+	DBUG_RETURN(DB_SUCCESS);
 }
 
+#endif /* !UNIV_HOTBACKUP */
 /*********************************************************************//**
 Scans from pointer onwards. Stops if is at the start of a copy of
 'string' where characters are compared without case sensitivity, and
@@ -2744,14 +2980,27 @@ dict_scan_to(
 	const char*	string)	/*!< in: look for this */
 {
 	char	quote	= '\0';
+	ibool	escape	= FALSE;
 
 	for (; *ptr; ptr++) {
 		if (*ptr == quote) {
 			/* Closing quote character: do not look for
 			starting quote or the keyword. */
-			quote = '\0';
+
+			/* If the quote character is escaped by a
+			backslash, ignore it. */
+			if (escape) {
+				escape = FALSE;
+			} else {
+				quote = '\0';
+			}
 		} else if (quote) {
 			/* Within quotes: do nothing. */
+			if (escape) {
+				escape = FALSE;
+			} else if (*ptr == '\\') {
+				escape = TRUE;
+			}
 		} else if (*ptr == '`' || *ptr == '"' || *ptr == '\'') {
 			/* Starting quote: remember the quote character. */
 			quote = *ptr;
@@ -3070,7 +3319,7 @@ dict_scan_table_name(
 	            2 = Store as given, compare in lower; case semi-sensitive */
 	if (innobase_get_lower_case_table_names() == 2) {
 		innobase_casedn_str(ref);
-		*table = dict_table_get_low(ref);
+		*table = dict_table_get_low(ref, DICT_ERR_IGNORE_NONE);
 		memcpy(ref, database_name, database_name_len);
 		ref[database_name_len] = '/';
 		memcpy(ref + database_name_len + 1, table_name, table_name_len + 1);
@@ -3083,7 +3332,7 @@ dict_scan_table_name(
 #else
 		innobase_casedn_str(ref);
 #endif /* !__WIN__ */
-		*table = dict_table_get_low(ref);
+		*table = dict_table_get_low(ref, DICT_ERR_IGNORE_NONE);
 	}
 
 	*success = TRUE;
@@ -3137,6 +3386,11 @@ dict_strip_comments(
 	char*		ptr;
 	/* unclosed quote character (0 if none) */
 	char		quote	= 0;
+	ibool		escape = FALSE;
+
+	DBUG_ENTER("dict_strip_comments");
+
+	DBUG_PRINT("dict_strip_comments", ("%s", sql_string));
 
 	str = mem_alloc(sql_length + 1);
 
@@ -3151,16 +3405,29 @@ end_of_string:
 
 			ut_a(ptr <= str + sql_length);
 
-			return(str);
+			DBUG_PRINT("dict_strip_comments", ("%s", str));
+			DBUG_RETURN(str);
 		}
 
 		if (*sptr == quote) {
 			/* Closing quote character: do not look for
 			starting quote or comments. */
-			quote = 0;
+
+			/* If the quote character is escaped by a
+			backslash, ignore it. */
+			if (escape) {
+				escape = FALSE;
+			} else {
+				quote = 0;
+			}
 		} else if (quote) {
 			/* Within quotes: do not look for
 			starting quotes or comments. */
+			if (escape) {
+				escape = FALSE;
+			} else if (*sptr == '\\') {
+				escape = TRUE;
+			}
 		} else if (*sptr == '"' || *sptr == '`' || *sptr == '\'') {
 			/* Starting quote: remember the quote character. */
 			quote = *sptr;
@@ -3210,6 +3477,7 @@ end_of_string:
 	}
 }
 
+#ifndef UNIV_HOTBACKUP
 /*********************************************************************//**
 Finds the highest [number] for foreign key constraints of the table. Looks
 only at the >= 4.0.18-format id's, which are of the form
@@ -3332,7 +3600,7 @@ dict_create_foreign_constraints_low(
 
 	ut_ad(mutex_own(&(dict_sys->mutex)));
 
-	table = dict_table_get_low(name);
+	table = dict_table_get_low(name, DICT_ERR_IGNORE_NONE);
 
 	if (table == NULL) {
 		mutex_enter(&dict_foreign_err_mutex);
@@ -4046,7 +4314,7 @@ syntax_error:
 }
 
 /*==================== END OF FOREIGN KEY PROCESSING ====================*/
-
+#endif /* !UNIV_HOTBACKUP */
 /**********************************************************************//**
 Returns an index object if it is found in the dictionary cache.
 Assumes that dict_sys->mutex is already being held.
@@ -4294,13 +4562,19 @@ void
 dict_update_statistics(
 /*===================*/
 	dict_table_t*	table,		/*!< in/out: table */
-	ibool		only_calc_if_missing_stats)/*!< in: only
+	ibool		only_calc_if_missing_stats,/*!< in: only
 					update/recalc the stats if they have
 					not been initialized yet, otherwise
 					do nothing */
+	ibool		only_calc_if_changed_too_much)/*!< in: only
+					update/recalc the stats if the table
+					has been changed too much since the
+					last stats update/recalc */
 {
 	dict_index_t*	index;
 	ulint		sum_of_index_sizes	= 0;
+
+	DBUG_EXECUTE_IF("skip_innodb_statistics", return;);
 
 	if (table->ibd_file_missing) {
 		ut_print_timestamp(stderr);
@@ -4327,26 +4601,52 @@ dict_update_statistics(
 
 	dict_table_stats_lock(table, RW_X_LATCH);
 
-	if (only_calc_if_missing_stats && table->stat_initialized) {
+	if ((only_calc_if_missing_stats && table->stat_initialized)
+	    || (only_calc_if_changed_too_much
+		&& !DICT_TABLE_CHANGED_TOO_MUCH(table))) {
+
 		dict_table_stats_unlock(table, RW_X_LATCH);
 		return;
 	}
 
-	do {
+	for (; index != NULL; index = dict_table_get_next_index(index)) {
+
+		/* Skip incomplete indexes. */
+		if (index->name[0] == TEMP_INDEX_PREFIX) {
+			continue;
+		}
+
+#if defined UNIV_DEBUG || defined UNIV_IBUF_DEBUG
+		if (ibuf_debug && !dict_index_is_clust(index)) {
+			goto fake_statistics;
+		}
+#endif /* UNIV_DEBUG || UNIV_IBUF_DEBUG */
+
 		if (UNIV_LIKELY
 		    (srv_force_recovery < SRV_FORCE_NO_IBUF_MERGE
 		     || (srv_force_recovery < SRV_FORCE_NO_LOG_REDO
 			 && dict_index_is_clust(index)))) {
+			mtr_t	mtr;
 			ulint	size;
-			size = btr_get_size(index, BTR_TOTAL_SIZE);
 
-			index->stat_index_size = size;
+			mtr_start(&mtr);
+			mtr_s_lock(dict_index_get_lock(index), &mtr);
 
-			sum_of_index_sizes += size;
+			size = btr_get_size(index, BTR_TOTAL_SIZE, &mtr);
 
-			size = btr_get_size(index, BTR_N_LEAF_PAGES);
+			if (size != ULINT_UNDEFINED) {
+				sum_of_index_sizes += size;
+				index->stat_index_size = size;
+				size = btr_get_size(
+					index, BTR_N_LEAF_PAGES, &mtr);
+			}
 
-			if (size == 0) {
+			mtr_commit(&mtr);
+
+			switch (size) {
+			case ULINT_UNDEFINED:
+				goto fake_statistics;
+			case 0:
 				/* The root node of the tree is a leaf */
 				size = 1;
 			}
@@ -4363,6 +4663,7 @@ dict_update_statistics(
 			various means, also via secondary indexes. */
 			ulint	i;
 
+fake_statistics:
 			sum_of_index_sizes++;
 			index->stat_index_size = index->stat_n_leaf_pages = 1;
 
@@ -4374,9 +4675,7 @@ dict_update_statistics(
 			       (1 + dict_index_get_n_unique(index))
                                * sizeof(*index->stat_n_non_null_key_vals));
 		}
-
-		index = dict_table_get_next_index(index);
-	} while (index);
+	}
 
 	index = dict_table_get_first_index(table);
 
@@ -4395,6 +4694,7 @@ dict_update_statistics(
 	dict_table_stats_unlock(table, RW_X_LATCH);
 }
 
+#ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Prints info of a foreign key constraint. */
 static
@@ -4425,6 +4725,7 @@ dict_foreign_print_low(
 	fputs(" )\n", stderr);
 }
 
+#endif /* !UNIV_HOTBACKUP */
 /**********************************************************************//**
 Prints a table data. */
 UNIV_INTERN
@@ -4450,7 +4751,7 @@ dict_table_print_by_name(
 
 	mutex_enter(&(dict_sys->mutex));
 
-	table = dict_table_get_low(name);
+	table = dict_table_get_low(name, DICT_ERR_IGNORE_NONE);
 
 	ut_a(table);
 
@@ -4472,7 +4773,10 @@ dict_table_print_low(
 
 	ut_ad(mutex_own(&(dict_sys->mutex)));
 
-	dict_update_statistics(table, FALSE /* update even if initialized */);
+	dict_update_statistics(
+		table,
+		FALSE, /* update even if initialized */
+		FALSE /* update even if not changed too much */);
 
 	dict_table_stats_lock(table, RW_S_LATCH);
 
@@ -4606,6 +4910,7 @@ dict_field_print_low(
 	}
 }
 
+#ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Outputs info on a foreign key of a table in a format suitable for
 CREATE TABLE. */
@@ -4794,6 +5099,7 @@ dict_print_info_on_foreign_keys(
 	mutex_exit(&(dict_sys->mutex));
 }
 
+#endif /* !UNIV_HOTBACKUP */
 /********************************************************************//**
 Displays the names of the index and the table. */
 UNIV_INTERN
@@ -4922,6 +5228,28 @@ dict_table_replace_index_in_foreign_list(
 			ut_a(new_index || !trx->check_foreigns);
 
 			foreign->foreign_index = new_index;
+		}
+	}
+
+
+	for (foreign = UT_LIST_GET_FIRST(table->referenced_list);
+	     foreign;
+	     foreign = UT_LIST_GET_NEXT(referenced_list, foreign)) {
+
+		dict_index_t*	new_index;
+
+		if (foreign->referenced_index == index) {
+			ut_ad(foreign->referenced_table == index->table);
+
+			new_index = dict_foreign_find_index(
+				foreign->referenced_table,
+				foreign->referenced_col_names,
+				foreign->n_fields, index,
+				/*check_charsets=*/TRUE, /*check_null=*/FALSE);
+			ut_ad(new_index || !trx->check_foreigns);
+			ut_ad(!new_index || new_index->table == index->table);
+
+			foreign->referenced_index = new_index;
 		}
 	}
 }
@@ -5072,6 +5400,11 @@ dict_find_table_by_space(
 
 	ut_ad(space_id > 0);
 
+	if (dict_sys == NULL) {
+		/* This could happen when it's in redo processing. */
+		return(NULL);
+	}
+
 	table = UT_LIST_GET_FIRST(dict_sys->table_LRU);
 	num_item =  UT_LIST_GET_LEN(dict_sys->table_LRU);
 
@@ -5178,11 +5511,11 @@ dict_set_corrupted(
 
 	dict_index_copy_types(tuple, sys_index, 2);
 
-	btr_cur_search_to_nth_level(sys_index, 0, tuple, PAGE_CUR_GE,
+	btr_cur_search_to_nth_level(sys_index, 0, tuple, PAGE_CUR_LE,
 				    BTR_MODIFY_LEAF,
 				    &cursor, 0, __FILE__, __LINE__, &mtr);
 
-	if (cursor.up_match == dtuple_get_n_fields(tuple)) {
+	if (cursor.low_match == dtuple_get_n_fields(tuple)) {
 		/* UPDATE SYS_INDEXES SET TYPE=index->type
 		WHERE TABLE_ID=index->table->id AND INDEX_ID=index->id */
 		ulint	len;

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -2429,7 +2429,7 @@ int mi_repair_by_sort(MI_CHECK *param, register MI_INFO *info,
 
     if (_create_index_by_sort(&sort_param,
 			      (my_bool) (!(param->testflag & T_VERBOSE)),
-			      (uint) param->sort_buffer_length))
+                              param->sort_buffer_length))
     {
       param->retry_repair=1;
       goto err;
@@ -2648,6 +2648,7 @@ int mi_repair_parallel(MI_CHECK *param, register MI_INFO *info,
   ulonglong UNINIT_VAR(key_map);
   pthread_attr_t thr_attr;
   ulong max_pack_reclength;
+  int error;
   DBUG_ENTER("mi_repair_parallel");
 
   start_records=info->state->records;
@@ -2942,12 +2943,13 @@ int mi_repair_parallel(MI_CHECK *param, register MI_INFO *info,
 #else
       param->sort_buffer_length*sort_param[i].key_length/total_key_length;
 #endif
-    if (mysql_thread_create(mi_key_thread_find_all_keys,
-                            &sort_param[i].thr, &thr_attr,
-                            thr_find_all_keys,
-                            (void *) (sort_param+i)))
+    if ((error= mysql_thread_create(mi_key_thread_find_all_keys,
+                                    &sort_param[i].thr, &thr_attr,
+                                    thr_find_all_keys,
+                                    (void *) (sort_param+i))))
     {
-      mi_check_print_error(param,"Cannot start a repair thread");
+      mi_check_print_error(param,"Cannot start a repair thread (errno= %d)",
+                           error);
       /* Cleanup: Detach from the share. Avoid others to be blocked. */
       if (io_share.total_threads)
         remove_io_thread(&sort_param[i].read_cache);
@@ -4303,14 +4305,6 @@ int recreate_table(MI_CHECK *param, MI_INFO **org_info, char *filename)
     u_ptr->seg=keyseg;
     keyseg+=u_ptr->keysegs+1;
   }
-  if (share.options & HA_OPTION_COMPRESS_RECORD)
-    share.base.records=max_records=info.state->records;
-  else if (share.base.min_pack_length)
-    max_records=(ha_rows) (mysql_file_seek(info.dfile, 0L, MY_SEEK_END,
-                                           MYF(0)) /
-			   (ulong) share.base.min_pack_length);
-  else
-    max_records=0;
   unpack= (share.options & HA_OPTION_COMPRESS_RECORD) &&
     (param->testflag & T_UNPACK);
   share.options&= ~HA_OPTION_TEMP_COMPRESS_RECORD;
@@ -4320,10 +4314,17 @@ int recreate_table(MI_CHECK *param, MI_INFO **org_info, char *filename)
   set_if_bigger(file_length,param->max_data_file_length);
   set_if_bigger(file_length,tmp_length);
   set_if_bigger(file_length,(ulonglong) share.base.max_data_file_length);
+ 
+  if (share.options & HA_OPTION_COMPRESS_RECORD)
+    share.base.records= max_records= info.state->records;
+  else if (!(share.options & HA_OPTION_PACK_RECORD))
+    max_records= (ha_rows) (file_length / share.base.pack_reclength);
+  else
+    max_records= 0;
 
   (void) mi_close(*org_info);
   bzero((char*) &create_info,sizeof(create_info));
-  create_info.max_rows=max(max_records,share.base.records);
+  create_info.max_rows= max_records;
   create_info.reloc_rows=share.base.reloc;
   create_info.old_options=(share.options |
 			   (unpack ? HA_OPTION_TEMP_COMPRESS_RECORD : 0));

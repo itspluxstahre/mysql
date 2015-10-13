@@ -1,4 +1,5 @@
-/* Copyright (c) 2002, 2011, Oracle and/or its affiliates. All rights reserved. & tommy@valley.ne.jp.
+/* Copyright (c) 2002 MySQL AB & tommy@valley.ne.jp
+   Copyright (c) 2002, 2014, Oracle and/or its affiliates. All rights reserved.
    
    This library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Library General Public
@@ -12,8 +13,8 @@
    
    You should have received a copy of the GNU Library General Public
    License along with this library; if not, write to the Free
-   Software Foundation, Inc., 59 Temple Place - Suite 330, Boston,
-   MA 02111-1307, USA */
+   Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+   MA 02110-1301, USA */
 
 /* This file is for binary pseudo charset, created by bar@mysql.com */
 
@@ -318,13 +319,16 @@ void my_hash_sort_bin(CHARSET_INFO *cs __attribute__((unused)),
 #define INC_PTR(cs,A,B) (A)++
 
 
-int my_wildcmp_bin(CHARSET_INFO *cs,
-                   const char *str,const char *str_end,
-                   const char *wildstr,const char *wildend,
-                   int escape, int w_one, int w_many)
+static
+int my_wildcmp_bin_impl(CHARSET_INFO *cs,
+                        const char *str,const char *str_end,
+                        const char *wildstr,const char *wildend,
+                        int escape, int w_one, int w_many, int recurse_level)
 {
   int result= -1;			/* Not found, using wildcards */
-  
+
+  if (my_string_stack_guard && my_string_stack_guard(recurse_level))
+    return 1;
   while (wildstr != wildend)
   {
     while (*wildstr != w_many && *wildstr != w_one)
@@ -383,8 +387,8 @@ int my_wildcmp_bin(CHARSET_INFO *cs,
 	if (str++ == str_end)
 	  return(-1);
 	{
-	  int tmp=my_wildcmp_bin(cs,str,str_end,wildstr,wildend,escape,w_one,
-				 w_many);
+	  int tmp=my_wildcmp_bin_impl(cs,str,str_end,wildstr,wildend,escape,w_one,
+                                      w_many, recurse_level + 1);
 	  if (tmp <= 0)
 	    return(tmp);
 	}
@@ -393,6 +397,16 @@ int my_wildcmp_bin(CHARSET_INFO *cs,
     }
   }
   return(str != str_end ? 1 : 0);
+}
+
+int my_wildcmp_bin(CHARSET_INFO *cs,
+                   const char *str,const char *str_end,
+                   const char *wildstr,const char *wildend,
+                   int escape, int w_one, int w_many)
+{
+  return my_wildcmp_bin_impl(cs, str, str_end,
+                             wildstr, wildend,
+                             escape, w_one, w_many, 1);
 }
 
 

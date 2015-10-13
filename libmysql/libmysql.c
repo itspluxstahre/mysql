@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -802,7 +802,7 @@ MYSQL_FIELD *cli_list_fields(MYSQL *mysql)
     return NULL;
 
   mysql->field_count= (uint) query->rows;
-  return unpack_fields(query,&mysql->field_alloc,
+  return unpack_fields(mysql, query,&mysql->field_alloc,
 		       mysql->field_count, 1, mysql->server_capabilities);
 }
 
@@ -862,7 +862,7 @@ mysql_list_processes(MYSQL *mysql)
   if (!(fields = (*mysql->methods->read_rows)(mysql,(MYSQL_FIELD*) 0,
 					      protocol_41(mysql) ? 7 : 5)))
     DBUG_RETURN(NULL);
-  if (!(mysql->fields=unpack_fields(fields,&mysql->field_alloc,field_count,0,
+  if (!(mysql->fields=unpack_fields(mysql, fields,&mysql->field_alloc,field_count,0,
 				    mysql->server_capabilities)))
     DBUG_RETURN(0);
   mysql->status=MYSQL_STATUS_GET_RESULT;
@@ -1316,6 +1316,10 @@ static my_bool my_realloc_str(NET *net, ulong length)
     res= net_realloc(net, buf_length + length);
     if (res)
     {
+      if (net->last_errno == ER_OUT_OF_RESOURCES)
+        net->last_errno= CR_OUT_OF_MEMORY;
+      else if (net->last_errno == ER_NET_PACKET_TOO_LARGE)
+        net->last_errno= CR_NET_PACKET_TOO_LARGE;
       strmov(net->sqlstate, unknown_sqlstate);
       strmov(net->last_error, ER(net->last_errno));
     }
@@ -1434,7 +1438,7 @@ my_bool cli_read_prepare_result(MYSQL *mysql, MYSQL_STMT *stmt)
 
     if (!(fields_data= (*mysql->methods->read_rows)(mysql,(MYSQL_FIELD*)0,7)))
       DBUG_RETURN(1);
-    if (!(stmt->fields= unpack_fields(fields_data,&stmt->mem_root,
+    if (!(stmt->fields= unpack_fields(mysql, fields_data,&stmt->mem_root,
 				      field_count,0,
 				      mysql->server_capabilities)))
       DBUG_RETURN(1);
@@ -2107,7 +2111,14 @@ int cli_stmt_execute(MYSQL_STMT *stmt)
       DBUG_RETURN(1);
     }
 
-    net_clear(net, 1);				/* Sets net->write_pos */
+    if (net->vio)
+      net_clear(net, 1);          /* Sets net->write_pos */
+    else
+    {
+      set_stmt_errmsg(stmt, net);
+      DBUG_RETURN(1);             
+    }
+
     /* Reserve place for null-marker bytes */
     null_count= (stmt->param_count+7) /8;
     if (my_realloc_str(net, null_count + 1))
@@ -4218,7 +4229,7 @@ int STDCALL mysql_stmt_fetch_column(MYSQL_STMT *stmt, MYSQL_BIND *my_bind,
   if ((int) stmt->state < (int) MYSQL_STMT_FETCH_DONE)
   {
     set_stmt_error(stmt, CR_NO_DATA, unknown_sqlstate, NULL);
-    return 1;
+    DBUG_RETURN(1);
   }
   if (column >= stmt->field_count)
   {

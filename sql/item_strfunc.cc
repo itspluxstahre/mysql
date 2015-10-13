@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -195,16 +195,27 @@ String *Item_func_md5::val_str_ascii(String *str)
 }
 
 
+/*
+  The MD5()/SHA() functions treat their parameter as being a case sensitive.
+  Thus we set binary collation on it so different instances of MD5() will be
+  compared properly.
+*/
+static CHARSET_INFO *get_checksum_charset(const char *csname)
+{
+  CHARSET_INFO *cs= get_charset_by_csname(csname, MY_CS_BINSORT, MYF(0));
+  if (!cs)
+  {
+    // Charset has no binary collation: use my_charset_bin.
+    cs= &my_charset_bin;
+  }
+  return cs;
+}
+
+
 void Item_func_md5::fix_length_and_dec()
 {
-  /*
-    The MD5() function treats its parameter as being a case sensitive. Thus
-    we set binary collation on it so different instances of MD5() will be
-    compared properly.
-  */
-  args[0]->collation.set(
-      get_charset_by_csname(args[0]->collation.collation->csname,
-                            MY_CS_BINSORT,MYF(0)), DERIVATION_COERCIBLE);
+  CHARSET_INFO *cs= get_checksum_charset(args[0]->collation.collation->csname);
+  args[0]->collation.set(cs, DERIVATION_COERCIBLE);
   fix_length_and_charset(32, default_charset());
 }
 
@@ -239,14 +250,8 @@ String *Item_func_sha::val_str_ascii(String *str)
 
 void Item_func_sha::fix_length_and_dec()
 {
-  /*
-    The SHA() function treats its parameter as being a case sensitive. Thus
-    we set binary collation on it so different instances of MD5() will be
-    compared properly.
-  */
-  args[0]->collation.set(
-      get_charset_by_csname(args[0]->collation.collation->csname,
-                            MY_CS_BINSORT,MYF(0)), DERIVATION_COERCIBLE);
+  CHARSET_INFO *cs= get_checksum_charset(args[0]->collation.collation->csname);
+  args[0]->collation.set(cs, DERIVATION_COERCIBLE);
   // size of hex representation of hash
   fix_length_and_charset(SHA1_HASH_SIZE * 2, default_charset());
 }
@@ -369,18 +374,9 @@ void Item_func_sha2::fix_length_and_dec()
       ER(ER_WRONG_PARAMETERS_TO_NATIVE_FCT), "sha2");
   }
 
-  /*
-    The SHA2() function treats its parameter as being a case sensitive.
-    Thus we set binary collation on it so different instances of SHA2()
-    will be compared properly.
-  */
+  CHARSET_INFO *cs= get_checksum_charset(args[0]->collation.collation->csname);
+  args[0]->collation.set(cs, DERIVATION_COERCIBLE);
 
-  args[0]->collation.set(
-      get_charset_by_csname(
-        args[0]->collation.collation->csname,
-        MY_CS_BINSORT,
-        MYF(0)),
-      DERIVATION_COERCIBLE);
 #else
   push_warning_printf(current_thd,
     MYSQL_ERROR::WARN_LEVEL_WARN,
@@ -1005,6 +1001,7 @@ String *Item_func_reverse::val_str(String *str)
       if ((l= my_ismbchar(res->charset(),ptr,end)))
       {
         tmp-= l;
+        DBUG_ASSERT(tmp >= tmp_value.ptr());
         memcpy(tmp,ptr,l);
         ptr+= l;
       }
@@ -1587,6 +1584,42 @@ String *Item_func_substr_index::val_str(String *str)
   return (&tmp_value);
 }
 
+
+/**
+  A helper function for trim(leading ...) for multibyte charsets.
+  @param res        Copy of 'res' in calling functions.
+  @param ptr        Where to start trimming.
+  @param end        End of string to be trimmed.
+  @param remove_str The string to be removed from [ptr .. end)
+  @return           Pointer to left-trimmed string.
+ */
+static inline
+char *trim_left_mb(String *res, char *ptr, char *end, String *remove_str)
+{
+  const char * const r_ptr= remove_str->ptr();
+  const uint remove_length= remove_str->length();
+
+  while (ptr + remove_length <= end)
+  {
+    uint num_bytes= 0;
+    while (num_bytes < remove_length)
+    {
+      uint len;
+      if ((len= my_ismbchar(res->charset(), ptr + num_bytes, end)))
+        num_bytes+= len;
+      else
+        ++num_bytes;
+    }
+    if (num_bytes != remove_length)
+      break;
+    if (memcmp(ptr, r_ptr, remove_length))
+      break;
+    ptr+= remove_length;
+  }
+  return ptr;
+}
+
+
 /*
 ** The trim functions are extension to ANSI SQL because they trim substrings
 ** They ltrim() and rtrim() functions are optimized for 1 byte strings
@@ -1621,19 +1654,28 @@ String *Item_func_ltrim::val_str(String *str)
 
   ptr= (char*) res->ptr();
   end= ptr+res->length();
-  if (remove_length == 1)
+#ifdef USE_MB
+  if (use_mb(res->charset()))
   {
-    char chr=(*remove_str)[0];
-    while (ptr != end && *ptr == chr)
-      ptr++;
+    ptr= trim_left_mb(res, ptr, end, remove_str);
   }
   else
+#endif /* USE_MB */
   {
-    const char *r_ptr=remove_str->ptr();
-    end-=remove_length;
-    while (ptr <= end && !memcmp(ptr, r_ptr, remove_length))
-      ptr+=remove_length;
-    end+=remove_length;
+    if (remove_length == 1)
+    {
+      char chr=(*remove_str)[0];
+      while (ptr != end && *ptr == chr)
+        ptr++;
+    }
+    else
+    {
+      const char *r_ptr=remove_str->ptr();
+      end-=remove_length;
+      while (ptr <= end && !memcmp(ptr, r_ptr, remove_length))
+        ptr+=remove_length;
+      end+=remove_length;
+    }
   }
   if (ptr == res->ptr())
     return res;
@@ -1727,11 +1769,8 @@ String *Item_func_trim::val_str(String *str)
 {
   DBUG_ASSERT(fixed == 1);
   char buff[MAX_FIELD_WIDTH], *ptr, *end;
-  const char *r_ptr;
   String tmp(buff, sizeof(buff), system_charset_info);
   String *res, *remove_str;
-  uint remove_length;
-  LINT_INIT(remove_length);
 
   res= args[0]->val_str(str);
   if ((null_value=args[0]->null_value))
@@ -1744,25 +1783,28 @@ String *Item_func_trim::val_str(String *str)
       return 0;
   }
 
-  if ((remove_length= remove_str->length()) == 0 ||
+  const uint remove_length= remove_str->length();
+  if (remove_length == 0 ||
       remove_length > res->length())
     return res;
 
   ptr= (char*) res->ptr();
   end= ptr+res->length();
-  r_ptr= remove_str->ptr();
-  while (ptr+remove_length <= end && !memcmp(ptr,r_ptr,remove_length))
-    ptr+=remove_length;
+  const char * const r_ptr= remove_str->ptr();
 #ifdef USE_MB
   if (use_mb(res->charset()))
   {
+    ptr= trim_left_mb(res, ptr, end, remove_str);
+
     char *p=ptr;
     register uint32 l;
  loop:
     while (ptr + remove_length < end)
     {
-      if ((l=my_ismbchar(res->charset(), ptr,end))) ptr+=l;
-      else ++ptr;
+      if ((l= my_ismbchar(res->charset(), ptr,end)))
+        ptr+= l;
+      else
+        ++ptr;
     }
     if (ptr + remove_length == end && !memcmp(ptr,r_ptr,remove_length))
     {
@@ -1775,6 +1817,8 @@ String *Item_func_trim::val_str(String *str)
   else
 #endif /* USE_MB */
   {
+    while (ptr+remove_length <= end && !memcmp(ptr,r_ptr,remove_length))
+      ptr+=remove_length;
     while (ptr + remove_length <= end &&
 	   !memcmp(end-remove_length,r_ptr,remove_length))
       end-=remove_length;
@@ -2770,6 +2814,16 @@ String *Item_func_rpad::val_str(String *str)
     rpad->set_charset(&my_charset_bin);
   }
 
+#ifdef USE_MB
+  if (use_mb(rpad->charset()))
+  {
+    // This will chop off any trailing illegal characters from rpad.
+    String *well_formed_pad= args[2]->check_well_formed_result(rpad, false);
+    if (!well_formed_pad)
+      goto err;
+  }
+#endif
+
   if (count <= (res_char_length= res->numchars()))
   {						// String to pad is big enough
     res->length(res->charpos((int) count));	// Shorten result if longer
@@ -2873,6 +2927,16 @@ String *Item_func_lpad::val_str(String *str)
     pad->set_charset(&my_charset_bin);
   }
 
+#ifdef USE_MB
+  if (use_mb(pad->charset()))
+  {
+    // This will chop off any trailing illegal characters from pad.
+    String *well_formed_pad= args[2]->check_well_formed_result(pad, false);
+    if (!well_formed_pad)
+      goto err;
+  }
+#endif
+
   res_char_length= res->numchars();
 
   if (count <= res_char_length)
@@ -2928,7 +2992,9 @@ String *Item_func_conv::val_str(String *str)
   int to_base= (int) args[2]->val_int();
   int err;
 
+  // Note that abs(INT_MIN) is undefined.
   if (args[0]->null_value || args[1]->null_value || args[2]->null_value ||
+      from_base == INT_MIN || to_base == INT_MIN ||
       abs(to_base) > 36 || abs(to_base) < 2 ||
       abs(from_base) > 36 || abs(from_base) < 2 || !(res->length()))
   {
@@ -3295,23 +3361,21 @@ err:
 String* Item_func_export_set::val_str(String* str)
 {
   DBUG_ASSERT(fixed == 1);
-  ulonglong the_set = (ulonglong) args[0]->val_int();
-  String yes_buf, *yes;
-  yes = args[1]->val_str(&yes_buf);
-  String no_buf, *no;
-  no = args[2]->val_str(&no_buf);
-  String *sep = NULL, sep_buf ;
+  String yes_buf, no_buf, sep_buf;
+  const ulonglong the_set = (ulonglong) args[0]->val_int();
+  const String *yes= args[1]->val_str(&yes_buf);
+  const String *no= args[2]->val_str(&no_buf);
+  const String *sep= NULL;
 
   uint num_set_values = 64;
-  ulonglong mask = 0x1;
   str->length(0);
   str->set_charset(collation.collation);
 
   /* Check if some argument is a NULL value */
   if (args[0]->null_value || args[1]->null_value || args[2]->null_value)
   {
-    null_value=1;
-    return 0;
+    null_value= true;
+    return NULL;
   }
   /*
     Arg count can only be 3, 4 or 5 here. This is guaranteed from the
@@ -3324,37 +3388,56 @@ String* Item_func_export_set::val_str(String* str)
       num_set_values=64;
     if (args[4]->null_value)
     {
-      null_value=1;
-      return 0;
+      null_value= true;
+      return NULL;
     }
     /* Fall through */
   case 4:
     if (!(sep = args[3]->val_str(&sep_buf)))	// Only true if NULL
     {
-      null_value=1;
-      return 0;
+      null_value= true;
+      return NULL;
     }
     break;
   case 3:
     {
       /* errors is not checked - assume "," can always be converted */
       uint errors;
-      sep_buf.copy(STRING_WITH_LEN(","), &my_charset_bin, collation.collation, &errors);
+      sep_buf.copy(STRING_WITH_LEN(","), &my_charset_bin,
+                   collation.collation, &errors);
       sep = &sep_buf;
     }
     break;
   default:
     DBUG_ASSERT(0); // cannot happen
   }
-  null_value=0;
+  null_value= false;
 
-  for (uint i = 0; i < num_set_values; i++, mask = (mask << 1))
+  const ulong max_allowed_packet= current_thd->variables.max_allowed_packet;
+  const uint num_separators= num_set_values > 0 ? num_set_values - 1 : 0;
+  const ulonglong max_total_length=
+    num_set_values * max(yes->length(), no->length()) +
+    num_separators * sep->length();
+
+  if (unlikely(max_total_length > max_allowed_packet))
+  {
+    push_warning_printf(current_thd, MYSQL_ERROR::WARN_LEVEL_WARN,
+                        ER_WARN_ALLOWED_PACKET_OVERFLOWED,
+                        ER(ER_WARN_ALLOWED_PACKET_OVERFLOWED),
+                        func_name(), max_allowed_packet);
+    null_value= true;
+    return NULL;
+  }
+
+  uint ix;
+  ulonglong mask;
+  for (ix= 0, mask=0x1; ix < num_set_values; ++ix, mask = (mask << 1))
   {
     if (the_set & mask)
       str->append(*yes);
     else
       str->append(*no);
-    if (i != num_set_values - 1)
+    if (ix != num_separators)
       str->append(*sep);
   }
   return str;

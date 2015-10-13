@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -39,6 +39,8 @@ typedef struct btr_cur_struct		btr_cur_t;
 /** B-tree search information for the adaptive hash index */
 typedef struct btr_search_struct	btr_search_t;
 
+#ifndef UNIV_HOTBACKUP
+
 /** @brief The latch protecting the adaptive search system
 
 This latch protects the
@@ -53,6 +55,8 @@ but does NOT protect:
 Bear in mind (3) and (4) when using the hash index.
 */
 extern rw_lock_t*	btr_search_latch_temp;
+
+#endif /* UNIV_HOTBACKUP */
 
 /** The latch protecting the adaptive search system */
 #define btr_search_latch	(*btr_search_latch_temp)

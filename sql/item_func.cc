@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2015, Oracle and/or its affiliates. All rights reserved.
    Copyright (c) 2012, Twitter, Inc.
 
    This program is free software; you can redistribute it and/or modify
@@ -222,7 +222,7 @@ Item_func::fix_fields(THD *thd, Item **ref)
       used_tables_cache|=     item->used_tables();
       not_null_tables_cache|= item->not_null_tables();
       const_item_cache&=      item->const_item();
-      with_subselect|=        item->with_subselect;
+      with_subselect|=        item->has_subquery();
     }
   }
   fix_length_and_dec();
@@ -1650,9 +1650,11 @@ void Item_func_int_div::fix_length_and_dec()
 {
   Item_result argtype= args[0]->result_type();
   /* use precision ony for the data type it is applicable for and valid */
-  max_length=args[0]->max_length -
-    (argtype == DECIMAL_RESULT || argtype == INT_RESULT ?
-     args[0]->decimals : 0);
+  uint32 char_length= args[0]->max_char_length() -
+                      (argtype == DECIMAL_RESULT || argtype == INT_RESULT ?
+                       args[0]->decimals : 0);
+  fix_char_length(char_length > MY_INT64_NUM_DECIMAL_DIGITS ?
+                  MY_INT64_NUM_DECIMAL_DIGITS : char_length);
   maybe_null=1;
   unsigned_flag=args[0]->unsigned_flag | args[1]->unsigned_flag;
 }
@@ -1759,7 +1761,13 @@ longlong Item_func_neg::int_op()
   if ((null_value= args[0]->null_value))
     return 0;
   if (args[0]->unsigned_flag &&
-      (ulonglong) value > (ulonglong) LONGLONG_MAX + 1)
+      (ulonglong) value > (ulonglong) LONGLONG_MAX + 1ULL)
+    return raise_integer_overflow();
+  // For some platforms we need special handling of LONGLONG_MIN to
+  // guarantee overflow.
+  if (value == LONGLONG_MIN &&
+      !args[0]->unsigned_flag &&
+      !unsigned_flag)
     return raise_integer_overflow();
   return check_integer_overflow(-value, !args[0]->unsigned_flag && value < 0);
 }
@@ -3344,8 +3352,12 @@ bool udf_handler::get_arguments()
 	{
 	  f_args.args[i]=    (char*) res->ptr();
 	  f_args.lengths[i]= res->length();
-	  break;
 	}
+	else
+	{
+	  f_args.lengths[i]= 0;
+	}
+	break;
       }
     case INT_RESULT:
       *((longlong*) to) = args[i]->val_int();
@@ -4024,7 +4036,8 @@ longlong Item_func_last_insert_id::val_int()
     thd->first_successful_insert_id_in_prev_stmt= value;
     return value;
   }
-  return thd->read_first_successful_insert_id_in_prev_stmt();
+  return
+    static_cast<longlong>(thd->read_first_successful_insert_id_in_prev_stmt());
 }
 
 
@@ -4222,13 +4235,18 @@ bool Item_func_set_user_var::set_entry(THD *thd, bool create_if_not_exists)
     return TRUE;
   }
   entry_thread_id= thd->thread_id;
-  /* 
-     Remember the last query which updated it, this way a query can later know
-     if this variable is a constant item in the query (it is if update_query_id
-     is different from query_id).
-  */
+
 end:
-  entry->update_query_id= thd->query_id;
+  /*
+    Remember the last query which updated it, this way a query can later know
+    if this variable is a constant item in the query (it is if update_query_id
+    is different from query_id).
+
+    If this object has delayed setting of non-constness, we delay this
+    until Item_func_set-user_var::save_item_result()
+  */
+  if (!delayed_non_constness)
+    entry->update_query_id= thd->query_id;
   return FALSE;
 }
 
@@ -4616,6 +4634,13 @@ void Item_func_set_user_var::save_item_result(Item *item)
     DBUG_ASSERT(0);
     break;
   }
+  /*
+    Set the ID of the query that last updated this variable. This is
+    usually set by Item_func_set_user_var::set_entry(), but if this
+    item has delayed setting of non-constness, we must do it now.
+   */
+  if (delayed_non_constness)
+    entry->update_query_id= current_thd->query_id;
   DBUG_VOID_RETURN;
 }
 
@@ -5022,7 +5047,8 @@ get_var_with_binlog(THD *thd, enum_sql_command sql_command,
     thd->lex= &lex_tmp;
     lex_start(thd);
     tmp_var_list.push_back(new set_var_user(new Item_func_set_user_var(name,
-                                                                       new Item_null())));
+                                                                       new Item_null(),
+                                                                       false)));
     /* Create the variable */
     if (sql_set_variables(thd, &tmp_var_list))
     {
@@ -5162,7 +5188,7 @@ enum Item_result Item_func_get_user_var::result_type() const
 void Item_func_get_user_var::print(String *str, enum_query_type query_type)
 {
   str->append(STRING_WITH_LEN("(@"));
-  str->append(name.str,name.length);
+  append_identifier(current_thd, str, name.str, name.length);
   str->append(')');
 }
 
@@ -5185,7 +5211,7 @@ bool Item_func_get_user_var::eq(const Item *item, bool binary_cmp) const
 bool Item_func_get_user_var::set_value(THD *thd,
                                        sp_rcontext * /*ctx*/, Item **it)
 {
-  Item_func_set_user_var *suv= new Item_func_set_user_var(get_name(), *it);
+  Item_func_set_user_var *suv= new Item_func_set_user_var(get_name(), *it, false);
   /*
     Item_func_set_user_var is not fixed after construction, call
     fix_fields().
@@ -5261,7 +5287,7 @@ my_decimal* Item_user_var_as_out_param::val_decimal(my_decimal *decimal_buffer)
 void Item_user_var_as_out_param::print(String *str, enum_query_type query_type)
 {
   str->append('@');
-  str->append(name.str,name.length);
+  append_identifier(current_thd, str, name.str, name.length);
 }
 
 
@@ -5777,6 +5803,13 @@ void Item_func_match::init_search(bool no_order)
 {
   DBUG_ENTER("Item_func_match::init_search");
 
+  /*
+    We will skip execution if the item is not fixed
+    with fix_field
+  */
+  if (!fixed)
+    DBUG_VOID_RETURN;
+
   /* Check if init_search() has been called before */
   if (ft_handler)
   {
@@ -5906,6 +5939,13 @@ bool Item_func_match::fix_index()
   Item_field *item;
   uint ft_to_key[MAX_KEY], ft_cnt[MAX_KEY], fts=0, keynr;
   uint max_cnt=0, mkeys=0, i;
+
+  /*
+    We will skip execution if the item is not fixed
+    with fix_field
+  */
+  if (!fixed)
+    return false;
 
   if (key == NO_SUCH_KEY)
     return 0;
@@ -6130,21 +6170,24 @@ longlong Item_func_is_free_lock::val_int()
   DBUG_ASSERT(fixed == 1);
   String *res=args[0]->val_str(&value);
   User_level_lock *ull;
+  longlong ret_val= 0LL;
 
   null_value=0;
   if (!res || !res->length())
   {
     null_value=1;
-    return 0;
+    return ret_val;
   }
   
   mysql_mutex_lock(&LOCK_user_locks);
   ull= (User_level_lock *) my_hash_search(&hash_user_locks, (uchar*) res->ptr(),
                                           (size_t) res->length());
-  mysql_mutex_unlock(&LOCK_user_locks);
   if (!ull || !ull->locked)
-    return 1;
-  return 0;
+    ret_val= 1;
+  mysql_mutex_unlock(&LOCK_user_locks);
+  DEBUG_SYNC(current_thd, "after_getting_user_level_lock_info");
+
+  return ret_val;
 }
 
 longlong Item_func_is_used_lock::val_int()
@@ -6152,6 +6195,7 @@ longlong Item_func_is_used_lock::val_int()
   DBUG_ASSERT(fixed == 1);
   String *res=args[0]->val_str(&value);
   User_level_lock *ull;
+  my_thread_id thread_id= 0UL;
 
   null_value=1;
   if (!res || !res->length())
@@ -6160,12 +6204,15 @@ longlong Item_func_is_used_lock::val_int()
   mysql_mutex_lock(&LOCK_user_locks);
   ull= (User_level_lock *) my_hash_search(&hash_user_locks, (uchar*) res->ptr(),
                                           (size_t) res->length());
+  if ((ull != NULL) && ull->locked)
+  {
+    null_value= 0;
+    thread_id= ull->thread_id;
+  }
   mysql_mutex_unlock(&LOCK_user_locks);
-  if (!ull || !ull->locked)
-    return 0;
+  DEBUG_SYNC(current_thd, "after_getting_user_level_lock_info");
 
-  null_value=0;
-  return ull->thread_id;
+  return thread_id;
 }
 
 

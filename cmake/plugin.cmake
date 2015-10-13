@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2012, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -39,6 +39,7 @@ MACRO(PLUGIN_APPEND_COLLECTIONS plugin)
       GET_FILENAME_COMPONENT(fname ${cfile} NAME)
       FILE(APPEND ${CMAKE_SOURCE_DIR}/mysql-test/collections/${fname} "${contents}")
       FILE(APPEND ${fcopied} "${fname}\n")
+      MESSAGE(STATUS "Appended ${cfile}")
     ENDFOREACH()
   ENDIF()
 ENDMACRO()
@@ -231,11 +232,4 @@ MACRO(CONFIGURE_PLUGINS)
       ADD_SUBDIRECTORY(${dir})
     ENDIF()
   ENDFOREACH()
-  FOREACH(dir ${dirs_plugin})
-    IF (EXISTS ${dir}/.bzr)
-      MESSAGE(STATUS "Found repo ${dir}/.bzr")
-      LIST(APPEND PLUGIN_BZR_REPOS "${dir}")
-    ENDIF()
-  ENDFOREACH()
-  SET(PLUGIN_REPOS "${PLUGIN_BZR_REPOS}" CACHE INTERNAL "")
 ENDMACRO()

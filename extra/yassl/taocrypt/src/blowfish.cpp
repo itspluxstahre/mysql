@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -54,7 +54,7 @@ void Blowfish::Process(byte* out, const byte* in, word32 sz)
             in  += BLOCK_SIZE;
         }
     else if (mode_ == CBC) {
-        if (dir_ == ENCRYPTION)
+        if (dir_ == ENCRYPTION) {
             while (blocks--) {
                 r_[0] ^= *(word32*)in;
                 r_[1] ^= *(word32*)(in + 4);
@@ -66,7 +66,8 @@ void Blowfish::Process(byte* out, const byte* in, word32 sz)
                 out += BLOCK_SIZE;
                 in  += BLOCK_SIZE;
             }
-        else
+        }
+        else {
             while (blocks--) {
                 AsmProcess(in, out);
                 
@@ -78,6 +79,7 @@ void Blowfish::Process(byte* out, const byte* in, word32 sz)
                 out += BLOCK_SIZE;
                 in  += BLOCK_SIZE;
             }
+        }
     }
 }
 
@@ -86,7 +88,10 @@ void Blowfish::Process(byte* out, const byte* in, word32 sz)
 
 void Blowfish::SetKey(const byte* key_string, word32 keylength, CipherDir dir)
 {
-	assert(keylength >= 4 && keylength <= 56);
+    if (keylength < 4)
+        keylength = 4;
+    else if (keylength > 56)
+        keylength = 56;
 
 	unsigned i, j=0, k;
 	word32 data, dspace[2] = {0, 0};
@@ -165,16 +170,21 @@ void Blowfish::crypt_block(const word32 in[2], word32 out[2]) const
 	word32 left  = in[0];
 	word32 right = in[1];
 
+	const word32  *const s = sbox_;
 	const word32* p = pbox_;
-    word32 tmp;
 
 	left ^= p[0];
 
-    BF_ROUNDS
+    // roll back up and use s and p index instead of just p
+    for (unsigned i = 0; i < ROUNDS / 2; i++) {
+        right ^= (((s[GETBYTE(left,3)] + s[256+GETBYTE(left,2)])
+            ^ s[2*256+GETBYTE(left,1)]) + s[3*256+GETBYTE(left,0)])
+            ^ p[2*i+1];
 
-#if ROUNDS == 20
-    BF_EXTRA_ROUNDS
-#endif
+        left ^= (((s[GETBYTE(right,3)] + s[256+GETBYTE(right,2)])
+            ^ s[2*256+GETBYTE(right,1)]) + s[3*256+GETBYTE(right,0)])
+            ^ p[2*i+2];
+    }
 
 	right ^= p[ROUNDS + 1];
 
@@ -188,17 +198,23 @@ typedef BlockGetAndPut<word32, BigEndian> gpBlock;
 void Blowfish::ProcessAndXorBlock(const byte* in, const byte* xOr, byte* out)
     const
 {
-    word32 tmp, left, right;
+    word32 left, right;
+	const word32  *const s = sbox_;
     const word32* p = pbox_;
     
     gpBlock::Get(in)(left)(right);
 	left ^= p[0];
 
-    BF_ROUNDS
+    // roll back up and use s and p index instead of just p
+    for (unsigned i = 0; i < ROUNDS / 2; i++) {
+        right ^= (((s[GETBYTE(left,3)] + s[256+GETBYTE(left,2)])
+            ^ s[2*256+GETBYTE(left,1)]) + s[3*256+GETBYTE(left,0)])
+            ^ p[2*i+1];
 
-#if ROUNDS == 20
-    BF_EXTRA_ROUNDS
-#endif
+        left ^= (((s[GETBYTE(right,3)] + s[256+GETBYTE(right,2)])
+            ^ s[2*256+GETBYTE(right,1)]) + s[3*256+GETBYTE(right,0)])
+            ^ p[2*i+2];
+    }
 
 	right ^= p[ROUNDS + 1];
 
@@ -208,23 +224,26 @@ void Blowfish::ProcessAndXorBlock(const byte* in, const byte* xOr, byte* out)
 
 #if defined(DO_BLOWFISH_ASM)
     #ifdef __GNUC__
-        #define AS1(x)    asm(#x);
-        #define AS2(x, y) asm(#x ", " #y);
+        #define AS1(x)    #x ";"
+        #define AS2(x, y) #x ", " #y ";"
 
         #define PROLOG()  \
-            asm(".intel_syntax noprefix"); \
-            AS2(    movd  mm3, edi                      )   \
-            AS2(    movd  mm4, ebx                      )   \
-            AS2(    movd  mm5, esi                      )   \
-            AS2(    mov   ecx, DWORD PTR [ebp +  8]     )   \
-            AS2(    mov   esi, DWORD PTR [ebp + 12]     )
-
+        __asm__ __volatile__ \
+        ( \
+            ".intel_syntax noprefix;" \
+            "push ebx;" \
+            "push ebp;" \
+            "movd mm3, eax;"
         #define EPILOG()  \
-            AS2(    movd esi, mm5                  )   \
-            AS2(    movd ebx, mm4                  )   \
-            AS2(    movd edi, mm3                  )   \
-            AS1(    emms                           )   \
-            asm(".att_syntax");
+            "pop ebp;" \
+            "pop ebx;" \
+       	    "emms;" \
+       	    ".att_syntax;" \
+                : \
+                : "c" (this), "S" (inBlock), "a" (outBlock) \
+                : "%edi", "%edx", "memory", "cc" \
+        );
+
     #else
         #define AS1(x)    __asm x
         #define AS2(x, y) __asm x, y
@@ -273,6 +292,8 @@ void Blowfish::ProcessAndXorBlock(const byte* in, const byte* xOr, byte* out)
 
 #ifdef _MSC_VER
     __declspec(naked) 
+#else
+    __attribute__ ((noinline))
 #endif
 void Blowfish::AsmProcess(const byte* inBlock, byte* outBlock) const
 {
@@ -321,7 +342,7 @@ void Blowfish::AsmProcess(const byte* inBlock, byte* outBlock) const
     #endif
 
     #ifdef __GNUC__
-        AS2(    mov   edi, [ebp + 16]           ) // outBlock
+        AS2(    movd  edi, mm3                  ) // outBlock
     #else
         AS2(    mov   edi, [ebp + 12]           ) // outBlock
     #endif

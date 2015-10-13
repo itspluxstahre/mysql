@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -92,6 +92,21 @@ insert/delete buffer when the record is not in the buffer pool. */
 buffer when the record is not in the buffer pool. */
 #define BTR_DELETE		8192
 
+/* Flags for page split operations. */
+
+/** When splitting a page, split the data in half (at the middle record). */
+#define BTR_PAGE_SPLIT_SYMMETRIC_FLAG	1
+
+/** When splitting the right-most page on its level, split at the insertion
+point if it's above the largest value in the page. */
+#define BTR_PAGE_SPLIT_UPPER_FLAG	2
+
+/** When splitting the left-most page on its level, split at the insertion
+point if it's below the smallest value in the page. */
+#define BTR_PAGE_SPLIT_LOWER_FLAG	4
+
+#endif /* UNIV_HOTBACKUP */
+
 /**************************************************************//**
 Report that an index page is corrupted. */
 UNIV_INTERN
@@ -112,6 +127,7 @@ btr_corruption_report(
 		ut_error;					\
 	}
 
+#ifndef UNIV_HOTBACKUP
 #ifdef UNIV_BLOB_DEBUG
 # include "ut0rbt.h"
 /** An index->blobs entry for keeping track of off-page column references */
@@ -401,6 +417,7 @@ btr_root_raise_and_insert(
 				of the inserted record */
 	const dtuple_t*	tuple,	/*!< in: tuple to insert */
 	ulint		n_ext,	/*!< in: number of externally stored columns */
+	ulint		flags,	/*!< in: page split flags */
 	mtr_t*		mtr);	/*!< in: mtr */
 /*************************************************************//**
 Reorganizes an index page.
@@ -425,6 +442,8 @@ ibool
 btr_page_get_split_rec_to_left(
 /*===========================*/
 	btr_cur_t*	cursor,	/*!< in: cursor at which to insert */
+	mtr_t*		mtr,	/*!< in: mtr */
+	ulint		flags,	/*!< in: page split flags */
 	rec_t**		split_rec);/*!< out: if split recommended,
 				the first record on upper half page,
 				or NULL if tuple should be first */
@@ -437,6 +456,8 @@ ibool
 btr_page_get_split_rec_to_right(
 /*============================*/
 	btr_cur_t*	cursor,	/*!< in: cursor at which to insert */
+	mtr_t*		mtr,	/*!< in: mtr */
+	ulint		flags,	/*!< in: page split flags */
 	rec_t**		split_rec);/*!< out: if split recommended,
 				the first record on upper half page,
 				or NULL if tuple should be first */
@@ -458,6 +479,7 @@ btr_page_split_and_insert(
 				on the predecessor of the inserted record */
 	const dtuple_t*	tuple,	/*!< in: tuple to insert */
 	ulint		n_ext,	/*!< in: number of externally stored columns */
+	ulint		flags,	/*!< in: page split flags */
 	mtr_t*		mtr);	/*!< in: mtr */
 /*******************************************************//**
 Inserts a data tuple to a tree on a non-leaf level. It is assumed
@@ -519,11 +541,14 @@ UNIV_INTERN
 ibool
 btr_compress(
 /*=========*/
-	btr_cur_t*	cursor,	/*!< in: cursor on the page to merge or lift;
-				the page must not be empty: in record delete
-				use btr_discard_page if the page would become
-				empty */
-	mtr_t*		mtr);	/*!< in: mtr */
+	btr_cur_t*	cursor,	/*!< in/out: cursor on the page to merge
+				or lift; the page must not be empty:
+				when deleting records, use btr_discard_page()
+				if the page would become empty */
+	ibool		adjust,	/*!< in: TRUE if should adjust the
+				cursor position even if compression occurs */
+	mtr_t*		mtr)	/*!< in/out: mini-transaction */
+	__attribute__((nonnull));
 /*************************************************************//**
 Discards a page from a B-tree. This is used to remove the last record from
 a B-tree page: the whole page must be removed at the same time. This cannot
@@ -564,17 +589,23 @@ btr_parse_page_reorganize(
 #ifndef UNIV_HOTBACKUP
 /**************************************************************//**
 Gets the number of pages in a B-tree.
-@return	number of pages */
+@return	number of pages, or ULINT_UNDEFINED if the index is unavailable */
 UNIV_INTERN
 ulint
 btr_get_size(
 /*=========*/
 	dict_index_t*	index,	/*!< in: index */
-	ulint		flag);	/*!< in: BTR_N_LEAF_PAGES or BTR_TOTAL_SIZE */
+	ulint		flag,	/*!< in: BTR_N_LEAF_PAGES or BTR_TOTAL_SIZE */
+	mtr_t*		mtr)	/*!< in/out: mini-transaction where index
+				is s-latched */
+	__attribute__((nonnull, warn_unused_result));
 /**************************************************************//**
 Allocates a new file page to be used in an index tree. NOTE: we assume
 that the caller has made the reservation for free extents!
-@return	new allocated block, x-latched; NULL if out of space */
+@retval NULL if no page could be allocated
+@retval block, rw_lock_x_lock_count(&block->lock) == 1 if allocation succeeded
+(init_mtr == mtr, or the page was not previously freed in mtr)
+@retval block (not allocated or initialized) otherwise */
 UNIV_INTERN
 buf_block_t*
 btr_page_alloc(
@@ -585,7 +616,12 @@ btr_page_alloc(
 					page split is made */
 	ulint		level,		/*!< in: level where the page is placed
 					in the tree */
-	mtr_t*		mtr);		/*!< in: mtr */
+	mtr_t*		mtr,		/*!< in/out: mini-transaction
+					for the allocation */
+	mtr_t*		init_mtr)	/*!< in/out: mini-transaction
+					for x-latching and initializing
+					the page */
+	__attribute__((nonnull, warn_unused_result));
 /**************************************************************//**
 Frees a file page used in an index tree. NOTE: cannot free field external
 storage pages because the page must contain info on its level. */
@@ -651,6 +687,18 @@ btr_validate_index(
 
 #define BTR_N_LEAF_PAGES	1
 #define BTR_TOTAL_SIZE		2
+
+/** Number of page reorganize operations. */
+extern ulint	btr_n_page_reorganize;
+/** Number of page split operations. */
+extern ulint	btr_n_page_split;
+/** Number of page merge operations. */
+extern ulint	btr_n_page_merge;
+/** Number of successful page merge operations. */
+extern ulint	btr_n_page_merge_succ;
+/** Number of page discard operations. */
+extern ulint	btr_n_page_discard;
+
 #endif /* !UNIV_HOTBACKUP */
 
 #ifndef UNIV_NONINL

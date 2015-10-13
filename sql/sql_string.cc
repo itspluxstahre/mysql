@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -220,6 +220,42 @@ bool String::needs_conversion(uint32 arg_length,
        (!(*offset=(arg_length % to_cs->mbminlen)))))
     return FALSE;
   return TRUE;
+}
+
+
+/*
+  Checks that the source string can just be copied to the destination string
+  without conversion.
+  Unlike needs_conversion it will require conversion on incoming binary data
+  to ensure the data are verified for vailidity first.
+
+  @param arg_length   Length of string to copy.
+  @param from_cs      Character set to copy from
+  @param to_cs        Character set to copy to
+
+  @return conversion needed
+*/
+bool String::needs_conversion_on_storage(uint32 arg_length,
+                                         CHARSET_INFO *cs_from,
+                                         CHARSET_INFO *cs_to)
+{
+  uint32 offset;
+  return (needs_conversion(arg_length, cs_from, cs_to, &offset) ||
+          /* force conversion when storing a binary string */
+          (cs_from == &my_charset_bin &&
+          /* into a non-binary destination */
+           cs_to != &my_charset_bin &&
+           /* and any of the following is true :*/
+           (
+            /* it's a variable length encoding */
+            cs_to->mbminlen != cs_to->mbmaxlen ||
+            /* longer than 2 bytes : neither 1 byte nor ucs2 */
+            cs_to->mbminlen > 2 ||
+            /* and is not a multiple of the char byte size */
+            0 != (arg_length % cs_to->mbmaxlen)
+           )
+          )
+         );
 }
 
 
@@ -732,7 +768,7 @@ String *copy_if_not_alloced(String *to,String *from,uint32 from_length)
 {
   if (from->Alloced_length >= from_length)
     return from;
-  if (from->alloced || !to || from == to)
+  if ((from->alloced && (from->Alloced_length != 0)) || !to || from == to)
   {
     (void) from->realloc(from_length);
     return from;

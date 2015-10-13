@@ -1,0 +1,2 @@
+--secure-file-priv=/tmp
+--testcase-timeout=15

@@ -88,6 +88,9 @@ const char *MDL_key::m_namespace_to_wait_state_name[NAMESPACE_END]=
   "Waiting for commit lock"
 };
 
+#define ER_LOCK_ABORTED_MSG \
+  "Wait on a lock was aborted due to a conflicting lock"
+
 static bool mdl_initialized= 0;
 
 
@@ -378,7 +381,12 @@ public:
 
   bool has_pending_conflicting_lock(enum_mdl_type type);
 
-  bool can_grant_lock(enum_mdl_type type, MDL_context *requstor_ctx) const;
+  bool has_no_wait_context(const MDL_context *ctx) const;
+
+  void abort_conflicting_lock_requests(void);
+
+  bool can_grant_lock(enum_mdl_type type, MDL_context *requstor_ctx,
+                      bool ignore_lock_priority) const;
 
   inline static MDL_lock *create(const MDL_key *key);
 
@@ -392,14 +400,24 @@ public:
   virtual bool needs_notification(const MDL_ticket *ticket) const = 0;
   virtual void notify_conflicting_locks(MDL_context *ctx) = 0;
 
+  virtual bitmap_t hog_lock_types_bitmap() const = 0;
+
   /** List of granted tickets for this lock. */
   Ticket_list m_granted;
   /** Tickets for contexts waiting to acquire a lock. */
   Ticket_list m_waiting;
+
+  /**
+    Number of times high priority lock requests have been granted while
+    low priority lock requests were waiting.
+  */
+  ulong m_hog_lock_count;
+
 public:
 
   MDL_lock(const MDL_key *key_arg)
   : key(key_arg),
+    m_hog_lock_count(0),
     m_ref_usage(0),
     m_ref_release(0),
     m_is_destroyed(FALSE),
@@ -484,6 +502,15 @@ public:
   }
   virtual void notify_conflicting_locks(MDL_context *ctx);
 
+  /*
+    In scoped locks, only IX lock request would starve because of X/S. But that
+    is practically very rare case. So just return 0 from this function.
+  */
+  virtual bitmap_t hog_lock_types_bitmap() const
+  {
+    return 0;
+  }
+
 private:
   static const bitmap_t m_granted_incompatible[MDL_TYPE_END];
   static const bitmap_t m_waiting_incompatible[MDL_TYPE_END];
@@ -535,6 +562,18 @@ public:
     return ticket->is_upgradable_or_exclusive();
   }
   virtual void notify_conflicting_locks(MDL_context *ctx);
+
+  /*
+    To prevent starvation, these lock types that are only granted
+    max_write_lock_count times in a row while other lock types are
+    waiting.
+  */
+  virtual bitmap_t hog_lock_types_bitmap() const
+  {
+    return (MDL_BIT(MDL_SHARED_NO_WRITE) |
+            MDL_BIT(MDL_SHARED_NO_READ_WRITE) |
+            MDL_BIT(MDL_EXCLUSIVE));
+  }
 
 private:
   static const bitmap_t m_granted_incompatible[MDL_TYPE_END];
@@ -972,6 +1011,7 @@ void MDL_request::init(MDL_key::enum_mdl_namespace mdl_namespace,
   type= mdl_type_arg;
   duration= mdl_duration_arg;
   ticket= NULL;
+  lock_no_wait= FALSE;
 }
 
 
@@ -992,6 +1032,7 @@ void MDL_request::init(const MDL_key *key_arg,
   type= mdl_type_arg;
   duration= mdl_duration_arg;
   ticket= NULL;
+  lock_no_wait= FALSE;
 }
 
 
@@ -1267,6 +1308,41 @@ void MDL_lock::reschedule_waiters()
 {
   MDL_lock::Ticket_iterator it(m_waiting);
   MDL_ticket *ticket;
+  bool skip_high_priority= false;
+  bitmap_t hog_lock_types= hog_lock_types_bitmap();
+
+  if (m_hog_lock_count >= max_write_lock_count)
+  {
+    /*
+      If number of successively granted high-prio, strong locks has exceeded
+      max_write_lock_count give a way to low-prio, weak locks to avoid their
+      starvation.
+    */
+
+    if ((m_waiting.bitmap() & ~hog_lock_types) != 0)
+    {
+      /*
+        Even though normally when m_hog_lock_count is non-0 there is
+        some pending low-prio lock, we still can encounter situation
+        when m_hog_lock_count is non-0 and there are no pending low-prio
+        locks. This, for example, can happen when a ticket for pending
+        low-prio lock was removed from waiters list due to timeout,
+        and reschedule_waiters() is called after that to update the
+        waiters queue. m_hog_lock_count will be reset to 0 at the
+        end of this call in such case.
+
+        Note that it is not an issue if we fail to wake up any pending
+        waiters for weak locks in the loop below. This would mean that
+        all of them are either killed, timed out or chosen as a victim
+        by deadlock resolver, but have not managed to remove ticket
+        from the waiters list yet. After tickets will be removed from
+        the waiters queue there will be another call to
+        reschedule_waiters() with pending bitmap updated to reflect new
+        state of waiters queue.
+      */
+      skip_high_priority= true;
+    }
+  }
 
   /*
     Find the first (and hence the oldest) waiting request which
@@ -1288,7 +1364,16 @@ void MDL_lock::reschedule_waiters()
   */
   while ((ticket= it++))
   {
-    if (can_grant_lock(ticket->get_type(), ticket->get_ctx()))
+    /*
+      Skip high-prio, strong locks if earlier we have decided to give way to
+      low-prio, weaker locks.
+    */
+    if (skip_high_priority &&
+        ((MDL_BIT(ticket->get_type()) & hog_lock_types) != 0))
+      continue;
+
+    if (can_grant_lock(ticket->get_type(), ticket->get_ctx(),
+                       skip_high_priority))
     {
       if (! ticket->get_ctx()->m_wait.set_status(MDL_wait::GRANTED))
       {
@@ -1302,6 +1387,13 @@ void MDL_lock::reschedule_waiters()
         */
         m_waiting.remove_ticket(ticket);
         m_granted.add_ticket(ticket);
+
+        /*
+          Increase counter of successively granted high-priority strong locks,
+          if we have granted one.
+        */
+        if ((MDL_BIT(ticket->get_type()) & hog_lock_types) != 0)
+          m_hog_lock_count++;
       }
       /*
         If we could not update the wait slot of the waiter,
@@ -1312,6 +1404,24 @@ void MDL_lock::reschedule_waiters()
         queue and look for another request to reschedule.
       */
     }
+  }
+
+  if ((m_waiting.bitmap() & ~hog_lock_types) == 0)
+  {
+    /*
+      Reset number of successively granted high-prio, strong locks
+      if there are no pending low-prio, weak locks.
+      This ensures:
+      - That m_hog_lock_count is correctly reset after strong lock
+      is released and weak locks are granted (or there are no
+      other lock requests).
+      - That situation when SNW lock is granted along with some SR
+      locks, but SW locks are still blocked are handled correctly.
+      - That m_hog_lock_count is zero in most cases when there are no pending
+      weak locks (see comment at the start of this method for example of
+      exception). This allows to save on checks at the start of this method.
+    */
+    m_hog_lock_count= 0;
   }
 }
 
@@ -1467,8 +1577,9 @@ MDL_object_lock::m_waiting_incompatible[MDL_TYPE_END] =
   Check if request for the metadata lock can be satisfied given its
   current state.
 
-  @param  type_arg       The requested lock type.
-  @param  requestor_ctx  The MDL context of the requestor.
+  @param  type_arg             The requested lock type.
+  @param  requestor_ctx        The MDL context of the requestor.
+  @param  ignore_lock_priority Ignore lock priority.
 
   @retval TRUE   Lock request can be satisfied
   @retval FALSE  There is some conflicting lock.
@@ -1480,19 +1591,21 @@ MDL_object_lock::m_waiting_incompatible[MDL_TYPE_END] =
 
 bool
 MDL_lock::can_grant_lock(enum_mdl_type type_arg,
-                         MDL_context *requestor_ctx) const
+                         MDL_context *requestor_ctx,
+                         bool ignore_lock_priority) const
 {
   bool can_grant= FALSE;
   bitmap_t waiting_incompat_map= incompatible_waiting_types_bitmap()[type_arg];
   bitmap_t granted_incompat_map= incompatible_granted_types_bitmap()[type_arg];
+
   /*
     New lock request can be satisfied iff:
     - There are no incompatible types of satisfied requests
     in other contexts
     - There are no waiting requests which have higher priority
-    than this request.
+    than this request when priority was not ignored.
   */
-  if (! (m_waiting.bitmap() & waiting_incompat_map))
+  if (ignore_lock_priority || !(m_waiting.bitmap() & waiting_incompat_map))
   {
     if (! (m_granted.bitmap() & granted_incompat_map))
       can_grant= TRUE;
@@ -1565,6 +1678,57 @@ bool MDL_lock::has_pending_conflicting_lock(enum_mdl_type type)
   result= (m_waiting.bitmap() & incompatible_granted_types_bitmap()[type]);
   mysql_prlock_unlock(&m_rwlock);
   return result;
+}
+
+
+/**
+  Check if the context of a granted ticket sets a no-wait policy.
+
+  @param ctx  MDL_context for current lock request.
+
+  @return TRUE if there is such a context, FALSE otherwise.
+*/
+
+bool MDL_lock::has_no_wait_context(const MDL_context *ctx) const
+{
+  MDL_ticket *ticket;
+  Ticket_iterator it(m_granted);
+
+  while ((ticket= it++))
+  {
+    MDL_context *octx= ticket->get_ctx();
+    if (ctx != octx && ticket->get_abort_conflicting_lock_requests())
+      break;
+  }
+
+  return ticket;
+}
+
+
+/**
+  Abort any pending lock requests.
+*/
+
+void MDL_lock::abort_conflicting_lock_requests(void)
+{
+  MDL_ticket *ticket;
+  MDL_lock::Ticket_iterator it;
+
+  mysql_prlock_wrlock(&m_rwlock);
+
+  it.init(m_granted);
+  while ((ticket= it++))
+    if (ticket->get_abort_conflicting_lock_requests())
+      break;
+
+  if (ticket)
+  {
+    it.init(m_waiting);
+    while ((ticket= it++))
+      ticket->get_ctx()->m_wait.set_status(MDL_wait::ABORTED);
+  }
+
+  mysql_prlock_unlock(&m_rwlock);
 }
 
 
@@ -1788,7 +1952,7 @@ MDL_context::try_acquire_lock_impl(MDL_request *mdl_request,
 
   ticket->m_lock= lock;
 
-  if (lock->can_grant_lock(mdl_request->type, this))
+  if (lock->can_grant_lock(mdl_request->type, this, false))
   {
     lock->m_granted.add_ticket(ticket);
 
@@ -1800,6 +1964,10 @@ MDL_context::try_acquire_lock_impl(MDL_request *mdl_request,
   }
   else
     *out_ticket= ticket;
+
+  /* Mark NO_WAIT non-blocking mode in the lock ticket. */
+  if (mdl_request->lock_no_wait)
+    ticket->set_abort_conflicting_lock_requests(TRUE);
 
   return FALSE;
 }
@@ -1840,6 +2008,8 @@ MDL_context::clone_ticket(MDL_request *mdl_request)
   DBUG_ASSERT(mdl_request->ticket->has_stronger_or_equal_type(ticket->m_type));
 
   ticket->m_lock= mdl_request->ticket->m_lock;
+  if (mdl_request->ticket->get_abort_conflicting_lock_requests())
+    ticket->set_abort_conflicting_lock_requests(TRUE);
   mdl_request->ticket= ticket;
 
   mysql_prlock_wrlock(&ticket->m_lock->m_rwlock);
@@ -1961,6 +2131,15 @@ MDL_context::acquire_lock(MDL_request *mdl_request, ulong lock_wait_timeout)
   */
   lock= ticket->m_lock;
 
+  /* Is a conflicting lock request allowed to wait? */
+  if (lock->has_no_wait_context(this))
+  {
+    mysql_prlock_unlock(&lock->m_rwlock);
+    MDL_ticket::destroy(ticket);
+    my_message(ER_LOCK_ABORTED, ER_LOCK_ABORTED_MSG, MYF(0));
+    return TRUE;
+  }
+
   lock->m_waiting.add_ticket(ticket);
 
   /*
@@ -2027,12 +2206,18 @@ MDL_context::acquire_lock(MDL_request *mdl_request, ulong lock_wait_timeout)
       break;
     case MDL_wait::KILLED:
       break;
+    case MDL_wait::ABORTED:
+      my_message(ER_LOCK_ABORTED, ER_LOCK_ABORTED_MSG, MYF(0));
+      break;
     default:
       DBUG_ASSERT(0);
       break;
     }
     return TRUE;
   }
+
+  /* If this is a NO WAIT context, abort conflicting lock requests. */
+  lock->abort_conflicting_lock_requests();
 
   /*
     We have been granted our request.

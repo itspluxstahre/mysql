@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -255,6 +255,77 @@ void States::SetError(YasslError ye)
 }
 
 
+// mark message recvd, check for duplicates, return 0 on success
+int States::SetMessageRecvd(HandShakeType hst)
+{
+    switch (hst) {
+        case hello_request:
+            break;  // could send more than one
+
+        case client_hello:
+            if (recvdMessages_.gotClientHello_)
+                return -1;
+            recvdMessages_.gotClientHello_ = 1;
+            break;
+
+        case server_hello:
+            if (recvdMessages_.gotServerHello_)
+                return -1;
+            recvdMessages_.gotServerHello_ = 1;
+            break;
+
+        case certificate:
+            if (recvdMessages_.gotCert_)
+                return -1;
+            recvdMessages_.gotCert_ = 1;
+            break;
+
+        case server_key_exchange:
+            if (recvdMessages_.gotServerKeyExchange_)
+                return -1;
+            recvdMessages_.gotServerKeyExchange_ = 1;
+            break;
+
+        case certificate_request:
+            if (recvdMessages_.gotCertRequest_)
+                return -1;
+            recvdMessages_.gotCertRequest_ = 1;
+            break;
+
+        case server_hello_done:
+            if (recvdMessages_.gotServerHelloDone_)
+                return -1;
+            recvdMessages_.gotServerHelloDone_ = 1;
+            break;
+
+        case certificate_verify:
+            if (recvdMessages_.gotCertVerify_)
+                return -1;
+            recvdMessages_.gotCertVerify_ = 1;
+            break;
+
+        case client_key_exchange:
+            if (recvdMessages_.gotClientKeyExchange_)
+                return -1;
+            recvdMessages_.gotClientKeyExchange_ = 1;
+            break;
+
+        case finished:
+            if (recvdMessages_.gotFinished_)
+                return -1;
+            recvdMessages_.gotFinished_ = 1;
+            break;
+
+
+        default:
+            return -1;
+
+    }
+
+    return 0;
+}
+
+
 sslFactory::sslFactory() :           
         messageFactory_(InitMessageFactory),
         handShakeFactory_(InitHandShakeFactory),
@@ -308,8 +379,9 @@ SSL::SSL(SSL_CTX* ctx)
             SetError(YasslError(err));
             return;
         }
-        else if (serverSide && !(ctx->GetCiphers().setSuites_)) {
+        else if (serverSide && ctx->GetCiphers().setSuites_ == 0) {
             // remove RSA or DSA suites depending on cert key type
+            // but don't override user sets
             ProtocolVersion pv = secure_.get_connection().version_;
             
             bool removeDH  = secure_.use_parms().removeDH_;
@@ -1128,8 +1200,28 @@ void SSL::flushBuffer()
 
 void SSL::Send(const byte* buffer, uint sz)
 {
-    if (socket_.send(buffer, sz) != sz)
-        SetError(send_error);
+    unsigned int sent = 0;
+
+    if (socket_.send(buffer, sz, sent) != sz) {
+        if (socket_.WouldBlock()) {
+            buffers_.SetOutput(NEW_YS output_buffer(sz - sent, buffer + sent,
+                                                    sz - sent));
+            SetError(YasslError(SSL_ERROR_WANT_WRITE));
+        }
+        else
+            SetError(send_error);
+    }
+}
+
+
+void SSL::SendWriteBuffered()
+{
+    output_buffer* out = buffers_.TakeOutput();
+
+    if (out) {
+        mySTL::auto_ptr<output_buffer> tmp(out);
+        Send(out->get_buffer(), out->get_size());
+    }
 }
 
 
@@ -1175,6 +1267,11 @@ void SSL::verifyState(const HandShakeHeader& hsHeader)
 
     if (states_.getHandShake() == handShakeNotReady) {
         SetError(handshake_layer);
+        return;
+    }
+
+    if (states_.SetMessageRecvd(hsHeader.get_handshakeType()) != 0) {
+        order_error();
         return;
     }
 
@@ -1291,7 +1388,6 @@ void SSL::matchSuite(const opaque* peer, uint length)
             if (secure_.use_parms().suites_[i] == peer[j]) {
                 secure_.use_parms().suite_[0] = 0x00;
                 secure_.use_parms().suite_[1] = peer[j];
-
                 return;
             }
 
@@ -1435,7 +1531,6 @@ void SSL::addBuffer(output_buffer* b)
 
 void SSL_SESSION::CopyX509(X509* x)
 {
-    assert(peerX509_ == 0);
     if (x == 0) return;
 
     X509_NAME* issuer   = x->GetIssuer();
@@ -1833,7 +1928,7 @@ SSL_CTX::GetCA_List() const
 }
 
 
-VerifyCallback SSL_CTX::getVerifyCallback() const
+const VerifyCallback SSL_CTX::getVerifyCallback() const
 {
     return verifyCallback_;
 }
@@ -2232,7 +2327,7 @@ Hashes& sslHashes::use_certVerify()
 }
 
 
-Buffers::Buffers() : rawInput_(0)
+Buffers::Buffers() : prevSent(0), plainSz(0), rawInput_(0), output_(0)
 {}
 
 
@@ -2243,12 +2338,18 @@ Buffers::~Buffers()
     STL::for_each(dataList_.begin(), dataList_.end(),
                   del_ptr_zero()) ;
     ysDelete(rawInput_);
+    ysDelete(output_);
+}
+
+
+void Buffers::SetOutput(output_buffer* ob)
+{
+    output_ = ob;
 }
 
 
 void Buffers::SetRawInput(input_buffer* ib)
 {
-    assert(rawInput_ == 0);
     rawInput_ = ib;
 }
 
@@ -2257,6 +2358,15 @@ input_buffer* Buffers::TakeRawInput()
 {
     input_buffer* ret = rawInput_;
     rawInput_ = 0;
+
+    return ret;
+}
+
+
+output_buffer* Buffers::TakeOutput()
+{
+    output_buffer* ret = output_;
+    output_ = 0;
 
     return ret;
 }
@@ -2500,8 +2610,9 @@ ASN1_STRING* StringHolder::GetString()
     int DeCompress(input_buffer& in, int sz, input_buffer& out)
     {
         byte tmp[LENGTH_SZ];
-    
-        in.read(tmp, sizeof(tmp));
+   
+        tmp[0] = in[AUTO]; 
+        tmp[1] = in[AUTO]; 
 
         uint16 len;
         ato16(tmp, len);
@@ -2536,14 +2647,12 @@ ASN1_STRING* StringHolder::GetString()
     // these versions should never get called
     int Compress(const byte* in, int sz, input_buffer& buffer)
     {
-        assert(0);  
         return -1;
     } 
 
 
     int DeCompress(input_buffer& in, int sz, input_buffer& out)
     {
-        assert(0);  
         return -1;
     } 
 

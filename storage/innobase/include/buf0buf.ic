@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2010, Innobase Oy. All Rights Reserved.
+Copyright (c) 1995, 2012, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -18,8 +18,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -31,6 +31,7 @@ Created 11/5/1995 Heikki Tuuri
 *******************************************************/
 
 #include "mtr0mtr.h"
+#ifndef UNIV_HOTBACKUP
 #include "buf0flu.h"
 #include "buf0lru.h"
 #include "buf0rea.h"
@@ -189,6 +190,7 @@ buf_page_peek_if_too_old(
 		return(!buf_page_peek_if_young(bpage));
 	}
 }
+#endif /* !UNIV_HOTBACKUP */
 
 /*********************************************************************//**
 Gets the state of a block.
@@ -612,18 +614,18 @@ UNIV_INLINE
 void
 buf_page_set_accessed(
 /*==================*/
-	buf_page_t*	bpage,		/*!< in/out: control block */
-	ulint		time_ms)	/*!< in: ut_time_ms() */
+	buf_page_t*	bpage)		/*!< in/out: control block */
 {
 #ifdef UNIV_DEBUG
 	buf_pool_t*	buf_pool = buf_pool_from_bpage(bpage);
-	ut_ad(buf_pool_mutex_own(buf_pool));
+	ut_ad(!buf_pool_mutex_own(buf_pool));
+	ut_ad(mutex_own(buf_page_get_mutex(bpage)));
 #endif
 	ut_a(buf_page_in_file(bpage));
 
 	if (!bpage->access_time) {
 		/* Make this the time of the first access. */
-		bpage->access_time = time_ms;
+		bpage->access_time = ut_time_ms();
 	}
 }
 
@@ -997,19 +999,6 @@ buf_block_buf_fix_inc_func(
 
 	block->page.buf_fix_count++;
 }
-#ifdef UNIV_SYNC_DEBUG
-/** Increments the bufferfix count.
-@param b	in/out: block to bufferfix
-@param f	in: file name where requested
-@param l	in: line number where requested */
-# define buf_block_buf_fix_inc(b,f,l) buf_block_buf_fix_inc_func(f,l,b)
-#else /* UNIV_SYNC_DEBUG */
-/** Increments the bufferfix count.
-@param b	in/out: block to bufferfix
-@param f	in: file name where requested
-@param l	in: line number where requested */
-# define buf_block_buf_fix_inc(b,f,l) buf_block_buf_fix_inc_func(b)
-#endif /* UNIV_SYNC_DEBUG */
 
 /*******************************************************************//**
 Decrements the bufferfix count. */
@@ -1260,7 +1249,7 @@ buf_block_dbg_add_level(
 				where we have acquired latch */
 	ulint		level)	/*!< in: latching order level */
 {
-	sync_thread_add_level(&block->lock, level);
+	sync_thread_add_level(&block->lock, level, FALSE);
 }
 #endif /* UNIV_SYNC_DEBUG */
 /********************************************************************//**

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@
 #include "sql_trigger.h"
 #include "item.h"               /* From item_subselect.h: subselect_union_engine */
 #include "thr_lock.h"                  /* thr_lock_type, TL_UNLOCK */
+#include "mem_root_array.h"
 
 /* YACC and LEX Definitions */
 
@@ -190,6 +191,9 @@ enum enum_sql_command {
   SQLCOM_SHOW_PROFILE, SQLCOM_SHOW_PROFILES,
   SQLCOM_SIGNAL, SQLCOM_RESIGNAL,
   SQLCOM_SHOW_RELAYLOG_EVENTS, 
+  // TODO(mcallaghan): update status_vars in mysqld to export these
+  SQLCOM_SHOW_USER_STATS, SQLCOM_SHOW_TABLE_STATS, SQLCOM_SHOW_INDEX_STATS,
+  SQLCOM_SHOW_CLIENT_STATS, SQLCOM_SHOW_THREAD_STATS,
   /*
     When a command is added here, be sure it's also added in mysqld.cc
     in "struct show_var_st status_vars[]= {" ...
@@ -258,6 +262,7 @@ enum enum_drop_mode
 #define TL_OPTION_ALIAS         8
 
 typedef List<Item> List_item;
+typedef Mem_root_array<ORDER*, true> Group_list_ptrs;
 
 /* SERVERS CACHE CHANGES */
 typedef struct st_lex_server_options
@@ -693,7 +698,16 @@ public:
   enum olap_type olap;
   /* FROM clause - points to the beginning of the TABLE_LIST::next_local list. */
   SQL_I_List<TABLE_LIST>  table_list;
-  SQL_I_List<ORDER>       group_list; /* GROUP BY clause. */
+
+  /*
+    GROUP BY clause.
+    This list may be mutated during optimization (by remove_const()),
+    so for prepared statements, we keep a copy of the ORDER.next pointers in
+    group_list_ptrs, and re-establish the original list before each execution.
+  */
+  SQL_I_List<ORDER>       group_list;
+  Group_list_ptrs        *group_list_ptrs;
+
   List<Item>          item_list;  /* list of fields & expressions */
   List<String>        interval_list;
   bool	              is_item_list_lookup;
@@ -716,10 +730,11 @@ public:
   const char *type;               /* type of select for EXPLAIN          */
 
   SQL_I_List<ORDER> order_list;   /* ORDER clause */
-  SQL_I_List<ORDER> *gorder_list;
+  SQL_I_List<ORDER> gorder_list;
   Item *select_limit, *offset_limit;  /* LIMIT clause parameters */
   // Arrays of pointers to top elements of all_fields list
   Item **ref_pointer_array;
+  size_t ref_pointer_array_size; // Number of elements in array.
 
   /*
     number of items in select_list and HAVING clause used to get number
@@ -838,6 +853,7 @@ public:
   bool add_group_to_list(THD *thd, Item *item, bool asc);
   bool add_ftfunc_to_list(Item_func_match *func);
   bool add_order_to_list(THD *thd, Item *item, bool asc);
+  bool add_gorder_to_list(THD *thd, Item *item, bool asc);
   TABLE_LIST* add_table_to_list(THD *thd, Table_ident *table,
 				LEX_STRING *alias,
 				ulong table_options,
@@ -870,7 +886,8 @@ public:
   bool test_limit();
 
   friend void lex_start(THD *thd);
-  st_select_lex() : n_sum_items(0), n_child_sum_items(0) {}
+  st_select_lex() : group_list_ptrs(NULL), n_sum_items(0), n_child_sum_items(0)
+  {}
   void make_empty_select()
   {
     init_query();
@@ -968,6 +985,14 @@ inline bool st_select_lex_unit::is_union ()
 #define ALTER_REMOVE_PARTITIONING (1L << 21)
 #define ALTER_FOREIGN_KEY        (1L << 22)
 #define ALTER_TRUNCATE_PARTITION (1L << 23)
+#define ALTER_NO_WAIT            (1L << 24)
+#define ALTER_MODIFY_COLUMN_NULL (1L << 25)
+
+enum enum_alter_table_lock
+{
+  ALTER_TABLE_LOCK_DEFAULT,
+  ALTER_TABLE_LOCK_EXCLUSIVE
+};
 
 enum enum_alter_table_change_level
 {
@@ -1016,6 +1041,7 @@ public:
   enum_alter_table_change_level change_level;
   Create_field                 *datetime_field;
   bool                          error_if_not_empty;
+  enum_alter_table_lock         lock_mode;
 
 
   Alter_info() :
@@ -1025,7 +1051,8 @@ public:
     num_parts(0),
     change_level(ALTER_TABLE_METADATA_ONLY),
     datetime_field(NULL),
-    error_if_not_empty(FALSE)
+    error_if_not_empty(FALSE),
+    lock_mode(ALTER_TABLE_LOCK_DEFAULT)
   {}
 
   void reset()
@@ -1042,8 +1069,10 @@ public:
     change_level= ALTER_TABLE_METADATA_ONLY;
     datetime_field= 0;
     error_if_not_empty= FALSE;
+    lock_mode= ALTER_TABLE_LOCK_DEFAULT;
   }
   Alter_info(const Alter_info &rhs, MEM_ROOT *mem_root);
+  bool set_lock_mode(const LEX_STRING *);
 private:
   Alter_info &operator=(const Alter_info &rhs); // not implemented
   Alter_info(const Alter_info &rhs);            // not implemented
@@ -1269,6 +1298,13 @@ public:
     BINLOG_STMT_UNSAFE_INSERT_SELECT_UPDATE,
 
     /**
+     Query that writes to a table with auto_inc column after selecting from 
+     other tables are unsafe as the order in which the rows are retrieved by
+     select may differ on master and slave.
+    */
+    BINLOG_STMT_UNSAFE_WRITE_AUTOINC_SELECT,
+
+    /**
       INSERT...REPLACE SELECT is unsafe because which rows are replaced depends
       on the order that rows are retrieved by SELECT. This order cannot be
       predicted and may differ on master and the slave.
@@ -1290,11 +1326,31 @@ public:
     BINLOG_STMT_UNSAFE_CREATE_REPLACE_SELECT,
 
     /**
+      CREATE TABLE...SELECT on a table with auto-increment column is unsafe
+      because which rows are replaced depends on the order that rows are
+      retrieved from SELECT. This order cannot be predicted and may differ on
+      master and the slave
+    */
+    BINLOG_STMT_UNSAFE_CREATE_SELECT_AUTOINC,
+
+    /**
       UPDATE...IGNORE is unsafe because which rows are ignored depends on the
       order that rows are updated. This order cannot be predicted and may differ
       on master and the slave.
     */
     BINLOG_STMT_UNSAFE_UPDATE_IGNORE,
+
+    /**
+      INSERT... ON DUPLICATE KEY UPDATE on a table with more than one
+      UNIQUE KEYS  is unsafe.
+    */
+    BINLOG_STMT_UNSAFE_INSERT_TWO_KEYS,
+
+    /**
+       INSERT into auto-inc field which is not the first part of composed
+       primary key.
+    */
+    BINLOG_STMT_UNSAFE_AUTOINC_NOT_FIRST,
 
     /* The last element of this enumeration type. */
     BINLOG_STMT_UNSAFE_COUNT
@@ -2244,6 +2300,13 @@ struct LEX: public Query_tables_list
 
   List<Key_part_spec> col_list;
   List<Key_part_spec> ref_list;
+  /*
+    A list of strings is maintained to store the SET clause command user strings
+    which are specified in load data operation.  This list will be used
+    during the reconstruction of "load data" statement at the time of writing
+    to binary log.
+   */
+  List<String>        load_set_str_list;
   List<String>	      interval_list;
   List<LEX_USER>      users_list;
   List<LEX_COLUMN>    columns;
@@ -2451,6 +2514,9 @@ struct LEX: public Query_tables_list
 
   /** Maximum execution time for a statement. */
   ulong max_statement_time;
+
+  /** Lock tables with NO_WAIT blocking mode */
+  bool lock_table_no_wait;
 
   LEX();
 
@@ -2748,7 +2814,7 @@ extern void lex_init(void);
 extern void lex_free(void);
 extern void lex_start(THD *thd);
 extern void lex_end(LEX *lex);
-extern int MYSQLlex(void *arg, void *yythd);
+extern int MYSQLlex(union YYSTYPE *yylval, class THD *thd);
 
 extern void trim_whitespace(CHARSET_INFO *cs, LEX_STRING *str);
 

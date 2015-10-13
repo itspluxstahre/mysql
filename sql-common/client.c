@@ -1,4 +1,4 @@
-/* Copyright (c) 2003, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2003, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 /*
   This file is included by both libmysql.c (the MySQL client C API)
@@ -1136,7 +1136,8 @@ static const char *default_options[]=
   "connect-timeout", "local-infile", "disable-local-infile",
   "ssl-cipher", "max-allowed-packet", "protocol", "shared-memory-base-name",
   "multi-results", "multi-statements", "multi-queries", "secure-auth",
-  "report-data-truncation", "plugin-dir", "default-auth",
+  "report-data-truncation", "plugin-dir", "default-auth", 
+  "enable-cleartext-plugin",
   NullS
 };
 enum option_id {
@@ -1148,6 +1149,7 @@ enum option_id {
   OPT_ssl_cipher, OPT_max_allowed_packet, OPT_protocol, OPT_shared_memory_base_name, 
   OPT_multi_results, OPT_multi_statements, OPT_multi_queries, OPT_secure_auth, 
   OPT_report_data_truncation, OPT_plugin_dir, OPT_default_auth, 
+  OPT_enable_cleartext_plugin,
   OPT_keep_this_one_last
 };
 
@@ -1180,14 +1182,27 @@ static int add_init_command(struct st_mysql_options *options, const char *cmd)
   return 0;
 }
 
-#define EXTENSION_SET_STRING(OPTS, X, STR)                       \
-    if ((OPTS)->extension)                                       \
-      my_free((OPTS)->extension->X);     \
-    else                                                         \
+#define ALLOCATE_EXTENSIONS(OPTS)                                \
       (OPTS)->extension= (struct st_mysql_options_extention *)   \
         my_malloc(sizeof(struct st_mysql_options_extention),     \
-                  MYF(MY_WME | MY_ZEROFILL));                    \
-    (OPTS)->extension->X= my_strdup((STR), MYF(MY_WME));
+                  MYF(MY_WME | MY_ZEROFILL))                     \
+
+#define ENSURE_EXTENSIONS_PRESENT(OPTS)                          \
+    do {                                                         \
+      if (!(OPTS)->extension)                                    \
+        ALLOCATE_EXTENSIONS(OPTS);                               \
+    } while (0)
+
+
+#define EXTENSION_SET_STRING(OPTS, X, STR)                       \
+    do {                                                         \
+      if ((OPTS)->extension)                                     \
+        my_free((OPTS)->extension->X);                           \
+      else                                                       \
+        ALLOCATE_EXTENSIONS(OPTS);                               \
+      (OPTS)->extension->X= ((STR) != NULL) ?                    \
+        my_strdup((STR), MYF(MY_WME)) : NULL;                    \
+    } while (0)
 
 void mysql_read_default_options(struct st_mysql_options *options,
 				const char *filename,const char *group)
@@ -1379,13 +1394,20 @@ void mysql_read_default_options(struct st_mysql_options *options,
                                     opt_arg));
               break;
             }
-            convert_dirname(buff, buff2, NULL);
+            convert_dirname(buff2, buff, NULL);
             EXTENSION_SET_STRING(options, plugin_dir, buff2);
           }
           break;
         case OPT_default_auth:
           EXTENSION_SET_STRING(options, default_auth, opt_arg);
           break;
+
+        case OPT_enable_cleartext_plugin:
+          ENSURE_EXTENSIONS_PRESENT(options);
+          options->extension->enable_cleartext_plugin= 
+            (!opt_arg || atoi(opt_arg) != 0) ? TRUE : FALSE;
+          break;
+
 	default:
 	  DBUG_PRINT("warning",("unknown option: %s",option[0]));
 	}
@@ -1430,7 +1452,7 @@ static void cli_fetch_lengths(ulong *to, MYSQL_ROW column,
 ***************************************************************************/
 
 MYSQL_FIELD *
-unpack_fields(MYSQL_DATA *data,MEM_ROOT *alloc,uint fields,
+unpack_fields(MYSQL *mysql, MYSQL_DATA *data,MEM_ROOT *alloc,uint fields,
 	      my_bool default_value, uint server_capabilities)
 {
   MYSQL_ROWS	*row;
@@ -1443,6 +1465,7 @@ unpack_fields(MYSQL_DATA *data,MEM_ROOT *alloc,uint fields,
   if (!result)
   {
     free_rows(data);				/* Free old data */
+    set_mysql_error(mysql, CR_OUT_OF_MEMORY, unknown_sqlstate);
     DBUG_RETURN(0);
   }
   bzero((char*) field, (uint) sizeof(MYSQL_FIELD)*fields);
@@ -1470,6 +1493,14 @@ unpack_fields(MYSQL_DATA *data,MEM_ROOT *alloc,uint fields,
       field->org_name_length=	lengths[5];
 
       /* Unpack fixed length parts */
+      if (lengths[6] != 12)
+      {
+        /* malformed packet. signal an error. */
+        free_rows(data);			/* Free old data */
+        set_mysql_error(mysql, CR_MALFORMED_PACKET, unknown_sqlstate);
+        DBUG_RETURN(0);
+      }
+
       pos= (uchar*) row->data[6];
       field->charsetnr= uint2korr(pos);
       field->length=	(uint) uint4korr(pos+2);
@@ -1878,6 +1909,12 @@ static int ssl_verify_server_cert(Vio *vio, const char* server_hostname, const c
     DBUG_RETURN(1);
   }
 
+  if (X509_V_OK != SSL_get_verify_result(ssl))
+  {
+    *errptr= "Failed to verify the server certificate";
+    X509_free(server_cert);
+    DBUG_RETURN(1);
+  }
   /*
     We already know that the certificate exchanged was valid; the SSL library
     handled that. Now we need to verify that the contents of the certificate
@@ -2184,6 +2221,8 @@ mysql_autodetect_character_set(MYSQL *mysql)
   }
 #endif
 
+  if (mysql->options.charset_name)
+    my_free(mysql->options.charset_name);
   if (!(mysql->options.charset_name= my_strdup(csname, MYF(MY_WME))))
     return 1;
   return 0;
@@ -2773,6 +2812,27 @@ static void client_mpvio_info(MYSQL_PLUGIN_VIO *vio,
   mpvio_info(mpvio->mysql->net.vio, info);
 }
 
+
+my_bool libmysql_cleartext_plugin_enabled= 0;
+
+static my_bool check_plugin_enabled(MYSQL *mysql, auth_plugin_t *plugin)
+{
+  if (plugin == &clear_password_client_plugin &&
+      (!libmysql_cleartext_plugin_enabled &&
+       (!mysql->options.extension ||
+       !mysql->options.extension->enable_cleartext_plugin)))
+  {
+    set_mysql_extended_error(mysql, CR_AUTH_PLUGIN_CANNOT_LOAD,
+                             unknown_sqlstate,
+                             ER(CR_AUTH_PLUGIN_CANNOT_LOAD),
+                             clear_password_client_plugin.name,
+                             "plugin not enabled");
+    return TRUE;
+  }
+  return FALSE;
+}
+
+
 /**
   Client side of the plugin driver authentication.
 
@@ -2814,6 +2874,9 @@ int run_plugin_auth(MYSQL *mysql, char *data, uint data_len,
       &native_password_client_plugin : &old_password_client_plugin;
     auth_plugin_name= auth_plugin->name;
   }
+
+  if (check_plugin_enabled(mysql, auth_plugin))
+    DBUG_RETURN(1);
 
   DBUG_PRINT ("info", ("using plugin %s", auth_plugin_name));
 
@@ -2905,6 +2968,9 @@ int run_plugin_auth(MYSQL *mysql, char *data, uint data_len,
     if (!(auth_plugin= (auth_plugin_t *) mysql_client_find_plugin(mysql,
                          auth_plugin_name, MYSQL_CLIENT_AUTHENTICATION_PLUGIN)))
       DBUG_RETURN (1);
+
+    if (check_plugin_enabled(mysql, auth_plugin))
+      DBUG_RETURN(1);
 
     mpvio.plugin= auth_plugin;
     res= auth_plugin->authenticate_user((struct st_plugin_vio *)&mpvio, mysql);
@@ -3357,6 +3423,12 @@ CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
     mysql->server_status=uint2korr(end+3);
     mysql->server_capabilities|= uint2korr(end+5) << 16;
     pkt_scramble_len= end[7];
+    if (pkt_scramble_len < 0)
+    {
+      set_mysql_error(mysql, CR_MALFORMED_PACKET,
+                      unknown_sqlstate);        /* purecov: inspected */
+      goto error;
+    }
   }
   end+= 18;
 
@@ -3736,8 +3808,8 @@ void STDCALL mysql_close(MYSQL *mysql)
     {
       free_old_query(mysql);
       mysql->status=MYSQL_STATUS_READY; /* Force command */
-      mysql->reconnect=0;
       simple_command(mysql,COM_QUIT,(uchar*) 0,0,1);
+      mysql->reconnect=0;
       end_server(mysql);			/* Sets mysql->net.vio= 0 */
     }
     mysql_close_free_options(mysql);
@@ -3815,7 +3887,7 @@ get_info:
 
   if (!(fields=cli_read_rows(mysql,(MYSQL_FIELD*)0, protocol_41(mysql) ? 7:5)))
     DBUG_RETURN(1);
-  if (!(mysql->fields=unpack_fields(fields,&mysql->field_alloc,
+  if (!(mysql->fields=unpack_fields(mysql, fields,&mysql->field_alloc,
 				    (uint) field_count,0,
 				    mysql->server_capabilities)))
     DBUG_RETURN(1);
@@ -4085,6 +4157,7 @@ mysql_options(MYSQL *mysql,enum mysql_option option, const void *arg)
     mysql->options.methods_to_use= option;
     break;
   case MYSQL_SET_CLIENT_IP:
+    my_free(mysql->options.client_ip);
     mysql->options.client_ip= my_strdup(arg, MYF(MY_WME));
     break;
   case MYSQL_SECURE_AUTH:
@@ -4107,6 +4180,11 @@ mysql_options(MYSQL *mysql,enum mysql_option option, const void *arg)
     break;
   case MYSQL_DEFAULT_AUTH:
     EXTENSION_SET_STRING(&mysql->options, default_auth, arg);
+    break;
+  case MYSQL_ENABLE_CLEARTEXT_PLUGIN:
+    ENSURE_EXTENSIONS_PRESENT(&mysql->options);
+    mysql->options.extension->enable_cleartext_plugin= 
+      (*(my_bool*) arg) ? TRUE : FALSE;
     break;
   default:
     DBUG_RETURN(1);
@@ -4158,17 +4236,27 @@ const char * STDCALL mysql_error(MYSQL *mysql)
 
   RETURN
    Signed number > 323000
+   Zero if there is no connection
 */
 
 ulong STDCALL
 mysql_get_server_version(MYSQL *mysql)
 {
-  uint major, minor, version;
-  char *pos= mysql->server_version, *end_pos;
-  major=   (uint) strtoul(pos, &end_pos, 10);	pos=end_pos+1;
-  minor=   (uint) strtoul(pos, &end_pos, 10);	pos=end_pos+1;
-  version= (uint) strtoul(pos, &end_pos, 10);
-  return (ulong) major*10000L+(ulong) (minor*100+version);
+  ulong major= 0, minor= 0, version= 0;
+
+  if (mysql->server_version)
+  {
+    char *pos= mysql->server_version, *end_pos;
+    major=   strtoul(pos, &end_pos, 10);	pos=end_pos+1;
+    minor=   strtoul(pos, &end_pos, 10);	pos=end_pos+1;
+    version= strtoul(pos, &end_pos, 10);
+  }
+  else
+  {
+    set_mysql_error(mysql, CR_COMMANDS_OUT_OF_SYNC, unknown_sqlstate);
+  }
+
+  return major*10000 + minor*100 + version;
 }
 
 
@@ -4327,5 +4415,3 @@ static int clear_password_auth_client(MYSQL_PLUGIN_VIO *vio, MYSQL *mysql)
 
   return res ? CR_ERROR : CR_OK;
 }
-
-

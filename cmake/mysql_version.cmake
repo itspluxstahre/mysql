@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,6 +18,7 @@
 #
 
 SET(SHARED_LIB_MAJOR_VERSION "18")
+SET(SHARED_LIB_MINOR_VERSION "0")
 SET(PROTOCOL_VERSION "10")
 SET(DOT_FRM_VERSION "6")
 
@@ -54,10 +55,13 @@ MACRO(GET_MYSQL_VERSION)
   ENDIF()
 
   SET(VERSION "${MAJOR_VERSION}.${MINOR_VERSION}.${PATCH_VERSION}${EXTRA_VERSION}")
-  MESSAGE("-- MySQL ${VERSION}")
+  MESSAGE(STATUS "MySQL ${VERSION}")
   SET(MYSQL_BASE_VERSION "${MAJOR_VERSION}.${MINOR_VERSION}" CACHE INTERNAL "MySQL Base version")
   SET(MYSQL_NO_DASH_VERSION "${MAJOR_VERSION}.${MINOR_VERSION}.${PATCH_VERSION}")
-  STRING(REPLACE "-" "_" MYSQL_RPM_VERSION "${VERSION}")
+  # Use NDBVERSION irregardless of whether this is Cluster or not, if not
+  # then the regex will be ignored anyway.
+  STRING(REGEX REPLACE "^.*-ndb-" "" NDBVERSION "${VERSION}")
+  STRING(REPLACE "-" "_" MYSQL_RPM_VERSION "${NDBVERSION}")
   MATH(EXPR MYSQL_VERSION_ID "10000*${MAJOR_VERSION} + 100*${MINOR_VERSION} + ${PATCH_VERSION}")
   MARK_AS_ADVANCED(VERSION MYSQL_VERSION_ID MYSQL_BASE_VERSION)
   SET(CPACK_PACKAGE_VERSION_MAJOR ${MAJOR_VERSION})
@@ -126,6 +130,10 @@ ENDIF()
 
 IF(NOT CPACK_SOURCE_PACKAGE_FILE_NAME)
   SET(CPACK_SOURCE_PACKAGE_FILE_NAME "mysql-${VERSION}")
+  IF("${VERSION}" MATCHES "-ndb-")
+    STRING(REGEX REPLACE "^.*-ndb-" "" NDBVERSION "${VERSION}")
+    SET(CPACK_SOURCE_PACKAGE_FILE_NAME "mysql-cluster-gpl-${NDBVERSION}")
+  ENDIF()
 ENDIF()
 SET(CPACK_PACKAGE_CONTACT "MySQL Release Engineering <mysql-build@oss.oracle.com>")
 SET(CPACK_PACKAGE_VENDOR "Oracle Corporation")

@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -74,10 +74,24 @@ static buf_flush_stat_t	buf_flush_stat_cur;
 Updated by buf_flush_stat_update(). Not protected by any mutex. */
 static buf_flush_stat_t	buf_flush_stat_sum;
 
-/** Number of pages flushed through non flush_list flushes. */
-static ulint buf_lru_flush_page_count = 0;
-
 /* @} */
+
+/******************************************************************//**
+Increases flush_list size in bytes with zip_size for compressed page,
+UNIV_PAGE_SIZE for uncompressed page in inline function */
+static inline
+void
+incr_flush_list_size_in_bytes(
+/*==========================*/
+	buf_block_t*	block,		/*!< in: control block */
+	buf_pool_t*	buf_pool)	/*!< in: buffer pool instance */
+{
+	ulint		zip_size;
+	ut_ad(buf_flush_list_mutex_own(buf_pool));
+	zip_size = page_zip_get_size(&block->page.zip);
+	buf_pool->stat.flush_list_bytes += zip_size ? zip_size : UNIV_PAGE_SIZE;
+	ut_ad(buf_pool->stat.flush_list_bytes <= buf_pool->curr_pool_size);
+}
 
 #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
 /******************************************************************//**
@@ -308,6 +322,7 @@ buf_flush_insert_into_flush_list(
 	ut_d(block->page.in_flush_list = TRUE);
 	block->page.oldest_modification = lsn;
 	UT_LIST_ADD_FIRST(list, buf_pool->flush_list, &block->page);
+	incr_flush_list_size_in_bytes(block, buf_pool);
 
 #ifdef UNIV_DEBUG_VALGRIND
 	{
@@ -412,6 +427,8 @@ buf_flush_insert_sorted_into_flush_list(
 				     prev_b, &block->page);
 	}
 
+	incr_flush_list_size_in_bytes(block, buf_pool);
+
 #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
 	ut_a(buf_flush_validate_low(buf_pool));
 #endif /* UNIV_DEBUG || UNIV_BUF_DEBUG */
@@ -504,6 +521,7 @@ buf_flush_remove(
 	buf_page_t*	bpage)	/*!< in: pointer to the block in question */
 {
 	buf_pool_t*	buf_pool = buf_pool_from_bpage(bpage);
+	ulint		zip_size;
 
 	ut_ad(buf_pool_mutex_own(buf_pool));
 	ut_ad(mutex_own(buf_page_get_mutex(bpage)));
@@ -541,6 +559,9 @@ buf_flush_remove(
 	/* Must be done after we have removed it from the flush_rbt
 	because we assert on in_flush_list in comparison function. */
 	ut_d(bpage->in_flush_list = FALSE);
+
+	zip_size = page_zip_get_size(&bpage->zip);
+	buf_pool->stat.flush_list_bytes -= zip_size ? zip_size : UNIV_PAGE_SIZE;
 
 	bpage->oldest_modification = 0;
 
@@ -757,7 +778,8 @@ buf_flush_buffered_writes(void)
 			if (UNIV_UNLIKELY
 			    (!page_simple_validate_new(block->frame))) {
 corrupted_page:
-				buf_page_print(block->frame, 0);
+				buf_page_print(block->frame, 0,
+					       BUF_PAGE_PRINT_NO_CRASH);
 
 				ut_print_timestamp(stderr);
 				fprintf(stderr,
@@ -1378,10 +1400,10 @@ buf_flush_try_neighbors(
 
 	ut_ad(flush_type == BUF_FLUSH_LRU || flush_type == BUF_FLUSH_LIST);
 
-	if (UT_LIST_GET_LEN(buf_pool->LRU) < BUF_LRU_OLD_MIN_LEN) {
-		/* If there is little space, it is better not to flush
-		any block except from the end of the LRU list */
-
+	if (UT_LIST_GET_LEN(buf_pool->LRU) < BUF_LRU_OLD_MIN_LEN
+	    || !srv_flush_neighbors) {
+		/* If there is little space or neighbor flushing is
+		not enabled then just flush the victim. */
 		low = offset;
 		high = offset + 1;
 	} else {
@@ -1472,6 +1494,10 @@ buf_flush_try_neighbors(
 		buf_pool_mutex_exit(buf_pool);
 	}
 
+	if (count) {
+		srv_buf_pool_flush_neighbor_pages += (count - 1);
+	}
+
 	return(count);
 }
 
@@ -1558,6 +1584,7 @@ buf_flush_LRU_list_batch(
 {
 	buf_page_t*	bpage;
 	ulint		count = 0;
+	ulint		scanned = 0;
 
 	ut_ad(buf_pool_mutex_own(buf_pool));
 
@@ -1569,6 +1596,7 @@ buf_flush_LRU_list_batch(
 		/* Iterate backwards over the flush list till we find
 		a page that isn't ready for flushing. */
 		while (bpage != NULL
+		       && (scanned++, TRUE)
 		       && !buf_flush_page_and_try_neighbors(
 				bpage, BUF_FLUSH_LRU, max, &count)) {
 
@@ -1576,12 +1604,9 @@ buf_flush_LRU_list_batch(
 		}
 	} while (bpage != NULL && count < max);
 
-	/* We keep track of all flushes happening as part of LRU
-	flush. When estimating the desired rate at which flush_list
-	should be flushed, we factor in this value. */
-	buf_lru_flush_page_count += count;
-
 	ut_ad(buf_pool_mutex_own(buf_pool));
+
+	srv_buf_pool_flush_LRU_batch_scanned += scanned;
 
 	return(count);
 }
@@ -1610,6 +1635,7 @@ buf_flush_flush_list_batch(
 	ulint		len;
 	buf_page_t*	bpage;
 	ulint		count = 0;
+	ulint		scanned = 0;
 
 	ut_ad(buf_pool_mutex_own(buf_pool));
 
@@ -1653,6 +1679,7 @@ buf_flush_flush_list_batch(
 		       && !buf_flush_page_and_try_neighbors(
 				bpage, BUF_FLUSH_LIST, min_n, &count)) {
 
+			++scanned;
 			buf_flush_list_mutex_enter(buf_pool);
 
 			/* If we are here that means that buf_pool->mutex
@@ -1681,6 +1708,8 @@ buf_flush_flush_list_batch(
 		}
 
 	} while (count < min_n && bpage != NULL && len > 0);
+
+	srv_buf_pool_flush_batch_scanned += scanned;
 
 	ut_ad(buf_pool_mutex_own(buf_pool));
 
@@ -1749,8 +1778,6 @@ buf_flush_batch(
 	}
 #endif /* UNIV_DEBUG */
 
-	srv_buf_pool_flushed += count;
-
 	return(count);
 }
 
@@ -1782,7 +1809,7 @@ buf_flush_common(
 		/* We keep track of all flushes happening as part of LRU
 		flush. When estimating the desired rate at which flush_list
 		should be flushed we factor in this value. */
-		buf_lru_flush_page_count += page_count;
+		srv_buf_pool_flush_LRU_page_count += page_count;
 	}
 }
 
@@ -2099,7 +2126,7 @@ buf_flush_stat_update(void)
 
 	/* values for this interval */
 	lsn_diff = lsn - buf_flush_stat_cur.redo;
-	n_flushed = buf_lru_flush_page_count
+	n_flushed = srv_buf_pool_flush_LRU_page_count
 		    - buf_flush_stat_cur.n_flushed;
 
 	/* add the current value and subtract the obsolete entry. */
@@ -2116,7 +2143,7 @@ buf_flush_stat_update(void)
 
 	/* reset the current entry. */
 	buf_flush_stat_cur.redo = lsn;
-	buf_flush_stat_cur.n_flushed = buf_lru_flush_page_count;
+	buf_flush_stat_cur.n_flushed = srv_buf_pool_flush_LRU_page_count;
 }
 
 /*********************************************************************
@@ -2176,7 +2203,7 @@ buf_flush_get_desired_flush_rate(void)
 	number of pages flushed in the current interval. */
 	lru_flush_avg = buf_flush_stat_sum.n_flushed
 			/ BUF_FLUSH_STAT_N_INTERVAL
-			+ (buf_lru_flush_page_count
+			+ (srv_buf_pool_flush_LRU_page_count
 			   - buf_flush_stat_cur.n_flushed);
 
 	n_flush_req = (n_dirty * redo_avg) / log_capacity;

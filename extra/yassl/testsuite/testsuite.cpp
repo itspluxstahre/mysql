@@ -1,5 +1,5 @@
 /*
-   Copyright (C) 2006, 2007 MySQL AB
+   Copyright (c) 2006, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -119,7 +119,7 @@ int main(int argc, char** argv)
 void start_thread(THREAD_FUNC fun, func_args* args, THREAD_TYPE* thread)
 {
 #ifndef _POSIX_THREADS
-    *thread = _beginthreadex(0, 0, fun, args, 0, 0);
+    *thread = (HANDLE)_beginthreadex(0, 0, fun, args, 0, 0);
 #else
     pthread_create(thread, 0, fun, args);
 #endif
@@ -129,9 +129,9 @@ void start_thread(THREAD_FUNC fun, func_args* args, THREAD_TYPE* thread)
 void join_thread(THREAD_TYPE thread)
 {
 #ifndef _POSIX_THREADS
-    int res = WaitForSingleObject(reinterpret_cast<HANDLE>(thread), INFINITE);
+    int res = WaitForSingleObject(thread, INFINITE);
     assert(res == WAIT_OBJECT_0);
-    res = CloseHandle(reinterpret_cast<HANDLE>(thread));
+    res = CloseHandle(thread);
     assert(res);
 #else
     pthread_join(thread, 0);
@@ -158,7 +158,7 @@ int test_openSSL_des()
 {
     /* test des encrypt/decrypt */
     char data[] = "this is my data ";
-    int  dataSz = strlen(data);
+    int  dataSz = (int)strlen(data);
     DES_key_schedule key[3];
     byte iv[8];
     EVP_BytesToKey(EVP_des_ede3_cbc(), EVP_md5(), NULL, (byte*)data, dataSz, 1,

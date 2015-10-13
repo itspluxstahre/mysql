@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -64,15 +64,14 @@ These are low-level functions
 #define BUF_LRU_FREE_SEARCH_LEN(b)	(5 + 2 * BUF_READ_AHEAD_AREA(b))
 
 /******************************************************************//**
-Invalidates all pages belonging to a given tablespace when we are deleting
-the data file(s) of that tablespace. A PROBLEM: if readahead is being started,
-what guarantees that it will not try to read in pages after this operation has
-completed? */
+Removes all pages belonging to a given tablespace. */
 UNIV_INTERN
 void
-buf_LRU_invalidate_tablespace(
+buf_LRU_flush_or_remove_pages(
 /*==========================*/
-	ulint	id);	/*!< in: space id */
+	ulint			id,	/*!< in: space id */
+	enum buf_remove_t	buf_remove);/*!< in: remove or flush
+					strategy */
 #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
 /********************************************************************//**
 Insert a compressed block into buf_pool->zip_clean in the LRU order. */
@@ -150,7 +149,10 @@ buf_LRU_block_free_non_file_page(
 /*=============================*/
 	buf_block_t*	block);	/*!< in: block, must not contain a file page */
 /******************************************************************//**
-Adds a block to the LRU list. */
+Adds a block to the LRU list. Please make sure that the zip_size is
+already set into the page zip when invoking the function, so that we
+can get correct zip_size from the buffer page when adding a block
+into LRU */
 UNIV_INTERN
 void
 buf_LRU_add_block(

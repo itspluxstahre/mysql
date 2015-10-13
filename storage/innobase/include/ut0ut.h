@@ -18,8 +18,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -401,11 +401,23 @@ a limited buffer. */
 /*************************************************************//**
 Convert an error number to a human readable text message. The
 returned string is static and should not be freed or modified.
-@return	string, describing the error */
+@return	string, describing the error. Otherwise, abort if an
+unknown error code is given. */
 UNIV_INTERN
 const char*
 ut_strerr(
 /*======*/
+	enum db_err	num);	/*!< in: error number */
+
+/*************************************************************//**
+Convert an error number to a human readable text message. The
+returned string is static and should not be freed or modified.
+@return	string, describing the error. Otherwise, NULL if an
+unknown error code is given. */
+UNIV_INTERN
+const char*
+ut_get_strerr(
+/*==========*/
 	enum db_err	num);	/*!< in: error number */
 
 #ifndef UNIV_NONINL

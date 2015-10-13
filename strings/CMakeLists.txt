@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -31,3 +31,7 @@ ENDIF()
 # Avoid dependencies on perschema data defined in mysys
 ADD_DEFINITIONS(-DDISABLE_MYSQL_THREAD_H)
 ADD_CONVENIENCE_LIBRARY(strings ${STRINGS_SOURCES})
+
+IF(MSVC)
+   INSTALL_DEBUG_TARGET(strings DESTINATION ${INSTALL_LIBDIR}/debug)
+ENDIF()

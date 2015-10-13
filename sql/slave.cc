@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2015, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -158,6 +158,90 @@ static int terminate_slave_thread(THD *thd,
                                   volatile uint *slave_running,
                                   bool skip_lock);
 static bool check_io_slave_killed(THD *thd, Master_info *mi, const char *info);
+/*
+  Function to set the slave's max_allowed_packet based on the value
+  of slave_max_allowed_packet.
+
+    @in_param    thd    Thread handler for slave
+    @in_param    mysql  MySQL connection handle
+*/
+
+static void set_slave_max_allowed_packet(THD *thd, MYSQL *mysql)
+{
+  DBUG_ENTER("set_slave_max_allowed_packet");
+  // thd and mysql must be valid
+  DBUG_ASSERT(thd && mysql);
+
+  thd->variables.max_allowed_packet= slave_max_allowed_packet;
+  thd->net.max_packet_size= slave_max_allowed_packet;
+  /*
+    Adding MAX_LOG_EVENT_HEADER_LEN to the max_packet_size on the I/O
+    thread and the mysql->option max_allowed_packet, since a
+    replication event can become this much  larger than
+    the corresponding packet (query) sent from client to master.
+  */
+  thd->net.max_packet_size+= MAX_LOG_EVENT_HEADER;
+  /*
+    Skipping the setting of mysql->net.max_packet size to slave
+    max_allowed_packet since this is done during mysql_real_connect.
+  */
+  mysql->options.max_allowed_packet=
+    slave_max_allowed_packet+MAX_LOG_EVENT_HEADER;
+  DBUG_VOID_RETURN;
+}
+
+/**
+  Thread state for the SQL slave thread.
+*/
+
+class THD_SQL_slave : public THD
+{
+private:
+  char *m_buffer;
+  size_t m_buffer_size;
+
+public:
+  /**
+    Constructor, used to represent slave thread state.
+
+    @param buffer Statically-allocated buffer.
+    @param size   Size of the passed buffer.
+  */
+  THD_SQL_slave(char *buffer, size_t size)
+  : m_buffer(buffer), m_buffer_size(size)
+  {
+    DBUG_ASSERT(buffer && size);
+    memset(m_buffer, 0, m_buffer_size);
+  }
+
+  virtual ~THD_SQL_slave()
+  {
+    m_buffer[0]= '\0';
+  }
+
+  void print_proc_info(const char *fmt, ...);
+};
+
+
+/**
+  Print an information (state) string for this slave thread.
+
+  @param fmt  Specifies how subsequent arguments are converted for output.
+  @param ...  Variable number of arguments.
+*/
+
+void THD_SQL_slave::print_proc_info(const char *fmt, ...)
+{
+  va_list args;
+
+  va_start(args, fmt);
+  my_vsnprintf(m_buffer, m_buffer_size - 1, fmt, args);
+  va_end(args);
+
+  /* Set field directly, profiling is not useful in a slave thread anyway. */
+  proc_info= m_buffer;
+}
+
 
 /*
   Find out which replications threads are running
@@ -678,6 +762,7 @@ int start_slave_thread(
 {
   pthread_t th;
   ulong start_id;
+  int error;
   DBUG_ENTER("start_slave_thread");
 
   DBUG_ASSERT(mi->inited);
@@ -704,9 +789,10 @@ int start_slave_thread(
   }
   start_id= *slave_run_id;
   DBUG_PRINT("info",("Creating new slave thread"));
-  if (mysql_thread_create(thread_key,
-                          &th, &connection_attrib, h_func, (void*)mi))
+  if ((error = mysql_thread_create(thread_key,
+                           &th, &connection_attrib, h_func, (void*)mi)))
   {
+    sql_print_error("Can't create slave thread (errno= %d).", error);
     if (start_lock)
       mysql_mutex_unlock(start_lock);
     DBUG_RETURN(ER_SLAVE_THREAD);
@@ -1347,6 +1433,8 @@ static int get_master_version_and_clock(MYSQL* mysql, Master_info* mi)
       (master_res= mysql_store_result(mysql)) &&
       (master_row= mysql_fetch_row(master_res)))
   {
+    // MYSQL-312
+    master_server_id= strtoul(master_row[1], 0, 10);
     if ((::server_id == (mi->master_id= strtoul(master_row[1], 0, 10))) &&
         !mi->rli.replicate_same_server_id)
     {
@@ -1586,6 +1674,54 @@ Waiting for the slave SQL thread to free enough relay log space");
          !(slave_killed=io_slave_killed(thd,mi)) &&
          !rli->ignore_log_space_limit)
     mysql_cond_wait(&rli->log_space_cond, &rli->log_space_lock);
+
+  /* 
+    Makes the IO thread read only one event at a time
+    until the SQL thread is able to purge the relay 
+    logs, freeing some space.
+
+    Therefore, once the SQL thread processes this next 
+    event, it goes to sleep (no more events in the queue),
+    sets ignore_log_space_limit=true and wakes the IO thread. 
+    However, this event may have been enough already for 
+    the SQL thread to purge some log files, freeing 
+    rli->log_space_total .
+
+    This guarantees that the SQL and IO thread move
+    forward only one event at a time (to avoid deadlocks), 
+    when the relay space limit is reached. It also 
+    guarantees that when the SQL thread is prepared to
+    rotate (to be able to purge some logs), the IO thread
+    will know about it and will rotate.
+
+    NOTE: The ignore_log_space_limit is only set when the SQL
+          thread sleeps waiting for events.
+
+   */
+  if (rli->ignore_log_space_limit)
+  {
+#ifndef DBUG_OFF
+    {
+      char llbuf1[22], llbuf2[22];
+      DBUG_PRINT("info", ("log_space_limit=%s "
+                          "log_space_total=%s "
+                          "ignore_log_space_limit=%d "
+                          "sql_force_rotate_relay=%d", 
+                        llstr(rli->log_space_limit,llbuf1),
+                        llstr(rli->log_space_total,llbuf2),
+                        (int) rli->ignore_log_space_limit,
+                        (int) rli->sql_force_rotate_relay));
+    }
+#endif
+    if (rli->sql_force_rotate_relay)
+    {
+      rotate_relay_log(rli->mi);
+      rli->sql_force_rotate_relay= false;
+    }
+
+    rli->ignore_log_space_limit= false;
+  }
+
   thd->exit_cond(save_proc_info);
   DBUG_RETURN(slave_killed);
 }
@@ -2024,13 +2160,6 @@ static int init_slave_thread(THD* thd, SLAVE_THD_TYPE thd_type)
     SYSTEM_THREAD_SLAVE_SQL : SYSTEM_THREAD_SLAVE_IO;
   thd->security_ctx->skip_grants();
   my_net_init(&thd->net, 0);
-/*
-  Adding MAX_LOG_EVENT_HEADER_LEN to the max_allowed_packet on all
-  slave threads, since a replication event can become this much larger
-  than the corresponding packet (query) sent from client to master.
-*/
-  thd->variables.max_allowed_packet= global_system_variables.max_allowed_packet
-    + MAX_LOG_EVENT_HEADER;  /* note, incr over the global not session var */
   thd->slave_thread = 1;
   thd->enable_slow_log= opt_log_slow_slave_statements;
   set_slave_thread_options(thd);
@@ -2462,6 +2591,9 @@ static int exec_relay_log_event(THD* thd, Relay_log_info* rli)
   {
     int exec_res;
 
+    thd->print_proc_info("Executing %s event at position %lu",
+                         ev->get_type_str(), ev->log_pos);
+
     /*
       This tests if the position of the beginning of the current event
       hits the UNTIL barrier.
@@ -2509,7 +2641,8 @@ static int exec_relay_log_event(THD* thd, Relay_log_info* rli)
       used to read info about the relay log's format; it will be deleted when
       the SQL thread does not need it, i.e. when this thread terminates.
     */
-    if (ev->get_type_code() != FORMAT_DESCRIPTION_EVENT)
+    if (ev->get_type_code() != FORMAT_DESCRIPTION_EVENT &&
+        !rli->is_deferred_event(ev))
     {
       DBUG_PRINT("info", ("Deleting the event after it has been executed"));
       delete ev;
@@ -2720,6 +2853,8 @@ pthread_handler_t handle_slave_io(void *arg)
   mysql= NULL ;
   retry_count= 0;
 
+  thd= new THD; // note that contructor of THD uses DBUG_ !
+
   mysql_mutex_lock(&mi->run_lock);
   /* Inform waiting threads that slave has started */
   mi->slave_run_id++;
@@ -2728,7 +2863,6 @@ pthread_handler_t handle_slave_io(void *arg)
   mi->events_till_disconnect = disconnect_slave_event_count;
 #endif
 
-  thd= new THD; // note that contructor of THD uses DBUG_ !
   THD_CHECK_SENTRY(thd);
   mi->io_thd = thd;
 
@@ -2780,12 +2914,6 @@ pthread_handler_t handle_slave_io(void *arg)
                           mi->user, mi->host, mi->port,
 			  IO_RPL_LOG_NAME,
 			  llstr(mi->master_log_pos,llbuff));
-  /*
-    Adding MAX_LOG_EVENT_HEADER_LEN to the max_packet_size on the I/O
-    thread, since a replication event can become this much larger than
-    the corresponding packet (query) sent from client to master.
-  */
-    mysql->net.max_packet_size= thd->net.max_packet_size+= MAX_LOG_EVENT_HEADER;
   }
   else
   {
@@ -2917,12 +3045,12 @@ reading event"))
         switch (mysql_error_number) {
         case CR_NET_PACKET_TOO_LARGE:
           sql_print_error("\
-Log entry on master is longer than max_allowed_packet (%ld) on \
+Log entry on master is longer than slave_max_allowed_packet (%lu) on \
 slave. If the entry is correct, restart the server with a higher value of \
-max_allowed_packet",
-                          thd->variables.max_allowed_packet);
+slave_max_allowed_packet",
+                         slave_max_allowed_packet);
           mi->report(ERROR_LEVEL, ER_NET_PACKET_TOO_LARGE,
-                     "%s", ER(ER_NET_PACKET_TOO_LARGE));
+                     "%s", "Got a packet bigger than 'slave_max_allowed_packet' bytes");
           goto err;
         case ER_MASTER_FATAL_ERROR_READING_BINLOG:
           mi->report(ERROR_LEVEL, ER_MASTER_FATAL_ERROR_READING_BINLOG,
@@ -3050,10 +3178,12 @@ err:
   change_rpl_status(RPL_ACTIVE_SLAVE,RPL_IDLE_SLAVE);
   DBUG_ASSERT(thd->net.buff != 0);
   net_end(&thd->net); // destructor will not free it, because net.vio is 0
+  mysql_mutex_lock(&LOCK_thd_remove);
   mysql_mutex_lock(&LOCK_thread_count);
   THD_CHECK_SENTRY(thd);
   delete thd;
   mysql_mutex_unlock(&LOCK_thread_count);
+  mysql_mutex_unlock(&LOCK_thd_remove);
   mi->abort_slave= 0;
   mi->slave_running= 0;
   mi->io_thd= 0;
@@ -3137,9 +3267,15 @@ pthread_handler_t handle_slave_sql(void *arg)
   Relay_log_info* rli = &((Master_info*)arg)->rli;
   const char *errmsg;
 
+  /* Buffer lifetime extends across the entire runtime of the THD handle. */
+  static char proc_info_buf[256]= {0};
+
   // needs to call my_thread_init(), otherwise we get a coredump in DBUG_ stuff
   my_thread_init();
   DBUG_ENTER("handle_slave_sql");
+
+  // note that contructor of THD uses DBUG_ !
+  thd = new THD_SQL_slave(proc_info_buf, sizeof(proc_info_buf));
 
   DBUG_ASSERT(rli->inited);
   mysql_mutex_lock(&rli->run_lock);
@@ -3149,7 +3285,6 @@ pthread_handler_t handle_slave_sql(void *arg)
   rli->events_till_abort = abort_slave_event_count;
 #endif
 
-  thd = new THD; // note that contructor of THD uses DBUG_ !
   thd->thread_stack = (char*)&thd; // remember where our stack is
   rli->sql_thd= thd;
   
@@ -3171,6 +3306,12 @@ pthread_handler_t handle_slave_sql(void *arg)
     goto err;
   }
   thd->init_for_queries();
+  thd->rli_slave= rli;
+  if ((rli->deferred_events_collecting= rpl_filter->is_on()))
+  {
+    rli->deferred_events= new Deferred_log_events(rli);
+  }
+
   thd->temporary_tables = rli->save_temporary_tables; // restore temp tables
   set_thd_in_use_temporary_tables(rli);   // (re)set sql_thd in use for saved temp tables
   mysql_mutex_lock(&LOCK_thread_count);
@@ -3443,10 +3584,12 @@ the slave SQL thread with \"SLAVE START\". We stopped at log \
   THD_CHECK_SENTRY(thd);
   rli->sql_thd= 0;
   set_thd_in_use_temporary_tables(rli);  // (re)set sql_thd in use for saved temp tables
+  mysql_mutex_lock(&LOCK_thd_remove);
   mysql_mutex_lock(&LOCK_thread_count);
   THD_CHECK_SENTRY(thd);
   delete thd;
   mysql_mutex_unlock(&LOCK_thread_count);
+  mysql_mutex_unlock(&LOCK_thd_remove);
  /*
   Note: the order of the broadcast and unlock calls below (first broadcast, then unlock)
   is important. Otherwise a killer_thread can execute between the calls and
@@ -4176,7 +4319,7 @@ static int connect_to_master(THD* thd, MYSQL* mysql, Master_info* mi,
   ulong err_count=0;
   char llbuff[22];
   DBUG_ENTER("connect_to_master");
-
+  set_slave_max_allowed_packet(thd, mysql);
 #ifndef DBUG_OFF
   mi->events_till_disconnect = disconnect_slave_event_count;
 #endif
@@ -4201,7 +4344,23 @@ static int connect_to_master(THD* thd, MYSQL* mysql, Master_info* mi,
   }
 #endif
 
-  mysql_options(mysql, MYSQL_SET_CHARSET_NAME, default_charset_info->csname);
+  /*
+    If server's default charset is not supported (like utf16, utf32) as client
+    charset, then set client charset to 'latin1' (default client charset).
+  */
+  if (is_supported_parser_charset(default_charset_info))
+    mysql_options(mysql, MYSQL_SET_CHARSET_NAME, default_charset_info->csname);
+  else
+  {
+    sql_print_information("'%s' can not be used as client character set. "
+                          "'%s' will be used as default client character set "
+                          "while connecting to master.",
+                          default_charset_info->csname,
+                          default_client_charset_info->csname);
+    mysql_options(mysql, MYSQL_SET_CHARSET_NAME,
+                  default_client_charset_info->csname);
+  }
+
   /* This one is not strictly needed but we have it here for completeness */
   mysql_options(mysql, MYSQL_SET_CHARSET_DIR, (char *) charsets_dir);
 
@@ -4655,19 +4814,45 @@ static Log_event* next_event(Relay_log_info* rli)
           constraint, because we do not want the I/O thread to block because of
           space (it's ok if it blocks for any other reason (e.g. because the
           master does not send anything). Then the I/O thread stops waiting
-          and reads more events.
-          The SQL thread decides when the I/O thread should take log_space_limit
-          into account again : ignore_log_space_limit is reset to 0
-          in purge_first_log (when the SQL thread purges the just-read relay
-          log), and also when the SQL thread starts. We should also reset
-          ignore_log_space_limit to 0 when the user does RESET SLAVE, but in
-          fact, no need as RESET SLAVE requires that the slave
+          and reads one more event and starts honoring log_space_limit again.
+
+          If the SQL thread needs more events to be able to rotate the log (it
+          might need to finish the current group first), then it can ask for one
+          more at a time. Thus we don't outgrow the relay log indefinitely,
+          but rather in a controlled manner, until the next rotate.
+
+          When the SQL thread starts it sets ignore_log_space_limit to false. 
+          We should also reset ignore_log_space_limit to 0 when the user does 
+          RESET SLAVE, but in fact, no need as RESET SLAVE requires that the slave
           be stopped, and the SQL thread sets ignore_log_space_limit to 0 when
           it stops.
         */
         mysql_mutex_lock(&rli->log_space_lock);
-        // prevent the I/O thread from blocking next times
-        rli->ignore_log_space_limit= 1;
+
+        /* 
+          If we have reached the limit of the relay space and we
+          are going to sleep, waiting for more events:
+
+          1. If outside a group, SQL thread asks the IO thread 
+             to force a rotation so that the SQL thread purges 
+             logs next time it processes an event (thus space is
+             freed).
+
+          2. If in a group, SQL thread asks the IO thread to 
+             ignore the limit and queues yet one more event 
+             so that the SQL thread finishes the group and 
+             is are able to rotate and purge sometime soon.
+         */
+        if (rli->log_space_limit && 
+            rli->log_space_limit < rli->log_space_total)
+        {
+          /* force rotation if not in an unfinished group */
+          rli->sql_force_rotate_relay= !rli->is_in_group();
+
+          /* ask for one more event */
+          rli->ignore_log_space_limit= true;
+        }
+
         /*
           If the I/O thread is blocked, unblock it.  Ok to broadcast
           after unlock, because the mutex is only destroyed in
@@ -5037,3 +5222,43 @@ template class I_List_iterator<i_string_pair>;
 */
 
 #endif /* HAVE_REPLICATION */
+
+#if defined(HAVE_REPLICATION) && defined(INNODB_COMPATIBILITY_HOOKS)
+
+/**
+  Get the file name of the mater's binlog.
+  @return the name of the binlog file
+*/
+extern "C"
+const char* mysql_master_log_file_name(void)
+{
+  DBUG_ASSERT(active_mi && active_mi->rli.sql_thd == current_thd);
+  return active_mi->rli.group_master_log_name;
+}
+
+/**
+  Get the current position of the master's binlog.
+  @return byte offset from the beginning of the binlog
+*/
+extern "C"
+ulonglong mysql_master_log_file_pos(void)
+{
+  DBUG_ASSERT(active_mi && active_mi->rli.sql_thd == current_thd);
+  return active_mi->rli.future_group_master_log_pos;
+}
+
+#else
+
+extern "C"
+const char* mysql_master_log_file_name(void)
+{
+  return NULL;
+}
+
+extern "C"
+ulonglong mysql_master_log_file_pos(void)
+{
+  return 0;
+}
+
+#endif

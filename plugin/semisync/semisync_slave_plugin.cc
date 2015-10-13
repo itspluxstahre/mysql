@@ -1,5 +1,6 @@
 /* Copyright (C) 2007 Google Inc.
    Copyright (C) 2008 MySQL AB
+   Use is subject to license terms
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -161,7 +162,7 @@ static MYSQL_SYSVAR_ULONG(trace_level, rpl_semi_sync_slave_trace_level,
  "The tracing level for semi-sync replication.",
   NULL,				  // check
   &fix_rpl_semi_sync_trace_level, // update
-  32, 0, ~0L, 1);
+  32, 0, ~0UL, 1);
 
 static SYS_VAR* semi_sync_slave_system_vars[]= {
   MYSQL_SYSVAR(enabled),

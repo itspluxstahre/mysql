@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2002, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2002, 2015, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1111,25 +1111,29 @@ sp_create_routine(THD *thd, int type, sp_head *sp)
     if ((sp->m_type == TYPE_ENUM_FUNCTION) &&
         !trust_function_creators && mysql_bin_log.is_open())
     {
-      if (!sp->m_chistics->detistic)
+      enum enum_sp_data_access access=
+        (sp->m_chistics->daccess == SP_DEFAULT_ACCESS) ?
+        SP_DEFAULT_ACCESS_MAPPING : sp->m_chistics->daccess;
+
+      if (thd->variables.binlog_format == BINLOG_FORMAT_ROW)
+      {
+        push_warning(thd, MYSQL_ERROR::WARN_LEVEL_WARN,
+                     ER_BINLOG_UNSAFE_ROUTINE,
+                     ER(ER_BINLOG_UNSAFE_ROUTINE));
+      }
+      else if (!sp->m_chistics->detistic &&
+               (access == SP_CONTAINS_SQL || access == SP_MODIFIES_SQL_DATA))
       {
 	/*
 	  Note that this test is not perfect; one could use
 	  a non-deterministic read-only function in an update statement.
 	*/
-	enum enum_sp_data_access access=
-	  (sp->m_chistics->daccess == SP_DEFAULT_ACCESS) ?
-	  SP_DEFAULT_ACCESS_MAPPING : sp->m_chistics->daccess;
-	if (access == SP_CONTAINS_SQL ||
-	    access == SP_MODIFIES_SQL_DATA)
-	{
 	  my_message(ER_BINLOG_UNSAFE_ROUTINE,
 		     ER(ER_BINLOG_UNSAFE_ROUTINE), MYF(0));
 	  ret= SP_INTERNAL_ERROR;
 	  goto done;
-	}
       }
-      if (!(thd->security_ctx->master_access & SUPER_ACL))
+      else if (!(thd->security_ctx->master_access & SUPER_ACL))
       {
 	my_message(ER_BINLOG_CREATE_ROUTINE_NEED_SUPER,
 		   ER(ER_BINLOG_CREATE_ROUTINE_NEED_SUPER), MYF(0));
@@ -1347,7 +1351,8 @@ sp_update_routine(THD *thd, int type, sp_name *name, st_sp_chistics *chistics)
   if ((ret= db_find_routine_aux(thd, type, name, table)) == SP_OK)
   {
     if (type == TYPE_ENUM_FUNCTION && ! trust_function_creators &&
-        mysql_bin_log.is_open() &&
+        (mysql_bin_log.is_open() &&
+         thd->variables.binlog_format != BINLOG_FORMAT_ROW) &&
         (chistics->daccess == SP_CONTAINS_SQL ||
          chistics->daccess == SP_MODIFIES_SQL_DATA))
     {
@@ -1442,7 +1447,6 @@ bool lock_db_routines(THD *thd, char *db)
 {
   TABLE *table;
   uint key_len;
-  int nxtres= 0;
   Open_tables_backup open_tables_state_backup;
   MDL_request_list mdl_requests;
   Lock_db_routines_error_handler err_handler;
@@ -1468,7 +1472,13 @@ bool lock_db_routines(THD *thd, char *db)
 
   table->field[MYSQL_PROC_FIELD_DB]->store(db, strlen(db), system_charset_info);
   key_len= table->key_info->key_part[0].store_length;
-  table->file->ha_index_init(0, 1);
+  int nxtres= table->file->ha_index_init(0, 1);
+  if (nxtres)
+  {
+    table->file->print_error(nxtres, MYF(0));
+    close_system_tables(thd, &open_tables_state_backup);
+    DBUG_RETURN(true);
+  }
 
   if (! table->file->index_read_map(table->record[0],
                                     table->field[MYSQL_PROC_FIELD_DB]->ptr,
@@ -1478,6 +1488,14 @@ bool lock_db_routines(THD *thd, char *db)
     {
       char *sp_name= get_field(thd->mem_root,
                                table->field[MYSQL_PROC_FIELD_NAME]);
+      if (sp_name == NULL)
+      {
+        table->file->ha_index_end();
+        my_error(ER_SP_WRONG_NAME, MYF(0), "");
+        close_system_tables(thd, &open_tables_state_backup);
+        DBUG_RETURN(true);
+      }
+
       longlong sp_type= table->field[MYSQL_PROC_MYSQL_TYPE]->val_int();
       MDL_request *mdl_request= new (thd->mem_root) MDL_request;
       mdl_request->init(sp_type == TYPE_ENUM_FUNCTION ?
@@ -1532,7 +1550,12 @@ sp_drop_db_routines(THD *thd, char *db)
   key_len= table->key_info->key_part[0].store_length;
 
   ret= SP_OK;
-  table->file->ha_index_init(0, 1);
+  if (table->file->ha_index_init(0, 1))
+  {
+    ret= SP_KEY_NOT_FOUND;
+    goto err_idx_init;
+  }
+
   if (! table->file->index_read_map(table->record[0],
                                     (uchar *)table->field[MYSQL_PROC_FIELD_DB]->ptr,
                                     (key_part_map)1, HA_READ_KEY_EXACT))
@@ -1560,6 +1583,7 @@ sp_drop_db_routines(THD *thd, char *db)
   }
   table->file->ha_index_end();
 
+err_idx_init:
   close_thread_tables(thd);
   /*
     Make sure to only release the MDL lock on mysql.proc, not other

@@ -1,5 +1,4 @@
-# Copyright (c) 2009 Sun Microsystems, Inc.
-# Use is subject to license terms.
+# Copyright (c) 2009, 2013, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -57,13 +56,17 @@ MACRO (MYSQL_CHECK_ZLIB_WITH_COMPRESS)
      INCLUDE(CheckFunctionExists)
       SET(CMAKE_REQUIRED_LIBRARIES z)
       CHECK_FUNCTION_EXISTS(crc32 HAVE_CRC32)
+      CHECK_FUNCTION_EXISTS(compressBound HAVE_COMPRESSBOUND)
+      CHECK_FUNCTION_EXISTS(deflateBound HAVE_DEFLATEBOUND)
       SET(CMAKE_REQUIRED_LIBRARIES)
-      IF(HAVE_CRC32)
+      IF(HAVE_CRC32 AND HAVE_COMPRESSBOUND AND HAVE_DEFLATEBOUND)
         SET(ZLIB_LIBRARY z CACHE INTERNAL "System zlib library")
-        SET(WITH_ZLIB "system" CACHE STRING "Which zlib to use (possible values are 'bundled' or 'system')")
+        SET(WITH_ZLIB "system" CACHE STRING
+          "Which zlib to use (possible values are 'bundled' or 'system')")
         SET(ZLIB_SOURCES "")
       ELSE()
         SET(ZLIB_FOUND FALSE CACHE INTERNAL "Zlib found but not usable")
+        MESSAGE(STATUS "system zlib found but not usable")
       ENDIF()
     ENDIF()
     IF(NOT ZLIB_FOUND)

@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -149,6 +149,23 @@ buf_LRU_block_free_hashed_page(
 /*===========================*/
 	buf_block_t*	block);	/*!< in: block, must contain a file page and
 				be in a state where it can be freed */
+
+/******************************************************************//**
+Increases LRU size in bytes with zip_size for compressed page,
+UNIV_PAGE_SIZE for uncompressed page in inline function */
+static inline
+void
+incr_LRU_size_in_bytes(
+/*===================*/
+	buf_page_t*	bpage,		/*!< in: control block */
+	buf_pool_t*	buf_pool)	/*!< in: buffer pool instance */
+{
+	ulint		zip_size;
+	ut_ad(buf_pool_mutex_own(buf_pool));
+	zip_size = page_zip_get_size(&bpage->zip);
+	buf_pool->stat.LRU_bytes += zip_size ? zip_size : UNIV_PAGE_SIZE;
+	ut_ad(buf_pool->stat.LRU_bytes <= buf_pool->curr_pool_size);
+}
 
 /******************************************************************//**
 Determines if the unzip_LRU list should be used for evicting a victim
@@ -335,39 +352,275 @@ next_page:
 }
 
 /******************************************************************//**
+While flushing (or removing dirty) pages from a tablespace we don't
+want to hog the CPU and resources. Release the buffer pool and block
+mutex and try to force a context switch. Then reacquire the same mutexes.
+The current page is "fixed" before the release of the mutexes and then
+"unfixed" again once we have reacquired the mutexes. */
+static
+void
+buf_flush_yield(
+/*============*/
+	buf_pool_t*	buf_pool,	/*!< in/out: buffer pool instance */
+	buf_page_t*	bpage)		/*!< in/out: current page */
+{
+	mutex_t*	block_mutex;
+
+	ut_ad(buf_pool_mutex_own(buf_pool));
+	ut_ad(buf_page_in_file(bpage));
+
+	block_mutex = buf_page_get_mutex(bpage);
+
+	mutex_enter(block_mutex);
+	/* "Fix" the block so that the position cannot be
+	changed after we release the buffer pool and
+	block mutexes. */
+	buf_page_set_sticky(bpage);
+
+	/* Now it is safe to release the buf_pool->mutex. */
+	buf_pool_mutex_exit(buf_pool);
+
+	mutex_exit(block_mutex);
+	/* Try and force a context switch. */
+	os_thread_yield();
+
+	buf_pool_mutex_enter(buf_pool);
+
+	mutex_enter(block_mutex);
+	/* "Unfix" the block now that we have both the
+	buffer pool and block mutex again. */
+	buf_page_unset_sticky(bpage);
+	mutex_exit(block_mutex);
+}
+
+/******************************************************************//**
+If we have hogged the resources for too long then release the buffer
+pool and flush list mutex and do a thread yield. Set the current page
+to "sticky" so that it is not relocated during the yield.
+@return TRUE if yielded */
+static
+ibool
+buf_flush_try_yield(
+/*================*/
+	buf_pool_t*	buf_pool,	/*!< in/out: buffer pool instance */
+	buf_page_t*	bpage,		/*!< in/out: bpage to remove */
+	ulint		processed)	/*!< in: number of pages processed */
+{
+	/* Every BUF_LRU_DROP_SEARCH_SIZE iterations in the
+	loop we release buf_pool->mutex to let other threads
+	do their job but only if the block is not IO fixed. This
+	ensures that the block stays in its position in the
+	flush_list. */
+
+	if (bpage != NULL
+	    && processed >= BUF_LRU_DROP_SEARCH_SIZE
+	    && buf_page_get_io_fix(bpage) == BUF_IO_NONE) {
+
+		buf_flush_list_mutex_exit(buf_pool);
+
+		/* Release the buffer pool and block mutex
+		to give the other threads a go. */
+
+		buf_flush_yield(buf_pool, bpage);
+
+		buf_flush_list_mutex_enter(buf_pool);
+
+		/* Should not have been removed from the flush
+		list during the yield. However, this check is
+		not sufficient to catch a remove -> add. */
+
+		ut_ad(bpage->in_flush_list);
+
+		return(TRUE);
+	}
+
+	return(FALSE);
+}
+
+/******************************************************************//**
+Removes a single page from a given tablespace inside a specific
+buffer pool instance.
+@return TRUE if page was removed. */
+static
+ibool
+buf_flush_or_remove_page(
+/*=====================*/
+	buf_pool_t*	buf_pool,	/*!< in/out: buffer pool instance */
+	buf_page_t*	bpage)		/*!< in/out: bpage to remove */
+{
+	mutex_t*	block_mutex;
+	ibool		processed = FALSE;
+
+	ut_ad(buf_pool_mutex_own(buf_pool));
+	ut_ad(buf_flush_list_mutex_own(buf_pool));
+
+	block_mutex = buf_page_get_mutex(bpage);
+
+	/* bpage->space and bpage->io_fix are protected by
+	buf_pool->mutex and block_mutex. It is safe to check
+	them while holding buf_pool->mutex only. */
+
+	if (buf_page_get_io_fix(bpage) != BUF_IO_NONE) {
+
+		/* We cannot remove this page during this scan
+		yet; maybe the system is currently reading it
+		in, or flushing the modifications to the file */
+
+	} else {
+
+		/* We have to release the flush_list_mutex to obey the
+		latching order. We are however guaranteed that the page
+		will stay in the flush_list because buf_flush_remove()
+		needs buf_pool->mutex as well (for the non-flush case). */
+
+		buf_flush_list_mutex_exit(buf_pool);
+
+		mutex_enter(block_mutex);
+
+		ut_ad(bpage->oldest_modification != 0);
+
+		if (bpage->buf_fix_count == 0) {
+
+			buf_flush_remove(bpage);
+
+			processed = TRUE;
+		}
+
+		mutex_exit(block_mutex);
+
+		buf_flush_list_mutex_enter(buf_pool);
+	}
+
+	ut_ad(!mutex_own(block_mutex));
+
+	return(processed);
+}
+
+/******************************************************************//**
 Remove all dirty pages belonging to a given tablespace inside a specific
 buffer pool instance when we are deleting the data file(s) of that
 tablespace. The pages still remain a part of LRU and are evicted from
-the list as they age towards the tail of the LRU. */
+the list as they age towards the tail of the LRU.
+@return TRUE if all freed. */
+static
+ibool
+buf_flush_or_remove_pages(
+/*======================*/
+	buf_pool_t*	buf_pool,	/*!< buffer pool instance */
+	ulint		id)		/*!< in: target space id for which
+					to remove or flush pages */
+{
+	buf_page_t*	prev;
+	buf_page_t*	bpage;
+	ulint		processed = 0;
+	ibool		all_freed = TRUE;
+
+	buf_flush_list_mutex_enter(buf_pool);
+
+	for (bpage = UT_LIST_GET_LAST(buf_pool->flush_list);
+	     bpage != NULL;
+	     bpage = prev) {
+
+		ut_a(buf_page_in_file(bpage));
+		ut_ad(bpage->in_flush_list);
+
+		/* Save the previous link because once we free the
+		page we can't rely on the links. */
+
+		prev = UT_LIST_GET_PREV(list, bpage);
+
+		if (buf_page_get_space(bpage) != id) {
+
+			/* Skip this block, as it does not belong to
+			the target space. */
+
+		} else if (!buf_flush_or_remove_page(buf_pool, bpage)) {
+
+			/* Remove was unsuccessful, we have to try again
+			by scanning the entire list from the end. */
+
+			all_freed = FALSE;
+		}
+
+		++processed;
+
+		/* Yield if we have hogged the CPU and mutexes for too long. */
+		if (buf_flush_try_yield(buf_pool, prev, processed)) {
+
+			/* Reset the batch size counter if we had to yield. */
+
+			processed = 0;
+		}
+
+	}
+
+	buf_flush_list_mutex_exit(buf_pool);
+
+	return(all_freed);
+}
+
+/******************************************************************//**
+Remove or flush all the dirty pages that belong to a given tablespace
+inside a specific buffer pool instance. The pages will remain in the LRU
+list and will be evicted from the LRU list as they age and move towards
+the tail of the LRU list. */
 static
 void
-buf_LRU_remove_dirty_pages_for_tablespace(
-/*======================================*/
+buf_flush_dirty_pages(
+/*==================*/
+	buf_pool_t*	buf_pool,	/*!< buffer pool instance */
+	ulint		id)		/*!< in: space id */
+{
+	ibool	all_freed;
+
+	do {
+		buf_pool_mutex_enter(buf_pool);
+
+		all_freed = buf_flush_or_remove_pages(buf_pool, id);
+
+		buf_pool_mutex_exit(buf_pool);
+
+		ut_ad(buf_flush_validate(buf_pool));
+
+		if (!all_freed) {
+			os_thread_sleep(20000);
+		}
+
+	} while (!all_freed);
+}
+
+/******************************************************************//**
+Remove all pages that belong to a given tablespace inside a specific
+buffer pool instance when we are DISCARDing the tablespace. */
+static
+void
+buf_LRU_remove_all_pages(
+/*=====================*/
 	buf_pool_t*	buf_pool,	/*!< buffer pool instance */
 	ulint		id)		/*!< in: space id */
 {
 	buf_page_t*	bpage;
 	ibool		all_freed;
-	ulint		i;
 
 scan_again:
 	buf_pool_mutex_enter(buf_pool);
-	buf_flush_list_mutex_enter(buf_pool);
 
 	all_freed = TRUE;
 
-	for (bpage = UT_LIST_GET_LAST(buf_pool->flush_list), i = 0;
-	     bpage != NULL; ++i) {
+	for (bpage = UT_LIST_GET_LAST(buf_pool->LRU);
+	     bpage != NULL;
+	     /* No op */) {
 
 		buf_page_t*	prev_bpage;
 		mutex_t*	block_mutex = NULL;
 
 		ut_a(buf_page_in_file(bpage));
+		ut_ad(bpage->in_LRU_list);
 
-		prev_bpage = UT_LIST_GET_PREV(list, bpage);
+		prev_bpage = UT_LIST_GET_PREV(LRU, bpage);
 
 		/* bpage->space and bpage->io_fix are protected by
-		buf_pool->mutex and block_mutex. It is safe to check
+		buf_pool->mutex and the block_mutex. It is safe to check
 		them while holding buf_pool->mutex only. */
 
 		if (buf_page_get_space(bpage) != id) {
@@ -381,83 +634,87 @@ scan_again:
 
 			all_freed = FALSE;
 			goto next_page;
+		} else {
+
+			block_mutex = buf_page_get_mutex(bpage);
+			mutex_enter(block_mutex);
+
+			if (bpage->buf_fix_count > 0) {
+
+				mutex_exit(block_mutex);
+
+				/* We cannot remove this page during
+				this scan yet; maybe the system is
+				currently reading it in, or flushing
+				the modifications to the file */
+
+				all_freed = FALSE;
+
+				goto next_page;
+			}
 		}
 
-		/* We have to release the flush_list_mutex to obey the
-		latching order. We are however guaranteed that the page
-		will stay in the flush_list because buf_flush_remove()
-		needs buf_pool->mutex as well. */
-		buf_flush_list_mutex_exit(buf_pool);
-		block_mutex = buf_page_get_mutex(bpage);
-		mutex_enter(block_mutex);
+		ut_ad(mutex_own(block_mutex));
 
-		if (bpage->buf_fix_count > 0) {
+#ifdef UNIV_DEBUG
+		if (buf_debug_prints) {
+			fprintf(stderr,
+				"Dropping space %lu page %lu\n",
+				(ulong) buf_page_get_space(bpage),
+				(ulong) buf_page_get_page_no(bpage));
+		}
+#endif
+		if (buf_page_get_state(bpage) != BUF_BLOCK_FILE_PAGE) {
+			/* Do nothing, because the adaptive hash index
+			covers uncompressed pages only. */
+		} else if (((buf_block_t*) bpage)->index) {
+			ulint	page_no;
+			ulint	zip_size;
+
+			buf_pool_mutex_exit(buf_pool);
+
+			zip_size = buf_page_get_zip_size(bpage);
+			page_no = buf_page_get_page_no(bpage);
+
 			mutex_exit(block_mutex);
-			buf_flush_list_mutex_enter(buf_pool);
 
-			/* We cannot remove this page during
-			this scan yet; maybe the system is
-			currently reading it in, or flushing
-			the modifications to the file */
+			/* Note that the following call will acquire
+			and release block->lock X-latch. */
 
-			all_freed = FALSE;
-			goto next_page;
+			btr_search_drop_page_hash_when_freed(
+				id, zip_size, page_no);
+
+			goto scan_again;
 		}
 
-		ut_ad(bpage->oldest_modification != 0);
+		if (bpage->oldest_modification != 0) {
+			buf_flush_remove(bpage);
+		}
 
-		buf_flush_remove(bpage);
+		ut_ad(!bpage->in_flush_list);
 
-		mutex_exit(block_mutex);
-		buf_flush_list_mutex_enter(buf_pool);
+		/* Remove from the LRU list. */
+
+		if (buf_LRU_block_remove_hashed_page(bpage, TRUE)
+		    != BUF_BLOCK_ZIP_FREE) {
+
+			buf_LRU_block_free_hashed_page((buf_block_t*) bpage);
+			mutex_exit(block_mutex);
+
+		} else {
+			/* The block_mutex should have been released
+			by buf_LRU_block_remove_hashed_page() when it
+			returns BUF_BLOCK_ZIP_FREE. */
+			ut_ad(block_mutex == &buf_pool->zip_mutex);
+		}
+
+		ut_ad(!mutex_own(block_mutex));
+
 next_page:
 		bpage = prev_bpage;
-
-		if (!bpage) {
-			break;
-		}
-
-		/* Every BUF_LRU_DROP_SEARCH_SIZE iterations in the
-		loop we release buf_pool->mutex to let other threads
-		do their job. */
-		if (i < BUF_LRU_DROP_SEARCH_SIZE) {
-			continue;
-		}
-
-		/* We IO-fix the block to make sure that the block
-		stays in its position in the flush_list. */
-		if (buf_page_get_io_fix(bpage) != BUF_IO_NONE) {
-			/* Block is already IO-fixed. We don't
-			want to change the value. Lets leave
-			this block alone. */
-			continue;
-		}
-
-		buf_flush_list_mutex_exit(buf_pool);
-		block_mutex = buf_page_get_mutex(bpage);
-		mutex_enter(block_mutex);
-		buf_page_set_sticky(bpage);
-		mutex_exit(block_mutex);
-
-		/* Now it is safe to release the buf_pool->mutex. */
-		buf_pool_mutex_exit(buf_pool);
-		os_thread_yield();
-		buf_pool_mutex_enter(buf_pool);
-
-		mutex_enter(block_mutex);
-		buf_page_unset_sticky(bpage);
-		mutex_exit(block_mutex);
-
-		buf_flush_list_mutex_enter(buf_pool);
-		ut_ad(bpage->in_flush_list);
-
-		i = 0;
 	}
 
 	buf_pool_mutex_exit(buf_pool);
-	buf_flush_list_mutex_exit(buf_pool);
-
-	ut_ad(buf_flush_validate(buf_pool));
 
 	if (!all_freed) {
 		os_thread_sleep(20000);
@@ -467,28 +724,46 @@ next_page:
 }
 
 /******************************************************************//**
-Invalidates all pages belonging to a given tablespace when we are deleting
-the data file(s) of that tablespace. */
+Removes all pages belonging to a given tablespace. */
 UNIV_INTERN
 void
-buf_LRU_invalidate_tablespace(
+buf_LRU_flush_or_remove_pages(
 /*==========================*/
-	ulint	id)	/*!< in: space id */
+	ulint			id,	/*!< in: space id */
+	enum buf_remove_t	buf_remove)/*!< in: remove or flush
+					strategy */
 {
-	ulint	i;
+	ulint		i;
 
-	/* Before we attempt to drop pages one by one we first
-	attempt to drop page hash index entries in batches to make
-	it more efficient. The batching attempt is a best effort
-	attempt and does not guarantee that all pages hash entries
-	will be dropped. We get rid of remaining page hash entries
-	one by one below. */
 	for (i = 0; i < srv_buf_pool_instances; i++) {
 		buf_pool_t*	buf_pool;
 
 		buf_pool = buf_pool_from_array(i);
-		buf_LRU_drop_page_hash_for_tablespace(buf_pool, id);
-		buf_LRU_remove_dirty_pages_for_tablespace(buf_pool, id);
+
+		switch (buf_remove) {
+		case BUF_REMOVE_ALL_NO_WRITE:
+			/* A DISCARD tablespace case. Remove AHI entries
+			and evict all pages from LRU. */
+
+			/* Before we attempt to drop pages hash entries
+			one by one we first attempt to drop page hash
+			index entries in batches to make it more
+			efficient. The batching attempt is a best effort
+			attempt and does not guarantee that all pages
+			hash entries will be dropped. We get rid of
+			remaining page hash entries one by one below. */
+			buf_LRU_drop_page_hash_for_tablespace(buf_pool, id);
+			buf_LRU_remove_all_pages(buf_pool, id);
+			break;
+
+		case BUF_REMOVE_FLUSH_NO_WRITE:
+			/* A DROP table case. AHI entries are already
+			removed. No need to evict all pages from LRU
+			list. Just evict pages from flush list without
+			writing. */
+			buf_flush_dirty_pages(buf_pool, id);
+			break;
+		}
 	}
 }
 
@@ -546,6 +821,8 @@ buf_LRU_free_from_unzip_LRU_list(
 {
 	buf_block_t*	block;
 	ulint		distance;
+	ulint		scanned = 0;
+	ibool		freed = FALSE;
 
 	ut_ad(buf_pool_mutex_own(buf_pool));
 
@@ -569,8 +846,6 @@ buf_LRU_free_from_unzip_LRU_list(
 	     UNIV_LIKELY(block != NULL) && UNIV_LIKELY(distance > 0);
 	     block = UT_LIST_GET_PREV(unzip_LRU, block), distance--) {
 
-		ibool freed;
-
 		ut_ad(buf_block_get_state(block) == BUF_BLOCK_FILE_PAGE);
 		ut_ad(block->in_unzip_LRU_list);
 		ut_ad(block->page.in_LRU_list);
@@ -579,12 +854,16 @@ buf_LRU_free_from_unzip_LRU_list(
 		freed = buf_LRU_free_block(&block->page, FALSE);
 		mutex_exit(&block->mutex);
 
+		scanned++;
+
 		if (freed) {
-			return(TRUE);
+			break;
 		}
 	}
 
-	return(FALSE);
+	srv_buf_pool_LRU_unzip_search_scanned += scanned;
+
+	return(freed);
 }
 
 /******************************************************************//**
@@ -605,6 +884,8 @@ buf_LRU_free_from_common_LRU_list(
 {
 	buf_page_t*	bpage;
 	ulint		distance;
+	ibool		freed = FALSE;
+	ulint		scanned = 0;
 
 	ut_ad(buf_pool_mutex_own(buf_pool));
 
@@ -614,9 +895,10 @@ buf_LRU_free_from_common_LRU_list(
 	     UNIV_LIKELY(bpage != NULL) && UNIV_LIKELY(distance > 0);
 	     bpage = UT_LIST_GET_PREV(LRU, bpage), distance--) {
 
-		ibool		freed;
 		unsigned	accessed;
 		mutex_t*	block_mutex = buf_page_get_mutex(bpage);
+
+		scanned++;
 
 		ut_ad(buf_page_in_file(bpage));
 		ut_ad(bpage->in_LRU_list);
@@ -633,11 +915,13 @@ buf_LRU_free_from_common_LRU_list(
 			if (!accessed) {
 				++buf_pool->stat.n_ra_pages_evicted;
 			}
-			return(TRUE);
+			break;
 		}
 	}
 
-	return(FALSE);
+	srv_buf_pool_LRU_search_scanned += scanned;
+
+	return(freed);
 }
 
 /******************************************************************//**
@@ -807,6 +1091,8 @@ buf_LRU_get_free_block(
 	ulint		n_iterations	= 1;
 	ibool		mon_value_was	= FALSE;
 	ibool		started_monitor	= FALSE;
+
+	srv_buf_pool_LRU_get_free_search++;
 loop:
 	buf_pool_mutex_enter(buf_pool);
 
@@ -1098,6 +1384,7 @@ buf_LRU_remove_block(
 	buf_page_t*	bpage)	/*!< in: control block */
 {
 	buf_pool_t*	buf_pool = buf_pool_from_bpage(bpage);
+	ulint		zip_size;
 
 	ut_ad(buf_pool);
 	ut_ad(bpage);
@@ -1132,6 +1419,9 @@ buf_LRU_remove_block(
 	/* Remove the block from the LRU list */
 	UT_LIST_REMOVE(LRU, buf_pool->LRU, bpage);
 	ut_d(bpage->in_LRU_list = FALSE);
+
+	zip_size = page_zip_get_size(&bpage->zip);
+	buf_pool->stat.LRU_bytes -= zip_size ? zip_size : UNIV_PAGE_SIZE;
 
 	buf_unzip_LRU_remove_block_if_needed(bpage);
 
@@ -1193,7 +1483,10 @@ buf_unzip_LRU_add_block(
 }
 
 /******************************************************************//**
-Adds a block to the LRU list end. */
+Adds a block to the LRU list end. Please make sure that the zip_size is
+already set into the page zip when invoking the function, so that we
+can get correct zip_size from the buffer page when adding a block
+into LRU */
 UNIV_INLINE
 void
 buf_LRU_add_block_to_end_low(
@@ -1211,6 +1504,8 @@ buf_LRU_add_block_to_end_low(
 	ut_ad(!bpage->in_LRU_list);
 	UT_LIST_ADD_LAST(LRU, buf_pool->LRU, bpage);
 	ut_d(bpage->in_LRU_list = TRUE);
+
+	incr_LRU_size_in_bytes(bpage, buf_pool);
 
 	if (UT_LIST_GET_LEN(buf_pool->LRU) > BUF_LRU_OLD_MIN_LEN) {
 
@@ -1240,7 +1535,10 @@ buf_LRU_add_block_to_end_low(
 }
 
 /******************************************************************//**
-Adds a block to the LRU list. */
+Adds a block to the LRU list. Please make sure that the zip_size is
+already set into the page zip when invoking the function, so that we
+can get correct zip_size from the buffer page when adding a block
+into LRU */
 UNIV_INLINE
 void
 buf_LRU_add_block_low(
@@ -1282,6 +1580,8 @@ buf_LRU_add_block_low(
 
 	ut_d(bpage->in_LRU_list = TRUE);
 
+	incr_LRU_size_in_bytes(bpage, buf_pool);
+
 	if (UT_LIST_GET_LEN(buf_pool->LRU) > BUF_LRU_OLD_MIN_LEN) {
 
 		ut_ad(buf_pool->LRU_old);
@@ -1309,7 +1609,10 @@ buf_LRU_add_block_low(
 }
 
 /******************************************************************//**
-Adds a block to the LRU list. */
+Adds a block to the LRU list. Please make sure that the zip_size is
+already set into the page zip when invoking the function, so that we
+can get correct zip_size from the buffer page when adding a block
+into LRU */
 UNIV_INTERN
 void
 buf_LRU_add_block(
@@ -1494,6 +1797,8 @@ alloc:
 #endif
 				UT_LIST_INSERT_AFTER(LRU, buf_pool->LRU,
 						     prev_b, b);
+
+				incr_LRU_size_in_bytes(b, buf_pool);
 
 				if (buf_page_is_old(b)) {
 					buf_pool->LRU_old_len++;
@@ -1740,7 +2045,9 @@ buf_LRU_block_remove_hashed_page(
 				break;
 			case FIL_PAGE_INDEX:
 #ifdef UNIV_ZIP_DEBUG
-				ut_a(page_zip_validate(&bpage->zip, page));
+				ut_a(page_zip_validate(
+					     &bpage->zip, page,
+					     ((buf_block_t*) bpage)->index));
 #endif /* UNIV_ZIP_DEBUG */
 				break;
 			default:
@@ -1906,9 +2213,23 @@ buf_LRU_free_one_page(
 				be in a state where it can be freed; there
 				may or may not be a hash index to the page */
 {
+#ifdef UNIV_DEBUG
+	buf_pool_t*	buf_pool = buf_pool_from_bpage(bpage);
+#endif
+	mutex_t*	block_mutex = buf_page_get_mutex(bpage);
+
+	ut_ad(buf_pool_mutex_own(buf_pool));
+	ut_ad(mutex_own(block_mutex));
+
 	if (buf_LRU_block_remove_hashed_page(bpage, TRUE)
 	    != BUF_BLOCK_ZIP_FREE) {
 		buf_LRU_block_free_hashed_page((buf_block_t*) bpage);
+	} else {
+		/* The block_mutex should have been released by
+		buf_LRU_block_remove_hashed_page() when it returns
+		BUF_BLOCK_ZIP_FREE. */
+		ut_ad(block_mutex == &buf_pool->zip_mutex);
+		mutex_enter(block_mutex);
 	}
 }
 

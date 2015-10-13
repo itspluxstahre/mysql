@@ -1,4 +1,4 @@
-/* Copyright (c) 2002, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 #include "sql_priv.h"
 #include "unireg.h"
@@ -297,8 +297,14 @@ int get_topics_for_keyword(THD *thd, TABLE *topics, TABLE *relations,
   rtopic_id= find_fields[help_relation_help_topic_id].field;
   rkey_id=   find_fields[help_relation_help_keyword_id].field;
 
-  topics->file->ha_index_init(iindex_topic,1);
-  relations->file->ha_index_init(iindex_relations,1);
+  if (topics->file->ha_index_init(iindex_topic,1) ||
+      relations->file->ha_index_init(iindex_relations,1))
+  {
+    if (topics->file->inited)
+      topics->file->ha_index_end();
+    my_message(ER_CORRUPT_HELP_DB, ER(ER_CORRUPT_HELP_DB), MYF(0));
+    DBUG_RETURN(-1);
+  }
 
   rkey_id->store((longlong) key_id, TRUE);
   rkey_id->get_key_image(buff, rkey_id->pack_length(), Field::itRAW);

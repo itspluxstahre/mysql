@@ -37,6 +37,10 @@
 #include <ft_global.h>
 #include <keycache.h>
 
+#if MAX_KEY > 128
+#error MAX_KEY is too large.  Values up to 128 are supported.
+#endif
+
 // the following is for checking tables
 
 #define HA_ADMIN_ALREADY_DONE	  1
@@ -383,6 +387,25 @@ enum enum_binlog_command {
 /** Unused. Reserved for future versions. */
 #define HA_CREATE_USED_PAGE_CHECKSUM    (1L << 21)
 
+
+/*
+  This is master database for most of system tables. However there
+  can be other databases which can hold system tables. Respective
+  storage engines define their own system database names.
+*/
+extern const char *mysqld_system_database;
+
+/*
+  Structure to hold list of system_database.system_table.
+  This is used at both mysqld and storage engine layer.
+*/
+struct st_system_tablename
+{
+  const char *db;
+  const char *tablename;
+};
+
+
 typedef ulonglong my_xid; // this line is the same as in log_event.h
 #define MYSQL_XID_PREFIX "MySQLXid"
 #define MYSQL_XID_PREFIX_LEN 8 // must be a multiple of 8
@@ -561,10 +584,12 @@ struct TABLE;
 enum enum_schema_tables
 {
   SCH_CHARSETS= 0,
+  SCH_CLIENT_STATS,
   SCH_COLLATIONS,
   SCH_COLLATION_CHARACTER_SET_APPLICABILITY,
   SCH_COLUMNS,
   SCH_COLUMN_PRIVILEGES,
+  SCH_INDEX_STATS,
   SCH_ENGINES,
   SCH_EVENTS,
   SCH_FILES,
@@ -577,6 +602,7 @@ enum enum_schema_tables
   SCH_PLUGINS,
   SCH_PROCESSLIST,
   SCH_PROFILES,
+  SCH_QUERY_STATISTICS,
   SCH_REFERENTIAL_CONSTRAINTS,
   SCH_PROCEDURES,
   SCH_SCHEMATA,
@@ -590,8 +616,11 @@ enum enum_schema_tables
   SCH_TABLE_CONSTRAINTS,
   SCH_TABLE_NAMES,
   SCH_TABLE_PRIVILEGES,
+  SCH_TABLE_STATS,
+  SCH_THREAD_STATS,
   SCH_TRIGGERS,
   SCH_USER_PRIVILEGES,
+  SCH_USER_STATS,
   SCH_VARIABLES,
   SCH_VIEWS
 };
@@ -808,6 +837,39 @@ struct handlerton
                      const char *wild, bool dir, List<LEX_STRING> *files);
    int (*table_exists_in_engine)(handlerton *hton, THD* thd, const char *db,
                                  const char *name);
+
+  /**
+    List of all system tables specific to the SE.
+    Array element would look like below,
+     { "<database_name>", "<system table name>" },
+    The last element MUST be,
+     { (const char*)NULL, (const char*)NULL }
+
+    @see ha_example_system_tables in ha_example.cc
+
+    This interface is optional, so every SE need not implement it.
+  */
+  const char* (*system_database)();
+
+  /**
+    Check if the given db.tablename is a system table for this SE.
+
+    @param db                         Database name to check.
+    @param table_name                 table name to check.
+    @param is_sql_layer_system_table  if the supplied db.table_name is a SQL
+                                      layer system table.
+
+    @see example_is_supported_system_table in ha_example.cc
+
+    is_sql_layer_system_table is supplied to make more efficient
+    checks possible for SEs that support all SQL layer tables.
+
+    This interface is optional, so every SE need not implement it.
+  */
+  bool (*is_supported_system_table)(const char *db,
+                                    const char *table_name,
+                                    bool is_sql_layer_system_table);
+
    uint32 license; /* Flag for Engine License */
    void *data; /* Location for engines to keep personal structures */
 };
@@ -824,6 +886,7 @@ struct handlerton
 #define HTON_TEMPORARY_NOT_SUPPORTED (1 << 6) //Having temporary tables not supported
 #define HTON_SUPPORT_LOG_TABLES      (1 << 7) //Engine supports log tables
 #define HTON_NO_PARTITION            (1 << 8) //You can not partition these tables
+#define HTON_SUPPORTS_FOREIGN_KEYS   (1 << 9) //Foreign key constraint supported.
 
 class Ha_trx_info;
 
@@ -1156,6 +1219,23 @@ public:
   {}
 };
 
+/** Statistics counters for handler operations. */
+struct ha_operations_statistics
+{
+  ulong ha_read_first_count;
+  ulong ha_read_last_count;
+  ulong ha_read_key_count;
+  ulong ha_read_next_count;
+  ulong ha_read_prev_count;
+  ulong ha_read_rnd_count;
+  ulong ha_read_rnd_next_count;
+  ulong ha_delete_count;
+  ulong ha_update_count;
+  ulong ha_write_count;
+};
+
+typedef struct ha_operations_statistics HOS;
+
 uint calculate_key_len(TABLE *, uint, const uchar *, key_part_map);
 /*
   bitmap with first N+1 bits set
@@ -1214,6 +1294,10 @@ public:
 
   ha_statistics stats;
 
+  /** Counters for handler operations. */
+  ha_operations_statistics ops_stats;
+  ha_operations_statistics ops_index_stats[MAX_KEY];
+
   /** The following are for read_multi_range */
   bool multi_range_sorted;
   KEY_MULTI_RANGE *multi_range_curr;
@@ -1236,6 +1320,9 @@ public:
   bool locked;
   bool implicit_emptied;                /* Can be !=0 only if HEAP */
   const COND *pushed_cond;
+  ulonglong rows_read;
+  ulonglong rows_changed;
+  ulonglong index_rows_read[MAX_KEY];
   /**
     next_insert_id is the next value which should be inserted into the
     auto_increment column: in a inserting-multi-row statement (like INSERT
@@ -1283,14 +1370,18 @@ public:
   handler(handlerton *ht_arg, TABLE_SHARE *share_arg)
     :table_share(share_arg), table(0),
     estimation_rows_to_insert(0), ht(ht_arg),
-    ref(0), key_used_on_scan(MAX_KEY), active_index(MAX_KEY),
+    ref(0), ops_stats(),
+    key_used_on_scan(MAX_KEY), active_index(MAX_KEY),
     ref_length(sizeof(my_off_t)),
     ft_handler(0), inited(NONE),
     locked(FALSE), implicit_emptied(0),
-    pushed_cond(0), next_insert_id(0), insert_id_for_cur_row(0),
+    pushed_cond(0), rows_read(0), rows_changed(0), next_insert_id(0), insert_id_for_cur_row(0),
     auto_inc_intervals_count(0),
     m_psi(NULL)
-    {}
+    {
+      memset(index_rows_read, 0, sizeof(index_rows_read));
+      memset(ops_index_stats, 0, sizeof(ops_index_stats));
+    }
   virtual ~handler(void)
   {
     DBUG_ASSERT(locked == FALSE);
@@ -1307,6 +1398,7 @@ public:
   int ha_open(TABLE *table, const char *name, int mode, int test_if_locked);
   int ha_index_init(uint idx, bool sorted)
   {
+    DBUG_EXECUTE_IF("ha_index_init_fail", return HA_ERR_TABLE_DEF_CHANGED;);
     int result;
     DBUG_ENTER("ha_index_init");
     DBUG_ASSERT(inited==NONE);
@@ -1323,6 +1415,7 @@ public:
   }
   int ha_rnd_init(bool scan)
   {
+    DBUG_EXECUTE_IF("ha_rnd_init_fail", return HA_ERR_TABLE_DEF_CHANGED;);
     int result;
     DBUG_ENTER("ha_rnd_init");
     DBUG_ASSERT(inited==NONE || (inited==RND && scan));
@@ -1413,6 +1506,10 @@ public:
   {
     table= table_arg;
     table_share= share;
+    rows_read = rows_changed= 0;
+    memset(&ops_stats, 0, sizeof(ops_stats));
+    memset(index_rows_read, 0, sizeof(index_rows_read));
+    memset(ops_index_stats, 0, sizeof(ops_index_stats));
   }
   virtual double scan_time()
   { return ulonglong2double(stats.data_file_length) / IO_SIZE + 2; }
@@ -1808,6 +1905,8 @@ public:
   virtual bool is_crashed() const  { return 0; }
   virtual bool auto_repair() const { return 0; }
 
+  void update_global_table_stats();
+  void update_global_index_stats();
 
 #define CHF_CREATE_FLAG 0
 #define CHF_DELETE_FLAG 1
@@ -1944,7 +2043,7 @@ public:
 
 protected:
   /* Service methods for use by storage engines. */
-  void ha_statistic_increment(ulong SSV::*offset) const;
+  void ha_statistic_increment(ulong HOS::*hos_offset, ulong SSV::*ssv_offset);
   void **ha_data(THD *) const;
   THD *ha_thd(void) const;
 
@@ -2173,6 +2272,7 @@ private:
   { return HA_ERR_WRONG_COMMAND; }
 };
 
+#define ha_macro_statistic_inc(m) ha_statistic_increment(&HOS::m, &SSV::m)
 
 	/* Some extern variables used with handlers */
 
@@ -2247,6 +2347,8 @@ int ha_discover(THD* thd, const char* dbname, const char* name,
 int ha_find_files(THD *thd,const char *db,const char *path,
                   const char *wild, bool dir, List<LEX_STRING>* files);
 int ha_table_exists_in_engine(THD* thd, const char* db, const char* name);
+bool ha_check_if_supported_system_table(handlerton *hton, const char* db, 
+                                        const char* table_name);
 
 /* key cache */
 extern "C" int ha_init_key_cache(const char *name, KEY_CACHE *key_cache);
@@ -2313,5 +2415,7 @@ inline const char *table_case_name(HA_CREATE_INFO *info, const char *name)
 {
   return ((lower_case_table_names == 2 && info->alias) ? info->alias : name);
 }
+
+void print_handler_error(TABLE *, int error);
 
 #endif /* HANDLER_INCLUDED */

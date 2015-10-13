@@ -21,7 +21,7 @@ Public License for more details.
 
 You should have received a copy of the GNU General Public License along
 with this program; if not, write to the Free Software Foundation, Inc.,
-59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 ***********************************************************************/
 
@@ -324,7 +324,7 @@ to original un-instrumented file I/O APIs */
 	os_file_create_func(name, create, purpose, type, success)
 
 # define os_file_create_simple(key, name, create, access, success)	\
-	os_file_create_simple_func(name, create_mode, access, success)
+	os_file_create_simple_func(name, create, access, success)
 
 # define os_file_create_simple_no_error_handling(			\
 		key, name, create_mode, access, success)		\

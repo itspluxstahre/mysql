@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -148,7 +148,7 @@ page_dir_find_owner_slot(
 			fputs("\n"
 			      "InnoDB: on that page!\n", stderr);
 
-			buf_page_print(page, 0);
+			buf_page_print(page, 0, 0);
 
 			ut_error;
 		}
@@ -569,8 +569,10 @@ page_copy_rec_list_end_no_locks(
 			/* Track an assertion failure reported on the mailing
 			list on June 18th, 2003 */
 
-			buf_page_print(new_page, 0);
-			buf_page_print(page_align(rec), 0);
+			buf_page_print(new_page, 0,
+				       BUF_PAGE_PRINT_NO_CRASH);
+			buf_page_print(page_align(rec), 0,
+				       BUF_PAGE_PRINT_NO_CRASH);
 			ut_print_timestamp(stderr);
 
 			fprintf(stderr,
@@ -624,7 +626,7 @@ page_copy_rec_list_end(
 		Furthermore, btr_compress() may set FIL_PAGE_PREV to
 		FIL_NULL on new_page while leaving it intact on
 		new_page_zip.  So, we cannot validate new_page_zip. */
-		ut_a(page_zip_validate_low(page_zip, page, TRUE));
+		ut_a(page_zip_validate_low(page_zip, page, index, TRUE));
 	}
 #endif /* UNIV_ZIP_DEBUG */
 	ut_ad(buf_block_get_frame(block) == page);
@@ -779,17 +781,23 @@ page_copy_rec_list_start(
 	if (UNIV_LIKELY_NULL(new_page_zip)) {
 		mtr_set_log_mode(mtr, log_mode);
 
+		DBUG_EXECUTE_IF("page_copy_rec_list_start_compress_fail",
+				goto zip_reorganize;);
+
 		if (UNIV_UNLIKELY
 		    (!page_zip_compress(new_page_zip, new_page, index, mtr))) {
+			ulint	ret_pos;
+#ifndef DBUG_OFF
+zip_reorganize:
+#endif /* DBUG_OFF */
 			/* Before trying to reorganize the page,
 			store the number of preceding records on the page. */
-			ulint	ret_pos
-				= page_rec_get_n_recs_before(ret);
+			ret_pos = page_rec_get_n_recs_before(ret);
 			/* Before copying, "ret" was the predecessor
 			of the predefined supremum record.  If it was
 			the predefined infimum record, then it would
-			still be the infimum.  Thus, the assertion
-			ut_a(ret_pos > 0) would fail here. */
+			still be the infimum, and we would have
+			ret_pos == 0. */
 
 			if (UNIV_UNLIKELY
 			    (!page_zip_reorganize(new_block, index, mtr))) {
@@ -805,15 +813,10 @@ page_copy_rec_list_start(
 				btr_blob_dbg_add(new_page, index,
 						 "copy_start_reorg_fail");
 				return(NULL);
-			} else {
-				/* The page was reorganized:
-				Seek to ret_pos. */
-				ret = new_page + PAGE_NEW_INFIMUM;
-
-				do {
-					ret = rec_get_next_ptr(ret, TRUE);
-				} while (--ret_pos);
 			}
+
+			/* The page was reorganized: Seek to ret_pos. */
+			ret = page_rec_get_nth(new_page, ret_pos);
 		}
 	}
 
@@ -943,7 +946,7 @@ page_delete_rec_list_end(
 	ut_ad(size == ULINT_UNDEFINED || size < UNIV_PAGE_SIZE);
 	ut_ad(!page_zip || page_rec_is_comp(rec));
 #ifdef UNIV_ZIP_DEBUG
-	ut_a(!page_zip || page_zip_validate(page_zip, page));
+	ut_a(!page_zip || page_zip_validate(page_zip, page, index));
 #endif /* UNIV_ZIP_DEBUG */
 
 	if (page_rec_is_infimum(rec)) {
@@ -985,7 +988,7 @@ page_delete_rec_list_end(
 						  ULINT_UNDEFINED, &heap);
 			rec = rec_get_next_ptr(rec, TRUE);
 #ifdef UNIV_ZIP_DEBUG
-			ut_a(page_zip_validate(page_zip, page));
+			ut_a(page_zip_validate(page_zip, page, index));
 #endif /* UNIV_ZIP_DEBUG */
 			page_cur_delete_rec(&cur, index, offsets, mtr);
 		} while (page_offset(rec) != PAGE_NEW_SUPREMUM);
@@ -1049,6 +1052,7 @@ page_delete_rec_list_end(
 
 		n_owned = rec_get_n_owned_new(rec2) - count;
 		slot_index = page_dir_find_owner_slot(rec2);
+		ut_ad(slot_index > 0);
 		slot = page_dir_get_nth_slot(page, slot_index);
 	} else {
 		rec_t*	rec2	= rec;
@@ -1064,6 +1068,7 @@ page_delete_rec_list_end(
 
 		n_owned = rec_get_n_owned_old(rec2) - count;
 		slot_index = page_dir_find_owner_slot(rec2);
+		ut_ad(slot_index > 0);
 		slot = page_dir_get_nth_slot(page, slot_index);
 	}
 
@@ -1123,7 +1128,8 @@ page_delete_rec_list_start(
 		between btr_attach_half_pages() and insert_page = ...
 		when btr_page_get_split_rec_to_left() holds
 		(direction == FSP_DOWN). */
-		ut_a(!page_zip || page_zip_validate_low(page_zip, page, TRUE));
+		ut_a(!page_zip
+		     || page_zip_validate_low(page_zip, page, index, TRUE));
 	}
 #endif /* UNIV_ZIP_DEBUG */
 
@@ -1194,9 +1200,10 @@ page_move_rec_list_end(
 			= buf_block_get_page_zip(block);
 		ut_a(!new_page_zip == !page_zip);
 		ut_a(!new_page_zip
-		     || page_zip_validate(new_page_zip, new_page));
+		     || page_zip_validate(new_page_zip, new_page, index));
 		ut_a(!page_zip
-		     || page_zip_validate(page_zip, page_align(split_rec)));
+		     || page_zip_validate(page_zip, page_align(split_rec),
+					  index));
 	}
 #endif /* UNIV_ZIP_DEBUG */
 
@@ -1452,55 +1459,58 @@ page_dir_balance_slot(
 	}
 }
 
-#ifndef UNIV_HOTBACKUP
 /************************************************************//**
-Returns the middle record of the record list. If there are an even number
-of records in the list, returns the first record of the upper half-list.
-@return	middle record */
+Returns the nth record of the record list.
+This is the inverse function of page_rec_get_n_recs_before().
+@return	nth record */
 UNIV_INTERN
-rec_t*
-page_get_middle_rec(
-/*================*/
-	page_t*	page)	/*!< in: page */
+const rec_t*
+page_rec_get_nth_const(
+/*===================*/
+	const page_t*	page,	/*!< in: page */
+	ulint		nth)	/*!< in: nth record */
 {
-	page_dir_slot_t*	slot;
-	ulint			middle;
+	const page_dir_slot_t*	slot;
 	ulint			i;
 	ulint			n_owned;
-	ulint			count;
-	rec_t*			rec;
+	const rec_t*		rec;
 
-	/* This many records we must leave behind */
-	middle = (page_get_n_recs(page) + PAGE_HEAP_NO_USER_LOW) / 2;
+	if (nth == 0) {
+		return(page_get_infimum_rec(page));
+	}
 
-	count = 0;
+	ut_ad(nth < UNIV_PAGE_SIZE / (REC_N_NEW_EXTRA_BYTES + 1));
 
 	for (i = 0;; i++) {
 
 		slot = page_dir_get_nth_slot(page, i);
 		n_owned = page_dir_slot_get_n_owned(slot);
 
-		if (count + n_owned > middle) {
+		if (n_owned > nth) {
 			break;
 		} else {
-			count += n_owned;
+			nth -= n_owned;
 		}
 	}
 
 	ut_ad(i > 0);
 	slot = page_dir_get_nth_slot(page, i - 1);
-	rec = (rec_t*) page_dir_slot_get_rec(slot);
-	rec = page_rec_get_next(rec);
+	rec = page_dir_slot_get_rec(slot);
 
-	/* There are now count records behind rec */
-
-	for (i = 0; i < middle - count; i++) {
-		rec = page_rec_get_next(rec);
+	if (page_is_comp(page)) {
+		do {
+			rec = page_rec_get_next_low(rec, TRUE);
+			ut_ad(rec);
+		} while (nth--);
+	} else {
+		do {
+			rec = page_rec_get_next_low(rec, FALSE);
+			ut_ad(rec);
+		} while (nth--);
 	}
 
 	return(rec);
 }
-#endif /* !UNIV_HOTBACKUP */
 
 /***************************************************************//**
 Returns the number of records before the given record in chain.
@@ -1562,6 +1572,7 @@ page_rec_get_n_recs_before(
 	n--;
 
 	ut_ad(n >= 0);
+	ut_ad(n < UNIV_PAGE_SIZE / (REC_N_NEW_EXTRA_BYTES + 1));
 
 	return((ulint) n);
 }
@@ -1834,7 +1845,7 @@ page_check_dir(
 		fprintf(stderr,
 			"InnoDB: Page directory corruption:"
 			" infimum not pointed to\n");
-		buf_page_print(page, 0);
+		buf_page_print(page, 0, 0);
 	}
 
 	if (UNIV_UNLIKELY(!page_rec_is_supremum_low(supremum_offs))) {
@@ -1842,7 +1853,7 @@ page_check_dir(
 		fprintf(stderr,
 			"InnoDB: Page directory corruption:"
 			" supremum not pointed to\n");
-		buf_page_print(page, 0);
+		buf_page_print(page, 0, 0);
 	}
 }
 #endif /* !UNIV_HOTBACKUP */
@@ -2546,7 +2557,7 @@ func_exit2:
 			(ulong) page_get_space_id(page),
 			(ulong) page_get_page_no(page),
 			index->name);
-		buf_page_print(page, 0);
+		buf_page_print(page, 0, 0);
 	}
 
 	return(ret);

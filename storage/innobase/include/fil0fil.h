@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2010, Innobase Oy. All Rights Reserved.
+Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -30,6 +30,7 @@ Created 10/25/1995 Heikki Tuuri
 #include "dict0types.h"
 #include "ut0byte.h"
 #include "os0file.h"
+#include "mem0mem.h"
 #ifndef UNIV_HOTBACKUP
 #include "sync0rw.h"
 #include "ibuf0types.h"
@@ -163,6 +164,21 @@ extern ulint	fil_n_pending_tablespace_flushes;
 extern ulint	fil_n_tablespace_opened;
 /** Number of tablespace files closed. */
 extern ulint	fil_n_tablespace_closed;
+
+/** Space statistics struct */
+struct fil_stat_struct {
+	ulint	space_id;	/* Space ID. */
+	char*	space_name;	/* Space name. */
+	ulint	n_read;		/* Number of read requests. */
+	ulint	n_data_read;	/* Number of bytes read. */
+	ulint	n_wrtn;		/* Number of write requests. */
+	ulint	n_data_wrtn;	/* Number of bytes written. */
+	ulint	n_flush;	/* Number of flushes. */
+	ulint	n_extension;	/* Number of space extensions. */
+	ulint   n_extend_bytes;	/* Number of bytes that the space has been extended. */
+};
+
+typedef	struct fil_stat_struct	fil_stat_t;
 
 #ifndef UNIV_HOTBACKUP
 /*******************************************************************//**
@@ -330,10 +346,12 @@ fil_write_flushed_lsn_to_data_files(
 	ulint		arch_log_no);	/*!< in: latest archived log
 					file number */
 /*******************************************************************//**
-Reads the flushed lsn and arch no fields from a data file at database
-startup. */
+Reads the flushed lsn, arch no, and tablespace flag fields from a data
+file at database startup.
+@retval NULL on success, or if innodb_force_recovery is set
+@return pointer to an error message string */
 UNIV_INTERN
-void
+const char*
 fil_read_first_page(
 /*================*/
 	os_file_t	data_file,		/*!< in: open data file */
@@ -349,23 +367,23 @@ fil_read_first_page(
 #endif /* UNIV_LOG_ARCHIVE */
 	ib_uint64_t*	min_flushed_lsn,	/*!< out: min of flushed
 						lsn values in data files */
-	ib_uint64_t*	max_flushed_lsn);	/*!< out: max of flushed
+	ib_uint64_t*	max_flushed_lsn)	/*!< out: max of flushed
 						lsn values in data files */
+	__attribute__((warn_unused_result));
 /*******************************************************************//**
-Increments the count of pending insert buffer page merges, if space is not
-being deleted.
-@return	TRUE if being deleted, and ibuf merges should be skipped */
+Increments the count of pending operation, if space is not being deleted.
+@return	TRUE if being deleted, and operation should be skipped */
 UNIV_INTERN
 ibool
-fil_inc_pending_ibuf_merges(
-/*========================*/
+fil_inc_pending_ops(
+/*================*/
 	ulint	id);	/*!< in: space id */
 /*******************************************************************//**
-Decrements the count of pending insert buffer page merges. */
+Decrements the count of pending operations. */
 UNIV_INTERN
 void
-fil_decr_pending_ibuf_merges(
-/*=========================*/
+fil_decr_pending_ops(
+/*=================*/
 	ulint	id);	/*!< in: space id */
 #endif /* !UNIV_HOTBACKUP */
 /*******************************************************************//**
@@ -404,7 +422,9 @@ UNIV_INTERN
 ibool
 fil_delete_tablespace(
 /*==================*/
-	ulint	id);	/*!< in: space id */
+	ulint	id,		/*!< in: space id */
+	ibool	evict_all);	/*!< in: TRUE if we want all pages
+				evicted from LRU. */
 #ifndef UNIV_HOTBACKUP
 /*******************************************************************//**
 Discards a single-table tablespace. The tablespace must be cached in the
@@ -736,6 +756,43 @@ ibool
 fil_tablespace_is_being_deleted(
 /*============================*/
 	ulint		id);	/*!< in: space id */
+
+/****************************************************************//**
+Generate redo logs for swapping two .ibd files */
+UNIV_INTERN
+void
+fil_mtr_rename_log(
+/*===============*/
+	ulint		old_space_id,	/*!< in: tablespace id of the old
+					table. */
+	const char*	old_name,	/*!< in: old table name */
+	ulint		new_space_id,	/*!< in: tablespace id of the new
+					table */
+	const char*	new_name,	/*!< in: new table name */
+	const char*	tmp_name);	/*!< in: temp table name used while
+					swapping */
+
+/********************************************************************//**
+Returns a list of space ids in the tablespace memory cache.
+@return	array representing the space id list */
+UNIV_INTERN
+ulint*
+fil_get_space_list(
+/*===============*/
+	mem_heap_t*	heap,		/*!< in: temp heap memory */
+	ulint*		n_space_ids);	/*!< out: number of space ids */
+
+/********************************************************************//**
+Collect a batch of space statistics from the the tablespace memory cache.
+@return	Number of stat items filled. */
+UNIV_INTERN
+ulint
+fil_get_space_stat(
+/*===============*/
+	ulint		*space_ids,	/*!< in: array of space ids */
+	ulint		size,		/*!< in: size of space id array */
+	fil_stat_t	*stat,		/*!< in/out: stat array */
+	mem_heap_t*	heap);		/*!< in: temp heap memory */
 
 typedef	struct fil_space_struct	fil_space_t;
 

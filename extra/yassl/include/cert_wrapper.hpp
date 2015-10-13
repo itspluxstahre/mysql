@@ -1,6 +1,5 @@
 /*
-   Copyright (c) 2005-2007 MySQL AB, 2008 Sun Microsystems, Inc.
-   Use is subject to license terms.
+   Copyright (c) 2005, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -89,6 +88,7 @@ class CertManager {
     bool verifyNone_;                   // no error if verify fails
     bool failNoCert_;
     bool sendVerify_;
+    bool sendBlankCert_;
     VerifyCallback verifyCallback_;     // user verify callback
 public:
     CertManager();
@@ -115,16 +115,18 @@ public:
     bool verifyNone() const;
     bool failNoCert() const;
     bool sendVerify() const;
+    bool sendBlankCert() const;
 
     void setVerifyPeer();
     void setVerifyNone();
     void setFailNoCert();
     void setSendVerify();
+    void setSendBlankCert();
     void setPeerX509(X509*);
     void setVerifyCallback(VerifyCallback);
 private:
     CertManager(const CertManager&);            // hide copy
-    CertManager& operator=(const CertManager&); // and assign
+    CertManager& operator=(const CertManager&); // and assigin
 };
 
 

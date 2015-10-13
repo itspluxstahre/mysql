@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -138,6 +138,13 @@ trx_create(
 
 	trx->mysql_log_file_name = NULL;
 	trx->mysql_log_offset = 0;
+	trx->mysql_master_log_file_name = "";
+	trx->mysql_master_log_pos = 0;
+
+	trx->css_mysql_master_log_file_name = "";
+	trx->css_mysql_master_log_pos = 0;
+	trx->css_mysql_relay_log_file_name = "";
+	trx->css_mysql_relay_log_pos = 0;
 
 	mutex_create(trx_undo_mutex_key, &trx->undo_mutex, SYNC_TRX_UNDO);
 
@@ -820,6 +827,7 @@ trx_write_serialisation_history(
 {
 	mtr_t		mtr;
 	trx_rseg_t*	rseg;
+	trx_sysf_t*	sys_header = NULL;
 
 	ut_ad(!mutex_own(&kernel_mutex));
 
@@ -873,13 +881,64 @@ trx_write_serialisation_history(
 
 	if (trx->mysql_log_file_name
 	    && trx->mysql_log_file_name[0] != '\0') {
+		if (!sys_header) {
+			sys_header = trx_sysf_get(&mtr);
+		}
 
 		trx_sys_update_mysql_binlog_offset(
+			sys_header,
 			trx->mysql_log_file_name,
 			trx->mysql_log_offset,
 			TRX_SYS_MYSQL_LOG_INFO, &mtr);
 
 		trx->mysql_log_file_name = NULL;
+	}
+
+	if (trx->mysql_master_log_file_name[0] != '\0') {
+		/* This database server is a MySQL replication slave */
+		if (!sys_header) {
+			sys_header = trx_sysf_get(&mtr);
+		}
+
+		trx_sys_update_mysql_binlog_offset(
+			sys_header,
+			trx->mysql_master_log_file_name,
+			trx->mysql_master_log_pos,
+			TRX_SYS_MYSQL_MASTER_LOG_INFO, &mtr);
+		trx->mysql_master_log_file_name = "";
+	}
+
+	if (trx->css_mysql_master_log_file_name[0] != '\0') {
+		/* This database server is a MySQL replication slave */
+		if (!sys_header) {
+			sys_header = trx_sysf_get(&mtr);
+		}
+
+		trx_sys_update_mysql_binlog_offset(
+			sys_header,
+			trx->css_mysql_relay_log_file_name,
+			trx->css_mysql_relay_log_pos,
+			TRX_SYS_CSS_COMMIT_RELAY_LOG_INFO, &mtr);
+
+		trx_sys_update_mysql_binlog_offset(
+			sys_header,
+			trx->css_mysql_master_log_file_name,
+			trx->css_mysql_master_log_pos,
+			TRX_SYS_CSS_COMMIT_MASTER_LOG_INFO, &mtr);
+
+		trx_sys_update_mysql_binlog_offset(
+			sys_header,
+			trx->css_mysql_relay_log_file_name,
+			trx->css_mysql_relay_log_pos,
+			TRX_SYS_CSS_MYSQL_RELAY_LOG_INFO, &mtr);
+
+		trx_sys_update_mysql_binlog_offset(
+			sys_header,
+			trx->css_mysql_master_log_file_name,
+			trx->css_mysql_master_log_pos,
+			TRX_SYS_CSS_MYSQL_MASTER_LOG_INFO, &mtr);
+
+		trx->css_mysql_master_log_file_name = "";
 	}
 
 	/* The following call commits the mini-transaction, making the
@@ -1065,6 +1124,8 @@ trx_commit_off_kernel(
 	ut_ad(UT_LIST_GET_LEN(trx->trx_locks) == 0);
 
 	UT_LIST_REMOVE(trx_list, trx_sys->trx_list, trx);
+
+	trx->error_state = DB_SUCCESS;
 }
 
 /****************************************************************//**
@@ -1916,6 +1977,7 @@ trx_prepare_off_kernel(
 	trx_rseg_t*	rseg;
 	ib_uint64_t	lsn		= 0;
 	mtr_t		mtr;
+	trx_sysf_t*	sys_header	= NULL;
 
 	ut_ad(mutex_own(&kernel_mutex));
 
@@ -1950,6 +2012,39 @@ trx_prepare_off_kernel(
 		}
 
 		mutex_exit(&(rseg->mutex));
+
+		if (trx->mysql_master_log_file_name[0] != '\0') {
+			/* This database server is a MySQL replication slave */
+			if (!sys_header) {
+				sys_header = trx_sysf_get(&mtr);
+			}
+
+			trx_sys_update_mysql_binlog_offset(
+				sys_header,
+				trx->mysql_master_log_file_name,
+				trx->mysql_master_log_pos,
+				TRX_SYS_MYSQL_MASTER_LOG_INFO, &mtr);
+			trx->mysql_master_log_file_name = "";
+		}
+
+		if (trx->css_mysql_master_log_file_name[0] != '\0') {
+			/* This database server is a MySQL replication slave */
+			if (!sys_header) {
+				sys_header = trx_sysf_get(&mtr);
+			}
+
+			trx_sys_update_mysql_binlog_offset(
+				sys_header,
+				trx->css_mysql_relay_log_file_name,
+				trx->css_mysql_relay_log_pos,
+				TRX_SYS_CSS_MYSQL_RELAY_LOG_INFO, &mtr);
+			trx_sys_update_mysql_binlog_offset(
+				sys_header,
+				trx->css_mysql_master_log_file_name,
+				trx->css_mysql_master_log_pos,
+				TRX_SYS_CSS_MYSQL_MASTER_LOG_INFO, &mtr);
+			trx->css_mysql_master_log_file_name = "";
+		}
 
 		/*--------------*/
 		mtr_commit(&mtr);	/* This mtr commit makes the

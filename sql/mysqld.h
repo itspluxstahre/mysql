@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 #include "my_atomic.h"                     /* my_atomic_rwlock_t */
 #include "mysql/psi/mysql_file.h"          /* MYSQL_FILE */
 #include "sql_list.h"                      /* I_List */
+#include "hash.h"
 
 class THD;
 struct handlerton;
@@ -109,6 +110,7 @@ extern ulong slave_exec_mode_options;
 extern ulonglong slave_type_conversions_options;
 extern my_bool read_only, opt_readonly;
 extern my_bool lower_case_file_system;
+extern my_bool opt_userstat, opt_thread_statistics;
 extern my_bool opt_enable_named_pipe, opt_sync_frm, opt_allow_suspicious_udfs;
 extern my_bool opt_secure_auth;
 extern char* opt_secure_file_priv;
@@ -128,7 +130,6 @@ extern my_bool locked_in_memory;
 extern bool opt_using_transactions;
 extern ulong max_long_data_size;
 extern ulong current_pid;
-extern ulong expire_logs_days;
 extern my_bool relay_log_recovery;
 extern uint sync_binlog_period, sync_relaylog_period, 
             sync_relayloginfo_period, sync_masterinfo_period;
@@ -167,18 +168,21 @@ extern ulong slow_launch_threads, slow_launch_time;
 extern ulong table_cache_size, table_def_size;
 extern MYSQL_PLUGIN_IMPORT ulong max_connections;
 extern ulong max_connect_errors, connect_timeout;
+extern ulong superuser_connections;
 extern my_bool slave_allow_batching;
 extern my_bool allow_slave_start;
 extern LEX_CSTRING reason_slave_blocked;
 extern ulong slave_trans_retries;
 extern uint  slave_net_timeout;
 extern uint max_user_connections;
+extern ulonglong denied_connections;
 extern ulong what_to_log,flush_time;
 extern ulong max_prepared_stmt_count, prepared_stmt_count;
 extern ulong open_files_limit;
 extern ulong binlog_cache_size, binlog_stmt_cache_size;
 extern ulonglong max_binlog_cache_size, max_binlog_stmt_cache_size;
 extern ulong max_binlog_size, max_relay_log_size;
+extern ulong slave_max_allowed_packet;
 extern ulong opt_binlog_rows_event_max_size;
 extern ulong rpl_recovery_rank, thread_cache_size;
 extern ulong stored_program_cache_size;
@@ -199,6 +203,11 @@ extern SHOW_VAR status_vars[];
 extern struct system_variables max_system_variables;
 extern struct system_status_var global_status_var;
 extern struct rand_struct sql_rand;
+extern HASH global_user_stats;
+extern HASH global_client_stats;
+extern HASH global_thread_stats;
+extern HASH global_table_stats;
+extern HASH global_index_stats;
 extern const char *opt_date_time_formats[];
 extern handlerton *partition_hton;
 extern handlerton *myisam_hton;
@@ -218,6 +227,19 @@ extern char err_shared_dir[];
 extern TYPELIB thread_handling_typelib;
 extern my_decimal decimal_zero;
 extern my_bool opt_super_only;
+extern char *opt_minidump_dir;
+extern uint opt_twitter_audit_log;
+extern uint opt_twitter_query_stats;
+extern uint opt_twitter_query_stats_max;
+extern uint opt_twitter_query_throttling_limit;
+extern uint opt_twitter_write_throttling_limit;
+extern ulonglong rows_sent, rows_examined;
+extern ulonglong com_insert_noop;
+extern ulonglong read_queries, write_queries;
+extern ulonglong total_query_rejected, write_query_rejected;
+extern int32 write_query_running;
+extern my_atomic_rwlock_t write_query_running_lock;
+void init_sql_statement_names();
 
 /*
   THR_MALLOC is a key which will be used to set/get MEM_ROOT** for a thread,
@@ -239,6 +261,8 @@ extern PSI_mutex_key key_BINLOG_LOCK_index, key_BINLOG_LOCK_prep_xids,
   key_delayed_insert_mutex, key_hash_filo_lock, key_LOCK_active_mi,
   key_LOCK_connection_count, key_LOCK_crypt, key_LOCK_delayed_create,
   key_LOCK_delayed_insert, key_LOCK_delayed_status, key_LOCK_error_log,
+  key_LOCK_stats, key_LOCK_global_user_client_stats,
+  key_LOCK_global_table_stats, key_LOCK_global_index_stats,
   key_LOCK_gdl, key_LOCK_global_system_variables,
   key_LOCK_logger, key_LOCK_manager,
   key_LOCK_prepared_stmt_count,
@@ -251,12 +275,15 @@ extern PSI_mutex_key key_BINLOG_LOCK_index, key_BINLOG_LOCK_prep_xids,
   key_relay_log_info_log_space_lock, key_relay_log_info_run_lock,
   key_relay_log_info_sleep_lock,
   key_structure_guard_mutex, key_TABLE_SHARE_LOCK_ha_data,
-  key_LOCK_error_messages, key_LOCK_thread_count, key_PARTITION_LOCK_auto_inc;
+  key_LOCK_error_messages, key_LOCK_thread_count, key_PARTITION_LOCK_auto_inc,
+  key_LOCK_thd_remove;
 extern PSI_mutex_key key_RELAYLOG_LOCK_index;
+extern PSI_mutex_key key_LOCK_query_stats_cache;
 
 extern PSI_rwlock_key key_rwlock_LOCK_grant, key_rwlock_LOCK_logger,
   key_rwlock_LOCK_sys_init_connect, key_rwlock_LOCK_sys_init_slave,
   key_rwlock_LOCK_system_variables_hash, key_rwlock_query_cache_query_lock;
+extern PSI_mutex_key key_LOCK_thread_created;
 
 #ifdef HAVE_MMAP
 extern PSI_cond_key key_PAGE_cond, key_COND_active, key_COND_pool;
@@ -342,8 +369,11 @@ extern mysql_mutex_t
        LOCK_delayed_status, LOCK_delayed_create, LOCK_crypt, LOCK_timezone,
        LOCK_slave_list, LOCK_active_mi, LOCK_manager,
        LOCK_global_system_variables, LOCK_user_conn,
-       LOCK_prepared_stmt_count, LOCK_error_messages, LOCK_connection_count;
+       LOCK_prepared_stmt_count, LOCK_error_messages, LOCK_connection_count,
+       LOCK_stats, LOCK_global_user_client_stats,
+       LOCK_global_table_stats, LOCK_global_index_stats;
 extern MYSQL_PLUGIN_IMPORT mysql_mutex_t LOCK_thread_count;
+extern MYSQL_PLUGIN_IMPORT mysql_mutex_t LOCK_thd_remove;
 #ifdef HAVE_OPENSSL
 extern mysql_mutex_t LOCK_des_key_file;
 #endif
@@ -354,7 +384,11 @@ extern mysql_rwlock_t LOCK_system_variables_hash;
 extern mysql_cond_t COND_thread_count;
 extern mysql_cond_t COND_manager;
 extern int32 thread_running;
+extern int32 thread_running_max;
 extern my_atomic_rwlock_t thread_running_lock;
+
+// MYSQL-312
+extern ulong master_server_id;
 
 extern char *opt_ssl_ca, *opt_ssl_capath, *opt_ssl_cert, *opt_ssl_cipher,
             *opt_ssl_key;
@@ -407,6 +441,7 @@ enum options_mysqld
   OPT_SSL_CERT,
   OPT_SSL_CIPHER,
   OPT_SSL_KEY,
+  OPT_THREAD_CONCURRENCY,
   OPT_UPDATE_LOG,
   OPT_WANT_CORE,
   OPT_ENGINE_CONDITION_PUSHDOWN,
@@ -436,7 +471,7 @@ extern my_atomic_rwlock_t global_query_id_lock;
 void unireg_end(void) __attribute__((noreturn));
 
 /* increment query_id and return it.  */
-inline query_id_t next_query_id()
+inline __attribute__((warn_unused_result)) query_id_t next_query_id()
 {
   query_id_t id;
   my_atomic_rwlock_wrlock(&global_query_id_lock);
@@ -454,6 +489,16 @@ inline query_id_t get_query_id()
   return id;
 }
 
+void init_global_user_stats(void);
+void init_global_table_stats(void);
+void init_global_index_stats(void);
+void init_global_client_stats(void);
+void init_global_thread_stats(void);
+void free_global_user_stats(void);
+void free_global_table_stats(void);
+void free_global_index_stats(void);
+void free_global_client_stats(void);
+void free_global_thread_stats(void);
 
 /*
   TODO: Replace this with an inline function.
@@ -484,8 +529,12 @@ inline int32
 inc_thread_running()
 {
   int32 num_thread_running;
+  int32 max_threads;
   my_atomic_rwlock_wrlock(&thread_running_lock);
   num_thread_running= my_atomic_add32(&thread_running, 1);
+  max_threads= my_atomic_load32(&thread_running_max);
+  if (max_threads < (num_thread_running + 1))
+    my_atomic_store32(&thread_running_max, (num_thread_running + 1));
   my_atomic_rwlock_wrunlock(&thread_running_lock);
   return (num_thread_running+1);
 }
@@ -508,6 +557,26 @@ get_thread_running()
   num_thread_running= my_atomic_load32(&thread_running);
   my_atomic_rwlock_wrunlock(&thread_running_lock);
   return num_thread_running;
+}
+
+inline int32
+inc_write_query_running()
+{
+  int32 num_writes_running;
+  my_atomic_rwlock_wrlock(&write_query_running_lock);
+  num_writes_running= my_atomic_add32(&write_query_running, 1);
+  my_atomic_rwlock_wrunlock(&write_query_running_lock);
+  return (num_writes_running+1);
+}
+
+inline int32
+dec_write_query_running()
+{
+  int32 num_writes_running;
+  my_atomic_rwlock_wrlock(&write_query_running_lock);
+  num_writes_running= my_atomic_add32(&write_query_running, -1);
+  my_atomic_rwlock_wrunlock(&write_query_running_lock);
+  return (num_writes_running-1);
 }
 
 #if defined(MYSQL_DYNAMIC_PLUGIN) && defined(_WIN32)

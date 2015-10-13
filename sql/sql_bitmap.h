@@ -1,4 +1,4 @@
-/* Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -71,6 +71,7 @@ public:
   my_bool is_subset(const Bitmap& map2) const { return bitmap_is_subset(&map, &map2.map); }
   my_bool is_overlapping(const Bitmap& map2) const { return bitmap_is_overlapping(&map, &map2.map); }
   my_bool operator==(const Bitmap& map2) const { return bitmap_cmp(&map, &map2.map); }
+  my_bool operator!=(const Bitmap& map2) const { return !(*this == map2); }
   char *print(char *buf) const
   {
     char *s=buf;

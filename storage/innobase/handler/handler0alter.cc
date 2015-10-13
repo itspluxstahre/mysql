@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2005, 2010, Innobase Oy. All Rights Reserved.
+Copyright (c) 2005, 2013, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -101,8 +101,6 @@ innobase_col_to_mysql(
 		ut_ad(flen >= len);
 		ut_ad(DATA_MBMAXLEN(col->mbminmaxlen)
 		      >= DATA_MBMINLEN(col->mbminmaxlen));
-		ut_ad(DATA_MBMAXLEN(col->mbminmaxlen)
-		      > DATA_MBMINLEN(col->mbminmaxlen) || flen == len);
 		memcpy(dest, data, len);
 		break;
 
@@ -112,13 +110,17 @@ innobase_col_to_mysql(
 		/* These column types should never be shipped to MySQL. */
 		ut_ad(0);
 
-	case DATA_CHAR:
-	case DATA_FIXBINARY:
 	case DATA_FLOAT:
 	case DATA_DOUBLE:
 	case DATA_DECIMAL:
 		/* Above are the valid column types for MySQL data. */
 		ut_ad(flen == len);
+		/* fall through */
+	case DATA_FIXBINARY:
+	case DATA_CHAR:
+		/* We may have flen > len when there is a shorter
+		prefix on the CHAR and BINARY column. */
+		ut_ad(flen >= len);
 #else /* UNIV_DEBUG */
 	default:
 #endif /* UNIV_DEBUG */
@@ -151,7 +153,7 @@ innobase_rec_to_mysql(
 
 		field->reset();
 
-		ipos = dict_index_get_nth_col_pos(index, i);
+		ipos = dict_index_get_nth_col_or_prefix_pos(index, i, TRUE);
 
 		if (UNIV_UNLIKELY(ipos == ULINT_UNDEFINED)) {
 null_field:
@@ -700,13 +702,18 @@ ha_innobase::add_index(
 		DBUG_RETURN(-1);
 	}
 
-	indexed_table = dict_table_get(prebuilt->table->name, FALSE);
+	indexed_table = dict_table_get(prebuilt->table->name, FALSE,
+				       DICT_ERR_IGNORE_NONE);
 
 	if (UNIV_UNLIKELY(!indexed_table)) {
 		DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
 	}
 
 	ut_a(indexed_table == prebuilt->table);
+
+	if (indexed_table->tablespace_discarded) {
+		DBUG_RETURN(-1);
+	}
 
 	/* Check that index keys are sensible */
 	error = innobase_check_index_keys(key_info, num_of_keys, prebuilt->table);
@@ -769,7 +776,7 @@ ha_innobase::add_index(
 	row_mysql_lock_data_dictionary(trx);
 	dict_locked = TRUE;
 
-	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, FALSE));
+	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, TRUE));
 
 	/* If a new primary key is defined for the table we need
 	to drop the original table and rebuild all indexes. */
@@ -805,7 +812,7 @@ ha_innobase::add_index(
 			}
 
 			ut_d(dict_table_check_for_dup_indexes(prebuilt->table,
-							      FALSE));
+							      TRUE));
 			mem_heap_free(heap);
 			trx_general_rollback_for_mysql(trx, NULL);
 			row_mysql_unlock_data_dictionary(trx);
@@ -1057,7 +1064,7 @@ ha_innobase::final_add_index(
 		trx_commit_for_mysql(prebuilt->trx);
 	}
 
-	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, FALSE));
+	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, TRUE));
 	row_mysql_unlock_data_dictionary(trx);
 
 	trx_free_for_mysql(trx);
@@ -1100,7 +1107,7 @@ ha_innobase::prepare_drop_index(
 	/* Test and mark all the indexes to be dropped */
 
 	row_mysql_lock_data_dictionary(trx);
-	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, FALSE));
+	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, TRUE));
 
 	/* Check that none of the indexes have previously been flagged
 	for deletion. */
@@ -1143,7 +1150,9 @@ ha_innobase::prepare_drop_index(
 			goto func_exit;
 		}
 
+		rw_lock_x_lock(dict_index_get_lock(index));
 		index->to_be_dropped = TRUE;
+		rw_lock_x_unlock(dict_index_get_lock(index));
 	}
 
 	/* If FOREIGN_KEY_CHECKS = 1 you may not drop an index defined
@@ -1262,12 +1271,14 @@ func_exit:
 			= dict_table_get_first_index(prebuilt->table);
 
 		do {
+			rw_lock_x_lock(dict_index_get_lock(index));
 			index->to_be_dropped = FALSE;
+			rw_lock_x_unlock(dict_index_get_lock(index));
 			index = dict_table_get_next_index(index);
 		} while (index);
 	}
 
-	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, FALSE));
+	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, TRUE));
 	row_mysql_unlock_data_dictionary(trx);
 
 	DBUG_RETURN(err);
@@ -1314,7 +1325,7 @@ ha_innobase::final_drop_index(
 		prebuilt->table->flags, user_thd);
 
 	row_mysql_lock_data_dictionary(trx);
-	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, FALSE));
+	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, TRUE));
 
 	if (UNIV_UNLIKELY(err)) {
 
@@ -1322,7 +1333,9 @@ ha_innobase::final_drop_index(
 		for (index = dict_table_get_first_index(prebuilt->table);
 		     index; index = dict_table_get_next_index(index)) {
 
+			rw_lock_x_lock(dict_index_get_lock(index));
 			index->to_be_dropped = FALSE;
+			rw_lock_x_unlock(dict_index_get_lock(index));
 		}
 
 		goto func_exit;
@@ -1356,7 +1369,7 @@ ha_innobase::final_drop_index(
 	share->idx_trans_tbl.index_count = 0;
 
 func_exit:
-	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, FALSE));
+	ut_d(dict_table_check_for_dup_indexes(prebuilt->table, TRUE));
 	trx_commit_for_mysql(trx);
 	trx_commit_for_mysql(prebuilt->trx);
 	row_mysql_unlock_data_dictionary(trx);

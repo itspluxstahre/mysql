@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -88,16 +88,20 @@ ENDIF()
 
 IF(CMAKE_GENERATOR MATCHES "Makefiles")
   # Strip maintainer mode options if necessary
-  STRING(REPLACE "${MY_MAINTAINER_C_WARNINGS}" "" CFLAGS "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_RELWITHDEBINFO}")
-  STRING(REPLACE "${MY_MAINTAINER_CXX_WARNINGS}" "" CXXFLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+  STRING(REPLACE "${MY_C_WARNING_FLAGS}" "" CFLAGS
+    "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_RELWITHDEBINFO}")
+  STRING(REPLACE "${MY_CXX_WARNING_FLAGS}" "" CXXFLAGS
+    "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
   FOREACH(ARCH ${CMAKE_OSX_ARCHITECTURES})
     SET(CFLAGS   "${CFLAGS} -arch ${ARCH}")
     SET(CXXFLAGS "${CXXFLAGS} -arch ${ARCH}")
   ENDFOREACH()
 ELSE()
   # Strip maintainer mode options if necessary
-  STRING(REPLACE "${MY_MAINTAINER_C_WARNINGS}" "" CFLAGS "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
-  STRING(REPLACE "${MY_MAINTAINER_CXX_WARNINGS}" "" CXXFLAGS "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+  STRING(REPLACE "${MY_C_WARNING_FLAGS}" "" CFLAGS
+    "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
+  STRING(REPLACE "${MY_CXX_WARNING_FLAGS}" "" CXXFLAGS
+    "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
 ENDIF()
 
 IF(UNIX)
@@ -216,7 +220,6 @@ INSTALL_SCRIPT(
   COMPONENT Server
   )
 
-
 SET(prefix "${CMAKE_INSTALL_PREFIX}")
 SET(sysconfdir ${prefix})
 SET(bindir ${prefix}/${INSTALL_BINDIR})
@@ -224,10 +227,16 @@ SET(libexecdir ${prefix}/${INSTALL_SBINDIR})
 SET(scriptdir ${prefix}/${INSTALL_BINDIR})
 SET(datadir ${prefix}/${INSTALL_MYSQLSHAREDIR})
 SET(pkgdatadir ${prefix}/${INSTALL_MYSQLSHAREDIR})
+SET(libsubdir  ${INSTALL_LIBDIR})
 SET(pkgincludedir ${prefix}/${INSTALL_INCLUDEDIR})
 SET(pkglibdir ${prefix}/${INSTALL_LIBDIR})
 SET(pkgplugindir ${prefix}/${INSTALL_PLUGINDIR})
 SET(localstatedir ${MYSQL_DATADIR})
+
+SET(RPATH_OPTION "")
+IF(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
+  SET(RPATH_OPTION "-R$pkglibdir")
+ENDIF()
 
 # some scripts use  @TARGET_LINUX@
 IF(CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -313,6 +322,9 @@ IF(WIN32)
     INSTALL_SCRIPT(${CMAKE_CURRENT_BINARY_DIR}/${file}.pl COMPONENT Server_Scripts)
   ENDFOREACH()
 ELSE()
+  # Configure this one, for testing, but do not install it.
+  CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/mysql_config.pl.in
+    ${CMAKE_CURRENT_BINARY_DIR}/mysql_config.pl ESCAPE_QUOTES @ONLY)
   # On Unix, most of the files end up in the bin directory
   SET(mysql_config_COMPONENT COMPONENT Development)
   SET(BIN_SCRIPTS

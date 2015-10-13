@@ -2,7 +2,7 @@
 #define HA_PARTITION_INCLUDED
 
 /*
-   Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2013, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -25,14 +25,16 @@
 #include "queues.h"             /* QUEUE */
 
 enum partition_keywords
-{ 
+{
   PKW_HASH= 0, PKW_RANGE, PKW_LIST, PKW_KEY, PKW_MAXVALUE, PKW_LINEAR,
-  PKW_COLUMNS
+  PKW_COLUMNS, PKW_ALGORITHM
 };
 
 
 #define PARTITION_BYTES_IN_POS 2
-#define PARTITION_ENABLED_TABLE_FLAGS (HA_FILE_BASED | HA_REC_NOT_IN_SEQ)
+#define PARTITION_ENABLED_TABLE_FLAGS (HA_FILE_BASED | \
+                                       HA_REC_NOT_IN_SEQ | \
+                                       HA_CAN_REPAIR)
 #define PARTITION_DISABLED_TABLE_FLAGS (HA_CAN_GEOMETRY | \
                                         HA_CAN_FULLTEXT | \
                                         HA_DUPLICATE_POS | \
@@ -84,6 +86,7 @@ private:
   */
   KEY *m_curr_key_info[3];              // Current index
   uchar *m_rec0;                        // table->record[0]
+  const uchar *m_err_rec;               // record which gave error
   QUEUE m_queue;                        // Prio queue used by sorted read
   /*
     Since the partition handler is a handler on top of other handlers, it
@@ -177,6 +180,15 @@ private:
   ha_rows   m_bulk_inserted_rows;
   /** used for prediction of start_bulk_insert rows */
   enum_monotonicity_info m_part_func_monotonicity_info;
+  /** Sorted array of partition ids in descending order of number of rows. */
+  uint32 *m_part_ids_sorted_by_num_of_records;
+  /* Compare function for my_qsort2, for reversed order. */
+  static int compare_number_of_records(ha_partition *me,
+                                       const uint32 *a,
+                                       const uint32 *b);
+  /** partitions that returned HA_ERR_KEY_NOT_FOUND. */
+  MY_BITMAP m_key_not_found_partitions;
+  bool m_key_not_found;
 public:
   handler *clone(const char *name, MEM_ROOT *mem_root);
   virtual void set_part_info(partition_info *part_info)
@@ -258,12 +270,13 @@ private:
   void cleanup_new_partition(uint part_count);
   int prepare_new_partition(TABLE *table, HA_CREATE_INFO *create_info,
                             handler *file, const char *part_name,
-                            partition_element *p_elem);
+                            partition_element *p_elem,
+                            uint disable_non_uniq_indexes);
   /*
     delete_table, rename_table and create uses very similar logic which
     is packed into this routine.
   */
-  uint del_ren_cre_table(const char *from, const char *to,
+  int del_ren_cre_table(const char *from, const char *to,
                          TABLE *table_arg, HA_CREATE_INFO *create_info);
   /*
     One method to create the table_name.par file containing the names of the
@@ -505,22 +518,15 @@ public:
   virtual int read_range_next();
 
 private:
+  bool init_record_priority_queue();
+  void destroy_record_priority_queue();
   int common_index_read(uchar * buf, bool have_start_key);
   int common_first_last(uchar * buf);
   int partition_scan_set_up(uchar * buf, bool idx_read_flag);
   int handle_unordered_next(uchar * buf, bool next_same);
   int handle_unordered_scan_next_partition(uchar * buf);
-  uchar *queue_buf(uint part_id)
-    {
-      return (m_ordered_rec_buffer +
-              (part_id * (m_rec_length + PARTITION_BYTES_IN_POS)));
-    }
-  uchar *rec_buf(uint part_id)
-    {
-      return (queue_buf(part_id) +
-              PARTITION_BYTES_IN_POS);
-    }
   int handle_ordered_index_scan(uchar * buf, bool reverse_order);
+  int handle_ordered_index_scan_key_not_found();
   int handle_ordered_next(uchar * buf, bool next_same);
   int handle_ordered_prev(uchar * buf);
   void return_top_record(uchar * buf);
@@ -541,6 +547,20 @@ public:
   virtual int extra(enum ha_extra_function operation);
   virtual int extra_opt(enum ha_extra_function operation, ulong cachesize);
   virtual int reset(void);
+  /*
+    Do not allow caching of partitioned tables, since we cannot return
+    a callback or engine_data that would work for a generic engine.
+  */
+  virtual my_bool register_query_cache_table(THD *thd, char *table_key,
+                                             uint key_length,
+                                             qc_engine_callback
+                                               *engine_callback,
+                                             ulonglong *engine_data)
+  {
+    *engine_callback= NULL;
+    *engine_data= 0;
+    return FALSE;
+  }
 
 private:
   static const uint NO_CURRENT_PART_ID;
@@ -570,15 +590,9 @@ public:
   */
 
 private:
-  /*
-    Helper function to get the minimum number of partitions to use for
-    the optimizer hints/cost calls.
-  */
-  void partitions_optimizer_call_preparations(uint *num_used_parts,
-                                              uint *check_min_num,
-                                              uint *first);
-  ha_rows estimate_rows(bool is_records_in_range, uint inx,
-                        key_range *min_key, key_range *max_key);
+  /* Helper functions for optimizer hints. */
+  ha_rows min_rows_for_estimate();
+  uint get_biggest_used_partition(uint *part_index);
 public:
 
   /*
@@ -1092,9 +1106,18 @@ public:
     virtual bool check_and_repair(THD *thd);
     virtual bool auto_repair() const;
     virtual bool is_crashed() const;
+    virtual int check_for_upgrade(HA_CHECK_OPT *check_opt);
 
     private:
     int handle_opt_partitions(THD *thd, HA_CHECK_OPT *check_opt, uint flags);
+    int handle_opt_part(THD *thd, HA_CHECK_OPT *check_opt, uint part_id,
+                        uint flag);
+    /**
+      Check if the rows are placed in the correct partition.  If the given
+      argument is true, then move the rows to the correct partition.
+    */
+    int check_misplaced_rows(uint read_part_id, bool repair);
+    void append_row_to_str(String &str);
     public:
   /*
     -------------------------------------------------------------------------

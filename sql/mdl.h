@@ -241,8 +241,14 @@ public:
                     const char *db, const char *name)
   {
     m_ptr[0]= (char) mdl_namespace;
-    m_db_name_length= (uint16) (strmov(m_ptr + 1, db) - m_ptr - 1);
-    m_length= (uint16) (strmov(m_ptr + m_db_name_length + 2, name) - m_ptr + 1);
+    /*
+      It is responsibility of caller to ensure that db and object names
+      are not longer than NAME_LEN. Still we play safe and try to avoid
+      buffer overruns.
+    */
+    m_db_name_length= (uint16) (strmake(m_ptr + 1, db, NAME_LEN) - m_ptr - 1);
+    m_length= (uint16) (strmake(m_ptr + m_db_name_length + 2, name, NAME_LEN) -
+                        m_ptr + 1);
   }
   void mdl_key_init(const MDL_key *rhs)
   {
@@ -334,6 +340,9 @@ public:
   /** A lock is requested based on a fully qualified name and type. */
   MDL_key key;
 
+  /** The lock request has NO_WAIT non-blocking mode. */
+  bool lock_no_wait;
+
 public:
   static void *operator new(size_t size, MEM_ROOT *mem_root) throw ()
   { return alloc_root(mem_root, size); }
@@ -378,7 +387,8 @@ public:
     :type(rhs->type),
     duration(rhs->duration),
     ticket(NULL),
-    key(&rhs->key)
+    key(&rhs->key),
+    lock_no_wait(FALSE)
   {}
 };
 
@@ -495,6 +505,17 @@ public:
   /** Implement MDL_wait_for_subgraph interface. */
   virtual bool accept_visitor(MDL_wait_for_graph_visitor *dvisitor);
   virtual uint get_deadlock_weight() const;
+
+  void set_abort_conflicting_lock_requests(bool abort_lock_requests)
+  {
+    m_abort_conflicting_lock_requests= abort_lock_requests;
+  }
+
+  bool get_abort_conflicting_lock_requests() const
+  {
+    return m_abort_conflicting_lock_requests;
+  }
+
 private:
   friend class MDL_context;
 
@@ -508,7 +529,8 @@ private:
      m_duration(duration_arg),
 #endif
      m_ctx(ctx_arg),
-     m_lock(NULL)
+     m_lock(NULL),
+     m_abort_conflicting_lock_requests(FALSE)
   {}
 
   static MDL_ticket *create(MDL_context *ctx_arg, enum_mdl_type type_arg
@@ -536,6 +558,14 @@ private:
     Pointer to the lock object for this lock ticket. Externally accessible.
   */
   MDL_lock *m_lock;
+
+  /**
+    Whether conflicting lock requests are aborted or blocked.
+
+    @remark If TRUE, a conflicting lock request is not allowed to wait until
+     the lock is released.
+  */
+  bool m_abort_conflicting_lock_requests;
 
 private:
   MDL_ticket(const MDL_ticket &);               /* not implemented */
@@ -586,7 +616,7 @@ public:
   MDL_wait();
   ~MDL_wait();
 
-  enum enum_wait_status { EMPTY = 0, GRANTED, VICTIM, TIMEOUT, KILLED };
+  enum enum_wait_status { EMPTY = 0, GRANTED, VICTIM, TIMEOUT, KILLED, ABORTED };
 
   bool set_status(enum_wait_status result_arg);
   enum_wait_status get_status();
@@ -701,6 +731,7 @@ public:
   {
     return m_needs_thr_lock_abort;
   }
+
 public:
   /**
     If our request for a lock is scheduled, or aborted by the deadlock
@@ -859,4 +890,10 @@ extern mysql_mutex_t LOCK_open;
 extern ulong mdl_locks_cache_size;
 static const ulong MDL_LOCKS_CACHE_SIZE_DEFAULT = 1024;
 
+/*
+  Metadata locking subsystem tries not to grant more than
+  max_write_lock_count high-prio, strong locks successively,
+  to avoid starving out weak, low-prio locks.
+*/
+extern "C" ulong max_write_lock_count;
 #endif

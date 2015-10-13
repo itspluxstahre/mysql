@@ -80,10 +80,12 @@ Database: information_schema
 |                Tables                 |
 +---------------------------------------+
 | CHARACTER_SETS                        |
+| CLIENT_STATISTICS                     |
 | COLLATIONS                            |
 | COLLATION_CHARACTER_SET_APPLICABILITY |
 | COLUMNS                               |
 | COLUMN_PRIVILEGES                     |
+| INDEX_STATISTICS                      |
 | ENGINES                               |
 | EVENTS                                |
 | FILES                                 |
@@ -95,6 +97,7 @@ Database: information_schema
 | PLUGINS                               |
 | PROCESSLIST                           |
 | PROFILING                             |
+| QUERY_STATISTICS                      |
 | REFERENTIAL_CONSTRAINTS               |
 | ROUTINES                              |
 | SCHEMATA                              |
@@ -106,29 +109,36 @@ Database: information_schema
 | TABLESPACES                           |
 | TABLE_CONSTRAINTS                     |
 | TABLE_PRIVILEGES                      |
+| TABLE_STATISTICS                      |
+| THREAD_STATISTICS                     |
 | TRIGGERS                              |
 | USER_PRIVILEGES                       |
+| USER_STATISTICS                       |
 | VIEWS                                 |
-| INNODB_BUFFER_PAGE                    |
-| INNODB_TRX                            |
 | INNODB_BUFFER_POOL_STATS              |
+| INNODB_TRX                            |
+| INNODB_BUFFER_PAGE                    |
 | INNODB_LOCK_WAITS                     |
 | INNODB_CMPMEM                         |
 | INNODB_CMP                            |
-| INNODB_LOCKS                          |
+| INNODB_SPACE_STATS                    |
 | INNODB_CMPMEM_RESET                   |
 | INNODB_CMP_RESET                      |
 | INNODB_BUFFER_PAGE_LRU                |
+| INNODB_BUFFER_PAGE_BASIC              |
+| INNODB_LOCKS                          |
 +---------------------------------------+
 Database: INFORMATION_SCHEMA
 +---------------------------------------+
 |                Tables                 |
 +---------------------------------------+
 | CHARACTER_SETS                        |
+| CLIENT_STATISTICS                     |
 | COLLATIONS                            |
 | COLLATION_CHARACTER_SET_APPLICABILITY |
 | COLUMNS                               |
 | COLUMN_PRIVILEGES                     |
+| INDEX_STATISTICS                      |
 | ENGINES                               |
 | EVENTS                                |
 | FILES                                 |
@@ -140,6 +150,7 @@ Database: INFORMATION_SCHEMA
 | PLUGINS                               |
 | PROCESSLIST                           |
 | PROFILING                             |
+| QUERY_STATISTICS                      |
 | REFERENTIAL_CONSTRAINTS               |
 | ROUTINES                              |
 | SCHEMATA                              |
@@ -151,19 +162,24 @@ Database: INFORMATION_SCHEMA
 | TABLESPACES                           |
 | TABLE_CONSTRAINTS                     |
 | TABLE_PRIVILEGES                      |
+| TABLE_STATISTICS                      |
+| THREAD_STATISTICS                     |
 | TRIGGERS                              |
 | USER_PRIVILEGES                       |
+| USER_STATISTICS                       |
 | VIEWS                                 |
-| INNODB_BUFFER_PAGE                    |
-| INNODB_TRX                            |
 | INNODB_BUFFER_POOL_STATS              |
+| INNODB_TRX                            |
+| INNODB_BUFFER_PAGE                    |
 | INNODB_LOCK_WAITS                     |
 | INNODB_CMPMEM                         |
 | INNODB_CMP                            |
-| INNODB_LOCKS                          |
+| INNODB_SPACE_STATS                    |
 | INNODB_CMPMEM_RESET                   |
 | INNODB_CMP_RESET                      |
 | INNODB_BUFFER_PAGE_LRU                |
+| INNODB_BUFFER_PAGE_BASIC              |
+| INNODB_LOCKS                          |
 +---------------------------------------+
 Wildcard: inf_rmation_schema
 +--------------------+

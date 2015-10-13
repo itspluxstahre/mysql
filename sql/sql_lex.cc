@@ -1,4 +1,5 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/*
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -28,7 +29,7 @@
 #include "sp.h"
 #include "sp_head.h"
 
-static int lex_one_token(void *arg, void *yythd);
+static int lex_one_token(YYSTYPE *yylval, THD *thd);
 
 /*
   We are using pointer to this variable for distinguishing between assignment
@@ -61,10 +62,14 @@ Query_tables_list::binlog_stmt_unsafe_errcode[BINLOG_STMT_UNSAFE_COUNT] =
   ER_BINLOG_UNSAFE_MIXED_STATEMENT,
   ER_BINLOG_UNSAFE_INSERT_IGNORE_SELECT,
   ER_BINLOG_UNSAFE_INSERT_SELECT_UPDATE,
+  ER_BINLOG_UNSAFE_WRITE_AUTOINC_SELECT,
   ER_BINLOG_UNSAFE_REPLACE_SELECT,
   ER_BINLOG_UNSAFE_CREATE_IGNORE_SELECT,
   ER_BINLOG_UNSAFE_CREATE_REPLACE_SELECT,
-  ER_BINLOG_UNSAFE_UPDATE_IGNORE
+  ER_BINLOG_UNSAFE_CREATE_SELECT_AUTOINC,
+  ER_BINLOG_UNSAFE_UPDATE_IGNORE,
+  ER_BINLOG_UNSAFE_INSERT_TWO_KEYS,
+  ER_BINLOG_UNSAFE_AUTOINC_NOT_FIRST
 };
 
 
@@ -367,6 +372,7 @@ void lex_start(THD *thd)
   /* 'parent_lex' is used in init_query() so it must be before it. */
   lex->select_lex.parent_lex= lex;
   lex->select_lex.init_query();
+  lex->load_set_str_list.empty();
   lex->value_list.empty();
   lex->update_list.empty();
   lex->set_var_list.empty();
@@ -387,6 +393,8 @@ void lex_start(THD *thd)
   lex->select_lex.sql_cache= SELECT_LEX::SQL_CACHE_UNSPECIFIED;
   lex->select_lex.init_order();
   lex->select_lex.group_list.empty();
+  if (lex->select_lex.group_list_ptrs)
+    lex->select_lex.group_list_ptrs->clear();
   lex->describe= 0;
   lex->subqueries= FALSE;
   lex->context_analysis_only= 0;
@@ -403,6 +411,7 @@ void lex_start(THD *thd)
   lex->select_lex.ftfunc_list= &lex->select_lex.ftfunc_list_alloc;
   lex->select_lex.group_list.empty();
   lex->select_lex.order_list.empty();
+  lex->select_lex.gorder_list.empty();
   lex->duplicates= DUP_ERROR;
   lex->ignore= 0;
   lex->spname= NULL;
@@ -415,6 +424,7 @@ void lex_start(THD *thd)
   lex->reset_query_tables_list(FALSE);
   lex->expr_allows_subselect= TRUE;
   lex->use_only_table_context= FALSE;
+  lex->drop_if_exists= FALSE;
 
   lex->name.str= 0;
   lex->name.length= 0;
@@ -444,6 +454,7 @@ void lex_start(THD *thd)
   lex->reset_slave_info.all= false;
 
   lex->max_statement_time= 0;
+  lex->lock_table_no_wait = FALSE;
 
   DBUG_VOID_RETURN;
 }
@@ -858,16 +869,17 @@ bool consume_comment(Lex_input_stream *lip, int remaining_recursions_permitted)
 /*
   MYSQLlex remember the following states from the following MYSQLlex()
 
+  @param yylval         [out]  semantic value of the token being parsed (yylval)
+  @param thd            THD
+
   - MY_LEX_EOQ			Found end of query
   - MY_LEX_OPERATOR_OR_IDENT	Last state was an ident, text or number
 				(which can't be followed by a signed number)
 */
 
-int MYSQLlex(void *arg, void *yythd)
+int MYSQLlex(YYSTYPE *yylval, THD *thd)
 {
-  THD *thd= (THD *)yythd;
   Lex_input_stream *lip= & thd->m_parser_state->m_lip;
-  YYSTYPE *yylval=(YYSTYPE*) arg;
   int token;
 
   if (lip->lookahead_token >= 0)
@@ -883,7 +895,7 @@ int MYSQLlex(void *arg, void *yythd)
     return token;
   }
 
-  token= lex_one_token(arg, yythd);
+  token= lex_one_token(yylval, thd);
 
   switch(token) {
   case WITH:
@@ -894,7 +906,7 @@ int MYSQLlex(void *arg, void *yythd)
       to transform the grammar into a LALR(1) grammar,
       which sql_yacc.yy can process.
     */
-    token= lex_one_token(arg, yythd);
+    token= lex_one_token(yylval, thd);
     switch(token) {
     case CUBE_SYM:
       return WITH_CUBE_SYM;
@@ -917,17 +929,15 @@ int MYSQLlex(void *arg, void *yythd)
   return token;
 }
 
-int lex_one_token(void *arg, void *yythd)
+static int lex_one_token(YYSTYPE *yylval, THD *thd)
 {
   reg1	uchar c= 0;
   bool comment_closed;
   int	tokval, result_state;
   uint length;
   enum my_lex_states state;
-  THD *thd= (THD *)yythd;
   Lex_input_stream *lip= & thd->m_parser_state->m_lip;
   LEX *lex= thd->lex;
-  YYSTYPE *yylval=(YYSTYPE*) arg;
   CHARSET_INFO *cs= thd->charset();
   uchar *state_map= cs->state_map;
   uchar *ident_map= cs->ident_map;
@@ -1647,7 +1657,8 @@ Alter_info::Alter_info(const Alter_info &rhs, MEM_ROOT *mem_root)
   num_parts(rhs.num_parts),
   change_level(rhs.change_level),
   datetime_field(rhs.datetime_field),
-  error_if_not_empty(rhs.error_if_not_empty)
+  error_if_not_empty(rhs.error_if_not_empty),
+  lock_mode(rhs.lock_mode)
 {
   /*
     Make deep copies of used objects.
@@ -1663,6 +1674,26 @@ Alter_info::Alter_info(const Alter_info &rhs, MEM_ROOT *mem_root)
   list_copy_and_replace_each_value(key_list, mem_root);
   list_copy_and_replace_each_value(create_list, mem_root);
   /* partition_names are not deeply copied currently */
+}
+
+
+/**
+  Sets the lock mode for an ALTER TABLE operation, as specified
+  in the LOCK clause
+
+  @param lm String representing the lock mode.
+
+  @return false if the lock mode is supported, true otherwise.
+*/
+bool Alter_info::set_lock_mode(const LEX_STRING *lm)
+{
+  /* Match lock mode name to avoid adding new keywords to the grammar. */
+  if (!my_strcasecmp(system_charset_info, lm->str, "EXCLUSIVE"))
+    lock_mode= ALTER_TABLE_LOCK_EXCLUSIVE;
+  else
+    return true;
+
+  return false;
 }
 
 
@@ -1755,8 +1786,11 @@ void st_select_lex::init_query()
   cond_count= between_count= with_wild= 0;
   max_equal_elems= 0;
   ref_pointer_array= 0;
+  ref_pointer_array_size= 0;
   select_n_where_fields= 0;
   select_n_having_items= 0;
+  n_sum_items= 0;
+  n_child_sum_items= 0;
   subquery_in_having= explicit_limit= 0;
   is_item_list_lookup= 0;
   first_execution= 1;
@@ -1774,6 +1808,8 @@ void st_select_lex::init_select()
 {
   st_select_lex_node::init_select();
   group_list.empty();
+  if (group_list_ptrs)
+    group_list_ptrs->clear();
   type= db= 0;
   having= 0;
   table_join_options= 0;
@@ -2058,6 +2094,11 @@ bool st_select_lex::add_order_to_list(THD *thd, Item *item, bool asc)
 }
 
 
+bool st_select_lex::add_gorder_to_list(THD *thd, Item *item, bool asc)
+{
+  return add_to_list(thd, gorder_list, item, asc);
+}
+
 bool st_select_lex::add_item_to_list(THD *thd, Item *item)
 {
   DBUG_ENTER("st_select_lex::add_item_to_list");
@@ -2128,9 +2169,6 @@ ulong st_select_lex::get_table_join_options()
 
 bool st_select_lex::setup_ref_array(THD *thd, uint order_group_num)
 {
-  if (ref_pointer_array)
-    return 0;
-
   // find_order_in_list() may need some extra space, so multiply by two.
   order_group_num*= 2;
 
@@ -2139,12 +2177,29 @@ bool st_select_lex::setup_ref_array(THD *thd, uint order_group_num)
     prepared statement
   */
   Query_arena *arena= thd->stmt_arena;
-  return (ref_pointer_array=
-          (Item **)arena->alloc(sizeof(Item*) * (n_child_sum_items +
-                                                 item_list.elements +
-                                                 select_n_having_items +
-                                                 select_n_where_fields +
-                                                 order_group_num)*5)) == 0;
+  const uint n_elems= (n_sum_items +
+                       n_child_sum_items +
+                       item_list.elements +
+                       select_n_having_items +
+                       select_n_where_fields +
+                       order_group_num) * 5;
+  if (ref_pointer_array != NULL)
+  {
+    /*
+      We need to take 'n_sum_items' into account when allocating the array,
+      and this may actually increase during the optimization phase due to
+      MIN/MAX rewrite in Item_in_subselect::single_value_transformer.
+      In the usual case we can reuse the array from the prepare phase.
+      If we need a bigger array, we must allocate a new one.
+    */
+    if (ref_pointer_array_size >= n_elems)
+      return false;
+  }
+  ref_pointer_array= static_cast<Item**>(arena->alloc(sizeof(Item*) * n_elems));
+  if (ref_pointer_array != NULL)
+    ref_pointer_array_size= n_elems;
+
+  return ref_pointer_array == NULL;
 }
 
 
@@ -3101,6 +3156,8 @@ static void fix_prepare_info_in_table_list(THD *thd, TABLE_LIST *tbl)
     The passed WHERE and HAVING are to be saved for the future executions.
     This function saves it, and returns a copy which can be thrashed during
     this execution of the statement. By saving/thrashing here we mean only
+    We also save the chain of ORDER::next in group_list, in case
+    the list is modified by remove_const().
     AND/OR trees.
     The function also calls fix_prepare_info_in_table_list that saves all
     ON expressions.    
@@ -3112,6 +3169,19 @@ void st_select_lex::fix_prepare_information(THD *thd, Item **conds,
   if (!thd->stmt_arena->is_conventional() && first_execution)
   {
     first_execution= 0;
+    if (group_list.first)
+    {
+      if (!group_list_ptrs)
+      {
+        void *mem= thd->stmt_arena->alloc(sizeof(Group_list_ptrs));
+        group_list_ptrs= new (mem) Group_list_ptrs(thd->stmt_arena->mem_root);
+      }
+      group_list_ptrs->reserve(group_list.elements);
+      for (ORDER *order= group_list.first; order; order= order->next)
+      {
+        group_list_ptrs->push_back(order);
+      }
+    }
     if (*conds)
     {
       prep_where= *conds;
@@ -3362,4 +3432,8 @@ void binlog_unsafe_map_init()
   UNSAFE(LEX::STMT_WRITES_TEMP_NON_TRANS_TABLE, LEX::STMT_READS_NON_TRANS_TABLE,
      BINLOG_DIRECT_OFF & TRX_CACHE_NOT_EMPTY);
 }
+#endif
+
+#ifdef HAVE_EXPLICIT_TEMPLATE_INSTANTIATION
+template class Mem_root_array<ORDER*, true>;
 #endif

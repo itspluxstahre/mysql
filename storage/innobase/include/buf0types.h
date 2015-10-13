@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -61,6 +61,15 @@ enum buf_io_fix {
 	BUF_IO_PIN			/**< disallow relocation of
 					block and its removal of from
 					the flush_list */
+};
+
+/** Algorithm to remove the pages for a tablespace from the buffer pool.
+@See buf_LRU_flush_or_remove_pages(). */
+enum buf_remove_t {
+	BUF_REMOVE_ALL_NO_WRITE,	/*!< Remove all pages from the buffer
+					pool, don't write or sync to disk */
+	BUF_REMOVE_FLUSH_NO_WRITE	/*!< Remove only, from the flush list,
+					don't write or sync to disk */
 };
 
 /** Parameters of binary buddy system for compressed pages (buf0buddy.h) */

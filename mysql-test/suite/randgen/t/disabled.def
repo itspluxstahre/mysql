@@ -1,1 +1,2 @@
 rpl_semi_sync : Generates too much output to the error log and also fails occasionally.
+engine_varchar : Bug#65338: InnoDB assertion: unable to decompress space

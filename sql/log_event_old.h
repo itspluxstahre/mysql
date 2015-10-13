@@ -1,4 +1,4 @@
-/* Copyright 2007 MySQL AB. All rights reserved.
+/* Copyright (c) 2007, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,7 +11,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 #ifndef LOG_EVENT_OLD_H
 #define LOG_EVENT_OLD_H
@@ -203,10 +203,8 @@ protected:
   { 
     DBUG_ASSERT(m_table);
     ASSERT_OR_RETURN_ERROR(m_curr_row < m_rows_end, HA_ERR_CORRUPT_EVENT);
-    int const result= ::unpack_row(rli, m_table, m_width, m_curr_row, &m_cols,
-                                   &m_curr_row_end, &m_master_reclength);
-    ASSERT_OR_RETURN_ERROR(m_curr_row_end <= m_rows_end, HA_ERR_CORRUPT_EVENT);
-    return result;
+    return ::unpack_row(rli, m_table, m_width, m_curr_row, &m_cols,
+                                   &m_curr_row_end, &m_master_reclength, m_rows_end);
   }
 #endif
 

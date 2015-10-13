@@ -1,5 +1,5 @@
 /*
-   Copyright (C) 2006 MySQL AB
+   Copyright (c) 2006, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -17,6 +17,10 @@
 */
 
 /* client.cpp  */
+
+// takes an optional command line argument of cipher list to make scripting
+// easier
+
 
 #include "../../testsuite/test.hpp"
 
@@ -36,15 +40,20 @@ void ClientError(SSL_CTX* ctx, SSL* ssl, SOCKET_T& sockfd, const char* msg)
     void NonBlockingSSL_Connect(SSL* ssl, SSL_CTX* ctx, SOCKET_T& sockfd)
     {
         int ret = SSL_connect(ssl);
-        while (ret =! SSL_SUCCESS && SSL_get_error(ssl, 0) ==
-                                     SSL_ERROR_WANT_READ) {
-            printf("... client would block\n");
+        int err = SSL_get_error(ssl, 0);
+        while (ret != SSL_SUCCESS && (err == SSL_ERROR_WANT_READ ||
+                                      err == SSL_ERROR_WANT_WRITE)) {
+            if (err == SSL_ERROR_WANT_READ)
+                printf("... client would read block\n");
+            else
+                printf("... client would write block\n");
             #ifdef _WIN32
                 Sleep(1000);
             #else
                 sleep(1);
             #endif
             ret = SSL_connect(ssl);
+            err = SSL_get_error(ssl, 0);
         }
         if (ret != SSL_SUCCESS)
             ClientError(ctx, ssl, sockfd, "SSL_connect failed");
@@ -68,11 +77,16 @@ void client_test(void* args)
 #ifdef NON_BLOCKING
     tcp_set_nonblocking(sockfd);
 #endif
-
     SSL_METHOD* method = TLSv1_client_method();
     SSL_CTX*    ctx = SSL_CTX_new(method);
 
     set_certs(ctx);
+    if (argc >= 2) {
+        printf("setting cipher list to %s\n", argv[1]);
+        if (SSL_CTX_set_cipher_list(ctx, argv[1]) != SSL_SUCCESS) {
+            ClientError(ctx, NULL, sockfd, "set_cipher_list error\n");
+        }
+    }
     SSL* ssl = SSL_new(ctx);
 
     SSL_set_fd(ssl, sockfd);
@@ -81,7 +95,8 @@ void client_test(void* args)
 #ifdef NON_BLOCKING
     NonBlockingSSL_Connect(ssl, ctx, sockfd);
 #else
-    if (SSL_connect(ssl) != SSL_SUCCESS)
+    // if you get an error here see note at top of README
+    if (SSL_connect(ssl) != SSL_SUCCESS)   
         ClientError(ctx, ssl, sockfd, "SSL_connect failed");
 #endif
     showPeer(ssl);
@@ -105,7 +120,7 @@ void client_test(void* args)
     int input = SSL_read(ssl, reply, sizeof(reply));
     if (input > 0) {
         reply[input] = 0;
-    printf("Server response: %s\n", reply);
+        printf("Server response: %s\n", reply);
     }
 
 #ifdef TEST_RESUME
@@ -121,18 +136,18 @@ void client_test(void* args)
     tcp_connect(sockfd);
     SSL_set_fd(sslResume, sockfd);
     SSL_set_session(sslResume, session);
-    
+
     if (SSL_connect(sslResume) != SSL_SUCCESS)
         ClientError(ctx, sslResume, sockfd, "SSL_resume failed");
     showPeer(sslResume);
-  
+
     if (SSL_write(sslResume, msg, sizeof(msg)) != sizeof(msg))
         ClientError(ctx, sslResume, sockfd, "SSL_write failed");
 
     input = SSL_read(sslResume, reply, sizeof(reply));
     if (input > 0) {
         reply[input] = 0;
-    printf("Server response: %s\n", reply);
+        printf("Server response: %s\n", reply);
     }
 
     SSL_shutdown(sslResume);

@@ -1,7 +1,7 @@
 #ifndef CLIENT_SQL_STRING_INCLUDED
 #define CLIENT_SQL_STRING_INCLUDED
 
-/* Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -192,8 +192,12 @@ public:
   }
   bool real_alloc(uint32 arg_length);			// Empties old string
   bool realloc(uint32 arg_length);
-  inline void shrink(uint32 arg_length)		// Shrink buffer
+
+  // Shrink the buffer, but only if it is allocated on the heap.
+  inline void shrink(uint32 arg_length)
   {
+    if (!is_alloced())
+      return;
     if (arg_length < Alloced_length)
     {
       char *new_ptr;
@@ -209,7 +213,7 @@ public:
       }
     }
   }
-  bool is_alloced() { return alloced; }
+  bool is_alloced() const { return alloced; }
   inline String& operator = (const String &s)
   {
     if (&s != this)
@@ -221,6 +225,7 @@ public:
       DBUG_ASSERT(!s.uses_buffer_owned_by(this));
       free();
       Ptr=s.Ptr ; str_length=s.str_length ; Alloced_length=s.Alloced_length;
+      str_charset=s.str_charset;
       alloced=0;
     }
     return *this;

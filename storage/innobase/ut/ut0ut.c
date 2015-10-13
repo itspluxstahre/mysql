@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2011, Oracle Corpn. All Rights Reserved.
+Copyright (c) 2011, 2012, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -38,6 +38,8 @@ Created 5/11/1994 Heikki Tuuri
 # include "ha_prototypes.h"
 # include "mysql_com.h" /* NAME_LEN */
 #endif /* UNIV_HOTBACKUP */
+
+#include "os0proc.h" /* os_proc_get_number */
 
 /** A constant to prevent the compiler from optimizing ut_delay() away. */
 UNIV_INTERN ibool	ut_always_false	= FALSE;
@@ -232,20 +234,25 @@ ut_print_timestamp(
 /*===============*/
 	FILE*  file) /*!< in: file where to print */
 {
+	ulint proc_number = os_proc_get_number();
+
 #ifdef __WIN__
 	SYSTEMTIME cal_tm;
 
 	GetLocalTime(&cal_tm);
 
-	fprintf(file,"%02d%02d%02d %2d:%02d:%02d",
-		(int)cal_tm.wYear % 100,
+	fprintf(file, "%d-%02d-%02d %02d:%02d:%02d %lu",
+		(int)cal_tm.wYear,
 		(int)cal_tm.wMonth,
 		(int)cal_tm.wDay,
 		(int)cal_tm.wHour,
 		(int)cal_tm.wMinute,
-		(int)cal_tm.wSecond);
+		(int)cal_tm.wSecond,
+		proc_number);
 #else
+#ifdef HAVE_LOCALTIME_R
 	struct tm  cal_tm;
+#endif
 	struct tm* cal_tm_ptr;
 	time_t	   tm;
 
@@ -257,13 +264,14 @@ ut_print_timestamp(
 #else
 	cal_tm_ptr = localtime(&tm);
 #endif
-	fprintf(file,"%02d%02d%02d %2d:%02d:%02d",
-		cal_tm_ptr->tm_year % 100,
+	fprintf(file, "%d-%02d-%02d %02d:%02d:%02d %lu",
+		cal_tm_ptr->tm_year + 1900,
 		cal_tm_ptr->tm_mon + 1,
 		cal_tm_ptr->tm_mday,
 		cal_tm_ptr->tm_hour,
 		cal_tm_ptr->tm_min,
-		cal_tm_ptr->tm_sec);
+		cal_tm_ptr->tm_sec,
+		proc_number);
 #endif
 }
 
@@ -288,7 +296,9 @@ ut_sprintf_timestamp(
 		(int)cal_tm.wMinute,
 		(int)cal_tm.wSecond);
 #else
+#ifdef HAVE_LOCALTIME_R
 	struct tm  cal_tm;
+#endif
 	struct tm* cal_tm_ptr;
 	time_t	   tm;
 
@@ -333,7 +343,9 @@ ut_sprintf_timestamp_without_extra_chars(
 		(int)cal_tm.wMinute,
 		(int)cal_tm.wSecond);
 #else
+#ifdef HAVE_LOCALTIME_R
 	struct tm  cal_tm;
+#endif
 	struct tm* cal_tm_ptr;
 	time_t	   tm;
 
@@ -374,7 +386,9 @@ ut_get_year_month_day(
 	*month = (ulint)cal_tm.wMonth;
 	*day = (ulint)cal_tm.wDay;
 #else
+#ifdef HAVE_LOCALTIME_R
 	struct tm  cal_tm;
+#endif
 	struct tm* cal_tm_ptr;
 	time_t	   tm;
 
@@ -623,8 +637,8 @@ returned string is static and should not be freed or modified.
 @return	string, describing the error */
 UNIV_INTERN
 const char*
-ut_strerr(
-/*======*/
+ut_get_strerr(
+/*==========*/
 	enum db_err	num)	/*!< in: error number */
 {
 	switch (num) {
@@ -718,9 +732,31 @@ ut_strerr(
 		return("Undo record too big");
 	case DB_END_OF_INDEX:
 		return("End of index");
+	case DB_TABLE_IN_FK_CHECK:
+		return("Table is being used in foreign key check");
+	case DB_IDENTIFIER_TOO_LONG:
+		return("Identifier name is too long");
 	/* do not add default: in order to produce a warning if new code
 	is added to the enum but not added here */
 	}
+
+	return(NULL);
+}
+
+/*************************************************************//**
+Convert an error number to a human readable text message. The
+returned string is static and should not be freed or modified.
+@return	string, describing the error. Otherwise, abort. */
+UNIV_INTERN
+const char*
+ut_strerr(
+/*======*/
+	enum db_err	num)	/*!< in: error number */
+{
+	const char *str;
+
+	if ((str = ut_get_strerr(num)))
+		return(str);
 
 	/* we abort here because if unknown error code is given, this could
 	mean that memory corruption has happened and someone's error-code

@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -208,17 +208,6 @@ row_vers_impl_x_locked_off_kernel(
 		vers_del = rec_get_deleted_flag(prev_version, comp);
 		prev_trx_id = row_get_rec_trx_id(prev_version, clust_index,
 						 clust_offsets);
-
-		/* If the trx_id and prev_trx_id are different and if
-		the prev_version is marked deleted then the
-		prev_trx_id must have already committed for the trx_id
-		to be able to modify the row. Therefore, prev_trx_id
-		cannot hold any implicit lock. */
-		if (vers_del && trx_id != prev_trx_id) {
-
-			mutex_enter(&kernel_mutex);
-			break;
-		}
 
 		/* The stack of versions is locked by mtr.  Thus, it
 		is safe to fetch the prefixes for externally stored

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1312,7 +1312,7 @@ void close_files()
 void free_used_memory()
 {
   uint i;
-  DBUG_ENTER("free_used_memory");
+  // Do not use DBUG_ENTER("free_used_memory"); here, see below.
 
   if (connections)
     close_connections();
@@ -3052,6 +3052,8 @@ void do_exec(struct st_command *command)
           command->first_argument, ds_res.str);
     }
 
+    var_set_int("$exec_exit_status", status);
+
     DBUG_PRINT("info",
                ("error: %d, status: %d", error, status));
 
@@ -3077,6 +3079,10 @@ void do_exec(struct st_command *command)
     dynstr_free(&ds_cmd);
     die("command \"%s\" succeeded - should have failed with errno %d...",
         command->first_argument, command->expected_errors.err[0].code.errnum);
+  }
+  else
+  {
+    var_set_int("$exec_exit_status", error);
   }
 
   dynstr_free(&ds_cmd);
@@ -3326,8 +3332,12 @@ void do_remove_files_wildcard(struct st_command *command)
   /* Set default wild chars for wild_compare, is changed in embedded mode */
   set_wild_chars(1);
   
+  uint length;
+  /* Storing the length of the path to the file, so it can be reused */
+  length= ds_file_to_remove.length;
   for (i= 0; i < (uint) dir_info->number_off_files; i++)
   {
+    ds_file_to_remove.length= length;
     file= dir_info->dir_entry + i;
     /* Remove only regular files, i.e. no directories etc. */
     /* if (!MY_S_ISREG(file->mystat->st_mode)) */
@@ -3337,8 +3347,10 @@ void do_remove_files_wildcard(struct st_command *command)
     if (ds_wild.length &&
         wild_compare(file->name, ds_wild.str, 0))
       continue;
-    ds_file_to_remove.length= ds_directory.length + 1;
-    ds_file_to_remove.str[ds_directory.length + 1]= 0;
+    /* Not required as the var ds_file_to_remove.length already has the
+       length in canonnicalized form */
+    /* ds_file_to_remove.length= ds_directory.length + 1;
+    ds_file_to_remove.str[ds_directory.length + 1]= 0; */
     dynstr_append(&ds_file_to_remove, file->name);
     DBUG_PRINT("info", ("removing file: %s", ds_file_to_remove.str));
     error= my_delete(ds_file_to_remove.str, MYF(0)) != 0;
@@ -4075,7 +4087,10 @@ void do_change_user(struct st_command *command)
                       cur_con->name, ds_user.str, ds_passwd.str, ds_db.str));
 
   if (mysql_change_user(mysql, ds_user.str, ds_passwd.str, ds_db.str))
-    die("change user failed: %s", mysql_error(mysql));
+    handle_error(command, mysql_errno(mysql), mysql_error(mysql),
+                 mysql_sqlstate(mysql), &ds_res);
+  else
+    handle_no_error(command);
 
   dynstr_free(&ds_user);
   dynstr_free(&ds_passwd);
@@ -4823,7 +4838,7 @@ typedef struct
 
 static st_error global_error_names[] =
 {
-  { "<No error>", -1, "" },
+  { "<No error>", -1U, "" },
 #include <mysqld_ername.h>
   { 0, 0, 0 }
 };
@@ -5456,7 +5471,7 @@ void do_connect(struct st_command *command)
   int con_port= opt_port;
   char *con_options;
   my_bool con_ssl= 0, con_compress= 0;
-  my_bool con_pipe= 0, con_shm= 0;
+  my_bool con_pipe= 0, con_shm= 0, con_cleartext_enable= 0;
   struct st_connection* con_slot;
 
   static DYNAMIC_STRING ds_connection_name;
@@ -5546,6 +5561,8 @@ void do_connect(struct st_command *command)
       con_pipe= 1;
     else if (!strncmp(con_options, "SHM", 3))
       con_shm= 1;
+    else if (!strncmp(con_options, "CLEARTEXT", 9))
+      con_cleartext_enable= 1;
     else
       die("Illegal option to connect: %.*s", 
           (int) (end - con_options), con_options);
@@ -5642,6 +5659,10 @@ void do_connect(struct st_command *command)
   if (ds_default_auth.length)
     mysql_options(&con_slot->mysql, MYSQL_DEFAULT_AUTH, ds_default_auth.str);
 
+
+  if (con_cleartext_enable)
+    mysql_options(&con_slot->mysql, MYSQL_ENABLE_CLEARTEXT_PLUGIN,
+                  (char*) &con_cleartext_enable);
   /* Special database to allow one to connect without a database name */
   if (ds_database.length && !strcmp(ds_database.str,"*NO-ONE*"))
     dynstr_set(&ds_database, "");
@@ -6599,7 +6620,7 @@ void print_version(void)
 void usage()
 {
   print_version();
-  puts(ORACLE_WELCOME_COPYRIGHT_NOTICE("2000, 2011"));
+  puts(ORACLE_WELCOME_COPYRIGHT_NOTICE("2000"));
   printf("Runs a test against the mysql server and compares output with a results file.\n\n");
   printf("Usage: %s [OPTIONS] [database] < test_file\n", my_progname);
   my_print_help(my_long_options);
@@ -7303,6 +7324,8 @@ void run_query_normal(struct st_connection *cn, struct st_command *command,
     */
     if ((counter==0) && do_read_query_result(cn))
     {
+      /* we've failed to collect the result set */
+      cn->pending= TRUE;
       handle_error(command, mysql_errno(mysql), mysql_error(mysql),
 		   mysql_sqlstate(mysql), ds);
       goto end;

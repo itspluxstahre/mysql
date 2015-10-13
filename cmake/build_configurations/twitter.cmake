@@ -23,7 +23,8 @@ SET(FEATURE_SET "community" CACHE STRING "Twitter MySQL feature set.")
 IF(FEATURE_SET)
   STRING(TOLOWER ${FEATURE_SET} FEATURE_SET)
   IF(FEATURE_SET STREQUAL "community")
-    SET(WITH_EMBEDDED_SERVER TRUE CACHE BOOL "Embedded MySQL Server Library")
+    # Disable embedded MySQL server library
+    SET(WITH_EMBEDDED_SERVER FALSE CACHE BOOL "Disable embedded library")
   ELSE()
     MESSAGE(FATAL_ERROR "Unknown feature set.")
   ENDIF()
@@ -33,14 +34,28 @@ ENDIF()
 # Compiler options.
 #
 
-IF(CMAKE_COMPILER_IS_GNUCC AND CMAKE_COMPILER_IS_GNUCXX)
-  SET(COMMON_FLAGS "-g -fno-omit-frame-pointer -fno-strict-aliasing")
-  SET(CMAKE_C_FLAGS_DEBUG "-O ${COMMON_FLAGS}")
-  SET(CMAKE_C_FLAGS_RELWITHDEBINFO "-O3 ${COMMON_FLAGS}")
-  SET(CMAKE_CXX_FLAGS_DEBUG "-O ${COMMON_FLAGS}")
-  SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 ${COMMON_FLAGS}")
-ELSE()
-  MESSAGE(WARNING "There are no specific compiler options.")
+# Default GCC flags
+IF(CMAKE_COMPILER_IS_GNUCC)
+  SET(COMMON_C_FLAGS               "-g -static-libgcc -fno-omit-frame-pointer -fno-strict-aliasing")
+  SET(CMAKE_C_FLAGS_DEBUG          "-O ${COMMON_C_FLAGS}")
+  SET(CMAKE_C_FLAGS_RELWITHDEBINFO "-O3 ${COMMON_C_FLAGS}")
+ENDIF()
+IF(CMAKE_COMPILER_IS_GNUCXX)
+  SET(COMMON_CXX_FLAGS               "-g -static-libgcc -fno-omit-frame-pointer -fno-strict-aliasing")
+  SET(CMAKE_CXX_FLAGS_DEBUG          "-O ${COMMON_CXX_FLAGS}")
+  SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 ${COMMON_CXX_FLAGS}")
+ENDIF()
+
+# Default Clang flags
+IF(CMAKE_C_COMPILER_ID MATCHES "Clang")
+  SET(COMMON_C_FLAGS               "-g -fno-omit-frame-pointer -fno-strict-aliasing")
+  SET(CMAKE_C_FLAGS_DEBUG          "${COMMON_C_FLAGS}")
+  SET(CMAKE_C_FLAGS_RELWITHDEBINFO "-O3 ${COMMON_C_FLAGS}")
+ENDIF()
+IF(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  SET(COMMON_CXX_FLAGS               "-g -fno-omit-frame-pointer -fno-strict-aliasing")
+  SET(CMAKE_CXX_FLAGS_DEBUG          "${COMMON_CXX_FLAGS}")
+  SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 ${COMMON_CXX_FLAGS}")
 ENDIF()
 
 #
@@ -56,9 +71,9 @@ SET(WITHOUT_PERFSCHEMA_STORAGE_ENGINE TRUE BOOL)
 #
 
 SET(WITH_ZLIB system CACHE STRING "Use system zlib")
-
 SET(WITH_LIBEDIT OFF CACHE BOOL "Disable bundled libedit")
 SET(WITH_READLINE OFF CACHE BOOL "Disable bundled readline")
+SET(WITH_SSL system CACHE STRING "Use system openssl")
 
 #
 # Linux-native asynchronous I/O access.

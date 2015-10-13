@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -33,8 +33,8 @@ Created 1/8/1996 Heikki Tuuri
 #include "data0type.h"
 #include "mach0data.h"
 #include "dict0dict.h"
-#include "ha_prototypes.h" /* innobase_casedn_str()*/
 #ifndef UNIV_HOTBACKUP
+# include "ha_prototypes.h" /* innobase_casedn_str()*/
 # include "lock0lock.h"
 #endif /* !UNIV_HOTBACKUP */
 #ifdef UNIV_BLOB_DEBUG
@@ -66,6 +66,7 @@ dict_mem_table_create(
 {
 	dict_table_t*	table;
 	mem_heap_t*	heap;
+	DBUG_ENTER("dict_mem_table_create");
 
 	ut_ad(name);
 	ut_a(!(flags & (~0 << DICT_TF2_BITS)));
@@ -98,8 +99,11 @@ dict_mem_table_create(
 	table->n_waiting_or_granted_auto_inc_locks = 0;
 #endif /* !UNIV_HOTBACKUP */
 
+	table->foreign_rbt = NULL;
+	table->referenced_rbt = NULL;
+
 	ut_d(table->magic_n = DICT_TABLE_MAGIC_N);
-	return(table);
+	DBUG_RETURN(table);
 }
 
 /****************************************************************//**
@@ -117,6 +121,15 @@ dict_mem_table_free(
 #ifndef UNIV_HOTBACKUP
 	mutex_free(&(table->autoinc_mutex));
 #endif /* UNIV_HOTBACKUP */
+
+	if (table->foreign_rbt != NULL) {
+		rbt_free(table->foreign_rbt);
+	}
+
+	if (table->referenced_rbt != NULL) {
+		rbt_free(table->referenced_rbt);
+	}
+
 	ut_free(table->name);
 	mem_heap_free(table->heap);
 }
@@ -272,6 +285,7 @@ dict_mem_index_create(
 	return(index);
 }
 
+#ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Creates and initializes a foreign constraint memory object.
 @return	own: foreign constraint struct */
@@ -346,6 +360,7 @@ dict_mem_referenced_table_name_lookup_set(
 	}
 }
 
+#endif /* !UNIV_HOTBACKUP */
 /**********************************************************************//**
 Adds a field definition to an index. NOTE: does not take a copy
 of the column name if the field is a column. The memory occupied

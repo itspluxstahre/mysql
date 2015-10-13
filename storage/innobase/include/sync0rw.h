@@ -18,8 +18,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -154,6 +154,9 @@ unlocking, not the corresponding function. */
 # define rw_lock_s_lock(M)					\
 	rw_lock_s_lock_func((M), 0, __FILE__, __LINE__)
 
+# define rw_lock_s_lock_inline(M, P, F, L)			\
+	rw_lock_s_lock_func((M), (P), (F), (L))
+
 # define rw_lock_s_lock_gen(M, P)				\
 	rw_lock_s_lock_func((M), (P), __FILE__, __LINE__)
 
@@ -170,11 +173,17 @@ unlocking, not the corresponding function. */
 # define rw_lock_x_lock(M)					\
 	rw_lock_x_lock_func((M), 0, __FILE__, __LINE__)
 
+# define rw_lock_x_lock_inline(M, P, F, L)			\
+	rw_lock_x_lock_func((M), (P), (F), (L))
+
 # define rw_lock_x_lock_gen(M, P)				\
 	rw_lock_x_lock_func((M), (P), __FILE__, __LINE__)
 
 # define rw_lock_x_lock_nowait(M)				\
 	rw_lock_x_lock_func_nowait((M), __FILE__, __LINE__)
+
+# define rw_lock_x_lock_func_nowait_inline(M, F, L)		\
+	rw_lock_x_lock_func_nowait((M), (F), (L))
 
 # ifdef UNIV_SYNC_DEBUG
 #  define rw_lock_x_unlock_gen(L, P)	rw_lock_x_unlock_func(P, L)
@@ -207,6 +216,9 @@ unlocking, not the corresponding function. */
 # define rw_lock_s_lock(M)					\
 	pfs_rw_lock_s_lock_func((M), 0, __FILE__, __LINE__)
 
+# define rw_lock_s_lock_inline(M, P, F, L)			\
+	pfs_rw_lock_s_lock_func((M), (P), (F), (L))
+
 # define rw_lock_s_lock_gen(M, P)				\
 	pfs_rw_lock_s_lock_func((M), (P), __FILE__, __LINE__)
 
@@ -222,11 +234,17 @@ unlocking, not the corresponding function. */
 # define rw_lock_x_lock(M)					\
 	pfs_rw_lock_x_lock_func((M), 0, __FILE__, __LINE__)
 
+# define rw_lock_x_lock_inline(M, P, F, L)			\
+	pfs_rw_lock_x_lock_func((M), (P), (F), (L))
+
 # define rw_lock_x_lock_gen(M, P)				\
 	pfs_rw_lock_x_lock_func((M), (P), __FILE__, __LINE__)
 
 # define rw_lock_x_lock_nowait(M)				\
 	pfs_rw_lock_x_lock_func_nowait((M), __FILE__, __LINE__)
+
+# define rw_lock_x_lock_func_nowait_inline(M, F, L)		\
+	pfs_rw_lock_x_lock_func_nowait((M), (F), (L))
 
 # ifdef UNIV_SYNC_DEBUG
 #  define rw_lock_x_unlock_gen(L, P)	pfs_rw_lock_x_unlock_func(P, L)

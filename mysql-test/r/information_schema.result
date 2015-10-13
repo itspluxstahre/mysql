@@ -46,10 +46,12 @@ table_name not like 'ndb_%' AND table_name not like 'innodb_%';
 select * from v1;
 c
 CHARACTER_SETS
+CLIENT_STATISTICS
 COLLATIONS
 COLLATION_CHARACTER_SET_APPLICABILITY
 COLUMNS
 COLUMN_PRIVILEGES
+INDEX_STATISTICS
 ENGINES
 EVENTS
 FILES
@@ -61,6 +63,7 @@ PARTITIONS
 PLUGINS
 PROCESSLIST
 PROFILING
+QUERY_STATISTICS
 REFERENTIAL_CONSTRAINTS
 ROUTINES
 SCHEMATA
@@ -72,8 +75,11 @@ TABLES
 TABLESPACES
 TABLE_CONSTRAINTS
 TABLE_PRIVILEGES
+TABLE_STATISTICS
+THREAD_STATISTICS
 TRIGGERS
 USER_PRIVILEGES
+USER_STATISTICS
 VIEWS
 columns_priv
 db
@@ -112,6 +118,8 @@ TABLES	TABLES
 TABLESPACES	TABLESPACES
 TABLE_CONSTRAINTS	TABLE_CONSTRAINTS
 TABLE_PRIVILEGES	TABLE_PRIVILEGES
+TABLE_STATISTICS	TABLE_STATISTICS
+THREAD_STATISTICS	THREAD_STATISTICS
 TRIGGERS	TRIGGERS
 tables_priv	tables_priv
 time_zone	time_zone
@@ -132,6 +140,8 @@ TABLES	TABLES
 TABLESPACES	TABLESPACES
 TABLE_CONSTRAINTS	TABLE_CONSTRAINTS
 TABLE_PRIVILEGES	TABLE_PRIVILEGES
+TABLE_STATISTICS	TABLE_STATISTICS
+THREAD_STATISTICS	THREAD_STATISTICS
 TRIGGERS	TRIGGERS
 tables_priv	tables_priv
 time_zone	time_zone
@@ -152,6 +162,8 @@ TABLES	TABLES
 TABLESPACES	TABLESPACES
 TABLE_CONSTRAINTS	TABLE_CONSTRAINTS
 TABLE_PRIVILEGES	TABLE_PRIVILEGES
+TABLE_STATISTICS	TABLE_STATISTICS
+THREAD_STATISTICS	THREAD_STATISTICS
 TRIGGERS	TRIGGERS
 tables_priv	tables_priv
 time_zone	time_zone
@@ -634,13 +646,15 @@ from information_schema.tables
 where table_schema='information_schema' limit 2;
 TABLE_NAME	TABLE_TYPE	ENGINE
 CHARACTER_SETS	SYSTEM VIEW	MEMORY
-COLLATIONS	SYSTEM VIEW	MEMORY
+CLIENT_STATISTICS	SYSTEM VIEW	MEMORY
 show tables from information_schema like "T%";
 Tables_in_information_schema (T%)
 TABLES
 TABLESPACES
 TABLE_CONSTRAINTS
 TABLE_PRIVILEGES
+TABLE_STATISTICS
+THREAD_STATISTICS
 TRIGGERS
 create database information_schema;
 ERROR 42000: Access denied for user 'root'@'localhost' to database 'information_schema'
@@ -651,6 +665,8 @@ TABLES	SYSTEM VIEW
 TABLESPACES	SYSTEM VIEW
 TABLE_CONSTRAINTS	SYSTEM VIEW
 TABLE_PRIVILEGES	SYSTEM VIEW
+TABLE_STATISTICS	SYSTEM VIEW
+THREAD_STATISTICS	SYSTEM VIEW
 TRIGGERS	SYSTEM VIEW
 create table t1(a int);
 ERROR 42000: Access denied for user 'root'@'localhost' to database 'information_schema'
@@ -664,6 +680,8 @@ TABLES
 TABLESPACES
 TABLE_CONSTRAINTS
 TABLE_PRIVILEGES
+TABLE_STATISTICS
+THREAD_STATISTICS
 TRIGGERS
 select table_name from tables where table_name='user';
 table_name
@@ -682,6 +700,7 @@ Lock_tables_priv	select,insert,update,references
 Show_view_priv	select,insert,update,references
 Create_routine_priv	select,insert,update,references
 Alter_routine_priv	select,insert,update,references
+Ignore_logging_priv	select,insert,update,references
 max_questions	select,insert,update,references
 max_connections	select,insert,update,references
 max_user_connections	select,insert,update,references
@@ -785,6 +804,7 @@ information_schema	PARTITIONS	SUBPARTITION_EXPRESSION
 information_schema	PARTITIONS	PARTITION_DESCRIPTION
 information_schema	PLUGINS	PLUGIN_DESCRIPTION
 information_schema	PROCESSLIST	INFO
+information_schema	QUERY_STATISTICS	QUERY_TYPE
 information_schema	ROUTINES	DTD_IDENTIFIER
 information_schema	ROUTINES	ROUTINE_DEFINITION
 information_schema	ROUTINES	ROUTINE_COMMENT
@@ -854,6 +874,7 @@ where COLUMN_NAME='TABLE_NAME';
 TABLE_NAME	COLUMN_NAME	PRIVILEGES
 COLUMNS	TABLE_NAME	select
 COLUMN_PRIVILEGES	TABLE_NAME	select
+INDEX_STATISTICS	TABLE_NAME	select
 FILES	TABLE_NAME	select
 KEY_COLUMN_USAGE	TABLE_NAME	select
 PARTITIONS	TABLE_NAME	select
@@ -862,6 +883,7 @@ STATISTICS	TABLE_NAME	select
 TABLES	TABLE_NAME	select
 TABLE_CONSTRAINTS	TABLE_NAME	select
 TABLE_PRIVILEGES	TABLE_NAME	select
+TABLE_STATISTICS	TABLE_NAME	select
 VIEWS	TABLE_NAME	select
 INNODB_BUFFER_PAGE	TABLE_NAME	select
 INNODB_BUFFER_PAGE_LRU	TABLE_NAME	select
@@ -873,7 +895,7 @@ table_schema IN ('mysql', 'INFORMATION_SCHEMA', 'test', 'mysqltest')
 AND table_name not like 'ndb%' AND table_name not like 'innodb_%'
 GROUP BY TABLE_SCHEMA;
 table_schema	count(*)
-information_schema	30
+information_schema	36
 mysql	23
 create table t1 (i int, j int);
 create trigger trg1 before insert on t1 for each row
@@ -1313,6 +1335,7 @@ and t.table_name not like 'innodb_%'
 group by t.table_name order by num1, t.table_name;
 table_name	group_concat(t.table_schema, '.', t.table_name)	num1
 CHARACTER_SETS	information_schema.CHARACTER_SETS	1
+CLIENT_STATISTICS	information_schema.CLIENT_STATISTICS	1
 COLLATIONS	information_schema.COLLATIONS	1
 COLLATION_CHARACTER_SET_APPLICABILITY	information_schema.COLLATION_CHARACTER_SET_APPLICABILITY	1
 COLUMNS	information_schema.COLUMNS	1
@@ -1322,12 +1345,14 @@ EVENTS	information_schema.EVENTS	1
 FILES	information_schema.FILES	1
 GLOBAL_STATUS	information_schema.GLOBAL_STATUS	1
 GLOBAL_VARIABLES	information_schema.GLOBAL_VARIABLES	1
+INDEX_STATISTICS	information_schema.INDEX_STATISTICS	1
 KEY_COLUMN_USAGE	information_schema.KEY_COLUMN_USAGE	1
 PARAMETERS	information_schema.PARAMETERS	1
 PARTITIONS	information_schema.PARTITIONS	1
 PLUGINS	information_schema.PLUGINS	1
 PROCESSLIST	information_schema.PROCESSLIST	1
 PROFILING	information_schema.PROFILING	1
+QUERY_STATISTICS	information_schema.QUERY_STATISTICS	1
 REFERENTIAL_CONSTRAINTS	information_schema.REFERENTIAL_CONSTRAINTS	1
 ROUTINES	information_schema.ROUTINES	1
 SCHEMATA	information_schema.SCHEMATA	1
@@ -1339,8 +1364,11 @@ TABLES	information_schema.TABLES	1
 TABLESPACES	information_schema.TABLESPACES	1
 TABLE_CONSTRAINTS	information_schema.TABLE_CONSTRAINTS	1
 TABLE_PRIVILEGES	information_schema.TABLE_PRIVILEGES	1
+TABLE_STATISTICS	information_schema.TABLE_STATISTICS	1
+THREAD_STATISTICS	information_schema.THREAD_STATISTICS	1
 TRIGGERS	information_schema.TRIGGERS	1
 USER_PRIVILEGES	information_schema.USER_PRIVILEGES	1
+USER_STATISTICS	information_schema.USER_STATISTICS	1
 VIEWS	information_schema.VIEWS	1
 create table t1(f1 int);
 create view v1 as select f1+1 as a from t1;
@@ -1964,6 +1992,21 @@ event_object_table	trigger_name
 #
 # Clean-up.
 drop database mysqltest;
+#
+# Test for bug #16869534 - "QUERYING SUBSET OF COLUMNS DOESN'T USE TABLE
+#                           CACHE; OPENED_TABLES INCREASES"
+#
+SELECT * FROM INFORMATION_SCHEMA.TABLES;
+SELECT VARIABLE_VALUE INTO @val1 FROM INFORMATION_SCHEMA.GLOBAL_STATUS WHERE
+VARIABLE_NAME LIKE 'Opened_tables';
+SELECT ENGINE FROM INFORMATION_SCHEMA.TABLES;
+# The below SELECT query should give same output as above SELECT query.
+SELECT VARIABLE_VALUE INTO @val2 FROM INFORMATION_SCHEMA.GLOBAL_STATUS WHERE
+VARIABLE_NAME LIKE 'Opened_tables';
+# The below select should return '1'
+SELECT @val1 = @val2;
+@val1 = @val2
+1
 #
 # End of 5.5 tests
 #

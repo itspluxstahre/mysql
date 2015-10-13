@@ -1,5 +1,5 @@
 /*
-   Copyright (C) 2006 MySQL AB
+   Copyright (c) 2006, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -18,6 +18,9 @@
 
 /* server.cpp */
 
+// takes 2 optional command line argument to make scripting
+// if the first  command line argument is 'n' client auth is disabled
+// if the second command line argument is 'd' DSA certs are used instead of RSA
 
 #include "../../testsuite/test.hpp"
 
@@ -35,15 +38,20 @@ void ServerError(SSL_CTX* ctx, SSL* ssl, SOCKET_T& sockfd, const char* msg)
     void NonBlockingSSL_Accept(SSL* ssl, SSL_CTX* ctx, SOCKET_T& clientfd)
     {
         int ret = SSL_accept(ssl);
-        while (ret != SSL_SUCCESS && SSL_get_error(ssl, 0) ==
-                                     SSL_ERROR_WANT_READ) {
-            printf("... server would block\n");
+        int err = SSL_get_error(ssl, 0);
+        while (ret != SSL_SUCCESS && (err == SSL_ERROR_WANT_READ ||
+                                      err == SSL_ERROR_WANT_WRITE)) {
+            if (err == SSL_ERROR_WANT_READ)
+                printf("... server would read block\n");
+            else
+                printf("... server would write block\n");
             #ifdef _WIN32
                 Sleep(1000);
             #else
                 sleep(1);
             #endif
             ret = SSL_accept(ssl);
+            err = SSL_get_error(ssl, 0);
         }
         if (ret != SSL_SUCCESS)
             ServerError(ctx, ssl, clientfd, "SSL_accept failed");
@@ -64,6 +72,9 @@ THREAD_RETURN YASSL_API server_test(void* args)
     char**   argv     = 0;
 
     set_args(argc, argv, *static_cast<func_args*>(args));
+#ifdef SERVER_READY_FILE
+    set_file_ready("server_ready", *static_cast<func_args*>(args));
+#endif
     tcp_accept(sockfd, clientfd, *static_cast<func_args*>(args));
 
     tcp_close(sockfd);
@@ -72,20 +83,33 @@ THREAD_RETURN YASSL_API server_test(void* args)
     SSL_CTX*    ctx = SSL_CTX_new(method);
 
     //SSL_CTX_set_cipher_list(ctx, "RC4-SHA:RC4-MD5");
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, 0);
-    set_serverCerts(ctx);
+    
+    // should we disable client auth
+    if (argc >= 2 && argv[1][0] == 'n')
+        printf("disabling client auth\n");
+    else
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, 0);
+
+    // are we using DSA certs
+    if (argc >= 3 && argv[2][0] == 'd') {
+        printf("using DSA certs\n");
+        set_dsaServerCerts(ctx);
+    }
+    else {
+        set_serverCerts(ctx);
+    }
     DH* dh = set_tmpDH(ctx);
 
     SSL* ssl = SSL_new(ctx);
     SSL_set_fd(ssl, clientfd);
-   
+
 #ifdef NON_BLOCKING
     NonBlockingSSL_Accept(ssl, ctx, clientfd);
 #else
     if (SSL_accept(ssl) != SSL_SUCCESS)
         ServerError(ctx, ssl, clientfd, "SSL_accept failed");
 #endif
-
+     
     showPeer(ssl);
     printf("Using Cipher Suite: %s\n", SSL_get_cipher(ssl));
 
@@ -93,7 +117,7 @@ THREAD_RETURN YASSL_API server_test(void* args)
     int input = SSL_read(ssl, command, sizeof(command));
     if (input > 0) {
         command[input] = 0;
-    printf("First client command: %s\n", command);
+        printf("First client command: %s\n", command);
     }
 
     char msg[] = "I hear you, fa shizzle!";

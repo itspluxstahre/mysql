@@ -1,5 +1,6 @@
 /* Copyright (C) 2007 Google Inc.
    Copyright (C) 2008 MySQL AB
+   Use is subject to license terms
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -71,7 +72,7 @@ public:
 class ReplSemiSyncBase
   :public Trace {
 public:
-  static const char  kSyncHeader[2];              /* three byte packet header */
+  static const unsigned char  kSyncHeader[2];     /* three byte packet header */
 
   /* Constants in network packet header. */
   static const unsigned char kPacketMagicNum;

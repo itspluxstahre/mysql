@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 
 /* create and drop of databases */
@@ -930,7 +930,7 @@ update_binlog:
 
     if (!(query= (char*) thd->alloc(MAX_DROP_TABLE_Q_LEN)))
       goto exit; /* not much else we can do */
-    query_pos= query_data_start= strmov(query,"drop table ");
+    query_pos= query_data_start= strmov(query,"DROP TABLE IF EXISTS ");
     query_end= query + MAX_DROP_TABLE_Q_LEN;
     db_len= strlen(db);
 
@@ -1290,9 +1290,12 @@ static void mysql_change_db_impl(THD *thd,
       we just call THD::reset_db(). Since THD::reset_db() does not releases
       the previous database name, we should do it explicitly.
     */
-    my_free(thd->db);
-
+    mysql_mutex_lock(&thd->LOCK_thd_data);
+    if (thd->db)
+      my_free(thd->db);
+    DEBUG_SYNC(thd, "after_freeing_thd_db");
     thd->reset_db(new_db_name->str, new_db_name->length);
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
   }
 
   /* 2. Update security context. */
@@ -1517,8 +1520,8 @@ bool mysql_change_db(THD *thd, const LEX_STRING *new_db_name, bool force_switch)
   db_access=
     test_all_bits(sctx->master_access, DB_ACLS) ?
     DB_ACLS :
-    acl_get(sctx->host,
-            sctx->ip,
+    acl_get(sctx->get_host()->ptr(),
+            sctx->get_ip()->ptr(),
             sctx->priv_user,
             new_db_file_name.str,
             FALSE) | sctx->master_access;

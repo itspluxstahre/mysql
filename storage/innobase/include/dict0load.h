@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2009, Innobase Oy. All Rights Reserved.
+Copyright (c) 1996, 2013, Innobase Oy. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -32,6 +32,7 @@ Created 4/24/1996 Heikki Tuuri
 #include "ut0byte.h"
 #include "mem0mem.h"
 #include "btr0types.h"
+#include "ut0rbt.h"
 
 /** enum that defines all 6 system table IDs */
 enum dict_system_table_id {
@@ -207,11 +208,13 @@ UNIV_INTERN
 ulint
 dict_load_foreigns(
 /*===============*/
-	const char*	table_name,	/*!< in: table name */
-	ibool		check_recursive,/*!< in: Whether to check recursive
-					load of tables chained by FK */
-	ibool		check_charsets);/*!< in: TRUE=check charsets
-					compatibility */
+	const char*		table_name,	/*!< in: table name */
+	ibool			check_recursive,/*!< in: Whether to check
+						recursive load of tables
+						chained by FK */
+	ibool			check_charsets,	/*!< in: TRUE=check charsets
+						compatibility */
+	dict_err_ignore_t	ignore_err);	/*!< in: error to be ignored */
 /********************************************************************//**
 Prints to the standard output information on all tables found in the data
 dictionary system table. */
@@ -327,6 +330,17 @@ dict_process_sys_foreign_col_rec(
 	const char**	ref_col_name,	/*!< out: referenced column name
 					in referenced table */
 	ulint*		pos);		/*!< out: column position */
+/********************************************************************//**
+Check if dict_table_t::foreign_rbt and dict_table::foreign_list
+contains the same set of foreign key objects; and check if
+dict_table_t::referenced_rbt and dict_table::referenced_list contains
+the same set of foreign key objects.
+@return	TRUE if correct, FALSE otherwise. */
+ibool
+dict_table_check_foreign_keys(
+/*==========================*/
+	const dict_table_t*	table);	/* in: table object to check */
+
 #ifndef UNIV_NONINL
 #include "dict0load.ic"
 #endif

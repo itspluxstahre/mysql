@@ -2915,9 +2915,9 @@ DROP TABLE IF EXISTS t1;
 DROP VIEW IF EXISTS v1;
 DROP VIEW IF EXISTS v2;
 CREATE TABLE t1(a INT, b INT);
-CREATE DEFINER=1234567890abcdefGHIKL@localhost
+CREATE DEFINER=1234567890abcdefGHIKL1234567890abcdefGHIKL@localhost
 VIEW v1 AS SELECT a FROM t1;
-ERROR HY000: String '1234567890abcdefGHIKL' is too long for user name (should be no longer than 16)
+ERROR HY000: String '1234567890abcdefGHIKL1234567890abcdefGHIKL' is too long for user name (should be no longer than 32)
 CREATE DEFINER=some_user_name@1234567890abcdefghij1234567890abcdefghij1234567890abcdefghijQWERTY
 VIEW v2 AS SELECT b FROM t1;
 ERROR HY000: String '1234567890abcdefghij1234567890abcdefghij1234567890abcdefghijQWERTY' is too long for host name (should be no longer than 60)
@@ -4102,3 +4102,58 @@ UNLOCK TABLES;
 # Connection default
 DROP PROCEDURE p1;
 DROP TABLE t1;
+#
+# Bug#12626844: WRONG ERROR MESSAGE WHILE CREATING A VIEW ON A
+#               NON EXISTING DATABASE
+#
+DROP DATABASE IF EXISTS nodb;
+CREATE VIEW nodb.a AS SELECT 1;
+ERROR 42000: Unknown database 'nodb'
+#
+# UTC_EXTRACT
+#
+CREATE VIEW v1 AS SELECT UTC_EXTRACT(YEAR_MONTH_DAY_HOUR FROM '2000-01-01') AS a;
+SHOW CREATE VIEW v1;
+View	Create View	character_set_client	collation_connection
+v1	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v1` AS select utc_extract(YEAR_MONTH_DAY_HOUR from '2000-01-01') AS `a`	latin1	latin1_swedish_ci
+SELECT * FROM v1;
+a
+2000010100
+DROP VIEW v1;
+#
+# BUG#14117018 - MYSQL SERVER CREATES INVALID VIEW DEFINITION
+# BUG#18405221 - SHOW CREATE VIEW OUTPUT INCORRECT
+#
+CREATE VIEW v1 AS (SELECT '' FROM DUAL);
+CREATE VIEW v2 AS (SELECT 'BUG#14117018' AS col1 FROM DUAL) UNION ALL
+(SELECT '' FROM DUAL);
+CREATE VIEW v3 AS (SELECT 'BUG#14117018' AS col1 FROM DUAL) UNION ALL
+(SELECT '' FROM DUAL) UNION ALL
+(SELECT '' FROM DUAL);
+CREATE VIEW v4 AS (SELECT 'BUG#14117018' AS col1 FROM DUAL) UNION ALL
+(SELECT '' AS col2 FROM DUAL) UNION ALL
+(SELECT '' FROM DUAL);
+# Name for the column in select1 is set properly with or
+# without this fix.
+SHOW CREATE VIEW v1;
+View	Create View	character_set_client	collation_connection
+v1	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v1` AS (select '' AS `Name_exp_1`)	latin1	latin1_swedish_ci
+# Name for the column in select2 is set with this fix.
+# Without this fix, name would not have set for the
+# columns in select2.
+SHOW CREATE VIEW v2;
+View	Create View	character_set_client	collation_connection
+v2	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v2` AS (select 'BUG#14117018' AS `col1`) union all (select '' AS `Name_exp_2`)	latin1	latin1_swedish_ci
+# Name for the field item in select2 & select3 is set with this fix.
+# Without this fix, name would not have set for the
+# columns in select2 & select3.
+SHOW CREATE VIEW v3;
+View	Create View	character_set_client	collation_connection
+v3	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v3` AS (select 'BUG#14117018' AS `col1`) union all (select '' AS `Name_exp_2`) union all (select '' AS `Name_exp_3`)	latin1	latin1_swedish_ci
+# Name for the field item in select3 is set with this fix.
+# Without this fix, name would not have set for the
+# columns in select3.
+SHOW CREATE VIEW v4;
+View	Create View	character_set_client	collation_connection
+v4	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v4` AS (select 'BUG#14117018' AS `col1`) union all (select '' AS `col2`) union all (select '' AS `Name_exp_3`)	latin1	latin1_swedish_ci
+DROP VIEW v1, v2, v3, v4;

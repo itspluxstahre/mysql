@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -865,28 +865,43 @@ bool make_date_time(DATE_TIME_FORMAT *format, MYSQL_TIME *l_time,
   from the high end. This allows one to give:
   DAY_TO_SECOND as "D MM:HH:SS", "MM:HH:SS" "HH:SS" or as seconds.
 
-  @param length:         length of str
-  @param cs:             charset of str
-  @param values:         array of results
+  @param args            item expression which we convert to an ASCII string
+  @param str_value       string buffer
+  @param is_negative     set to true if interval is prefixed by '-'
   @param count:          count of elements in result array
+  @param values:         array of results
   @param transform_msec: if value is true we suppose
                          that the last part of string value is microseconds
                          and we should transform value to six digit value.
                          For example, '1.1' -> '1.100000'
 */
 
-static bool get_interval_info(const char *str,uint length,CHARSET_INFO *cs,
+static bool get_interval_info(Item *args,
+                              String *str_value,
+                              bool *is_negative,
                               uint count, ulonglong *values,
                               bool transform_msec)
 {
-  const char *end=str+length;
-  uint i;
-  long msec_length= 0;
+  String *res;
+  if (!(res= args->val_str_ascii(str_value)))
+    return true;
 
-  while (str != end && !my_isdigit(cs,*str))
+  CHARSET_INFO *cs= res->charset();
+  const char *str= res->ptr();
+  const char *end= str + res->length();
+
+  str+= cs->cset->scan(cs, str, end, MY_SEQ_SPACES);
+  if (str < end && *str == '-')
+  {
+    *is_negative= true;
+    str++;
+  }
+
+  while (str < end && !my_isdigit(cs,*str))
     str++;
 
-  for (i=0 ; i < count ; i++)
+  long msec_length= 0;
+  for (uint i=0 ; i < count ; i++)
   {
     longlong value;
     const char *start= str;
@@ -1427,44 +1442,23 @@ longlong Item_func_time_to_sec::val_int()
   To make code easy, allow interval objects without separators.
 */
 
-bool get_interval_value(Item *args,interval_type int_type,
-			       String *str_value, INTERVAL *interval)
+bool get_interval_value(Item *args, interval_type int_type,
+                        String *str_value, INTERVAL *interval)
 {
   ulonglong array[5];
   longlong UNINIT_VAR(value);
-  const char *UNINIT_VAR(str);
-  size_t UNINIT_VAR(length);
-  CHARSET_INFO *cs=str_value->charset();
 
   bzero((char*) interval,sizeof(*interval));
   if ((int) int_type <= INTERVAL_MICROSECOND)
   {
     value= args->val_int();
     if (args->null_value)
-      return 1;
+      return true;
     if (value < 0)
     {
-      interval->neg=1;
+      interval->neg= true;
       value= -value;
     }
-  }
-  else
-  {
-    String *res;
-    if (!(res= args->val_str_ascii(str_value)))
-      return (1);
-
-    /* record negative intervalls in interval->neg */
-    str=res->ptr();
-    const char *end=str+res->length();
-    while (str != end && my_isspace(cs,*str))
-      str++;
-    if (str != end && *str == '-')
-    {
-      interval->neg=1;
-      str++;
-    }
-    length= (size_t) (end-str);		// Set up pointers to new str
   }
 
   switch (int_type) {
@@ -1486,88 +1480,88 @@ bool get_interval_value(Item *args,interval_type int_type,
   case INTERVAL_HOUR:
     interval->hour= (ulong) value;
     break;
-  case INTERVAL_MICROSECOND:
-    interval->second_part=value;
-    break;
   case INTERVAL_MINUTE:
     interval->minute=value;
     break;
   case INTERVAL_SECOND:
     interval->second=value;
     break;
+  case INTERVAL_MICROSECOND:
+    interval->second_part=value;
+    break;
   case INTERVAL_YEAR_MONTH:			// Allow YEAR-MONTH YYYYYMM
-    if (get_interval_info(str,length,cs,2,array,0))
-      return (1);
+    if (get_interval_info(args, str_value, &interval->neg, 2, array, false))
+      return true;
     interval->year=  (ulong) array[0];
     interval->month= (ulong) array[1];
     break;
   case INTERVAL_DAY_HOUR:
-    if (get_interval_info(str,length,cs,2,array,0))
-      return (1);
+    if (get_interval_info(args, str_value, &interval->neg, 2, array, false))
+      return true;
     interval->day=  (ulong) array[0];
     interval->hour= (ulong) array[1];
     break;
+  case INTERVAL_DAY_MINUTE:
+    if (get_interval_info(args, str_value, &interval->neg, 3, array, false))
+      return true;
+    interval->day=    (ulong) array[0];
+    interval->hour=   (ulong) array[1];
+    interval->minute= array[2];
+    break;
+  case INTERVAL_DAY_SECOND:
+    if (get_interval_info(args, str_value, &interval->neg, 4, array, false))
+      return true;
+    interval->day=    (ulong) array[0];
+    interval->hour=   (ulong) array[1];
+    interval->minute= array[2];
+    interval->second= array[3];
+    break;
+  case INTERVAL_HOUR_MINUTE:
+    if (get_interval_info(args, str_value, &interval->neg, 2, array, false))
+      return true;
+    interval->hour=   (ulong) array[0];
+    interval->minute= array[1];
+    break;
+  case INTERVAL_HOUR_SECOND:
+    if (get_interval_info(args, str_value, &interval->neg, 3, array, false))
+      return true;
+    interval->hour=   (ulong) array[0];
+    interval->minute= array[1];
+    interval->second= array[2];
+    break;
+  case INTERVAL_MINUTE_SECOND:
+    if (get_interval_info(args, str_value, &interval->neg, 2, array, false))
+      return true;
+    interval->minute= array[0];
+    interval->second= array[1];
+    break;
   case INTERVAL_DAY_MICROSECOND:
-    if (get_interval_info(str,length,cs,5,array,1))
-      return (1);
+    if (get_interval_info(args, str_value, &interval->neg, 5, array, true))
+      return true;
     interval->day=    (ulong) array[0];
     interval->hour=   (ulong) array[1];
     interval->minute= array[2];
     interval->second= array[3];
     interval->second_part= array[4];
     break;
-  case INTERVAL_DAY_MINUTE:
-    if (get_interval_info(str,length,cs,3,array,0))
-      return (1);
-    interval->day=    (ulong) array[0];
-    interval->hour=   (ulong) array[1];
-    interval->minute= array[2];
-    break;
-  case INTERVAL_DAY_SECOND:
-    if (get_interval_info(str,length,cs,4,array,0))
-      return (1);
-    interval->day=    (ulong) array[0];
-    interval->hour=   (ulong) array[1];
-    interval->minute= array[2];
-    interval->second= array[3];
-    break;
   case INTERVAL_HOUR_MICROSECOND:
-    if (get_interval_info(str,length,cs,4,array,1))
-      return (1);
+    if (get_interval_info(args, str_value, &interval->neg, 4, array, true))
+      return true;
     interval->hour=   (ulong) array[0];
     interval->minute= array[1];
     interval->second= array[2];
     interval->second_part= array[3];
     break;
-  case INTERVAL_HOUR_MINUTE:
-    if (get_interval_info(str,length,cs,2,array,0))
-      return (1);
-    interval->hour=   (ulong) array[0];
-    interval->minute= array[1];
-    break;
-  case INTERVAL_HOUR_SECOND:
-    if (get_interval_info(str,length,cs,3,array,0))
-      return (1);
-    interval->hour=   (ulong) array[0];
-    interval->minute= array[1];
-    interval->second= array[2];
-    break;
   case INTERVAL_MINUTE_MICROSECOND:
-    if (get_interval_info(str,length,cs,3,array,1))
-      return (1);
+    if (get_interval_info(args, str_value, &interval->neg, 3, array, true))
+      return true;
     interval->minute= array[0];
     interval->second= array[1];
     interval->second_part= array[2];
     break;
-  case INTERVAL_MINUTE_SECOND:
-    if (get_interval_info(str,length,cs,2,array,0))
-      return (1);
-    interval->minute= array[0];
-    interval->second= array[1];
-    break;
   case INTERVAL_SECOND_MICROSECOND:
-    if (get_interval_info(str,length,cs,2,array,1))
-      return (1);
+    if (get_interval_info(args, str_value, &interval->neg, 2, array, true))
+      return true;
     interval->second= array[0];
     interval->second_part= array[1];
     break;
@@ -1575,7 +1569,7 @@ bool get_interval_value(Item *args,interval_type int_type,
     DBUG_ASSERT(0); 
     break;            /* purecov: end */
   }
-  return 0;
+  return false;
 }
 
 
@@ -2694,7 +2688,7 @@ longlong Item_datetime_typecast::val_int()
 {
   DBUG_ASSERT(fixed == 1);
   MYSQL_TIME ltime;
-  if (get_arg0_date(&ltime,1))
+  if (get_arg0_date(&ltime, TIME_FUZZY_DATE))
   {
     null_value= 1;
     return 0;
@@ -3583,4 +3577,187 @@ bool Item_func_last_day::get_date(MYSQL_TIME *ltime, uint fuzzy_date)
   ltime->second_part= 0;
   ltime->time_type= MYSQL_TIMESTAMP_DATE;
   return 0;
+}
+
+
+void Item_func_utc_extract::print(String *str, enum_query_type query_type)
+{
+  str->append(STRING_WITH_LEN("utc_extract("));
+  switch (m_extract_spec) {
+  case EXTRACT_YMD:
+    str->append("YEAR_MONTH_DAY");
+    break;
+  case EXTRACT_YMDH:
+    str->append("YEAR_MONTH_DAY_HOUR");
+    break;
+  }
+  str->append(STRING_WITH_LEN(" from "));
+  args[0]->print(str, query_type);
+  str->append(')');
+}
+
+
+void Item_func_utc_extract::fix_length_and_dec()
+{
+  /* Date might be invalid. */
+  maybe_null= 1;
+
+  switch (m_extract_spec) {
+  case EXTRACT_YMD:
+    max_length=  8; break;
+  case EXTRACT_YMDH:
+    max_length= 10; break;
+  }
+}
+
+
+enum_monotonicity_info Item_func_utc_extract::get_monotonicity_info() const
+{
+  if (args[0]->type() == Item::FIELD_ITEM)
+  {
+    switch (args[0]->field_type()) {
+    case MYSQL_TYPE_DATE:
+    case MONOTONIC_INCREASING:
+    case MYSQL_TYPE_TIMESTAMP:
+      return MONOTONIC_INCREASING_NOT_NULL;
+    default:
+      break;
+    }
+  }
+
+  return NON_MONOTONIC;
+}
+
+
+longlong Item_func_utc_extract::val_int_endpoint(bool left_endp,
+                                                 bool *incl_endp)
+{
+  MYSQL_TIME time;
+
+  DBUG_ASSERT(fixed == 1);
+
+  /* Include current timestamp-based partition (MYSQL-164) */
+  *incl_endp= true;
+
+  if (get_utc_time(&time))
+    return LONGLONG_MIN;
+
+  return extract(&time);
+}
+
+
+bool Item_func_utc_extract::check_valid_arguments_processor(uchar *)
+{
+  bool UNINIT_VAR(prereq);
+
+  DBUG_ASSERT(arg_count == 1);
+
+  if (args[0]->type() == FIELD_ITEM &&
+      args[0]->field_type() == MYSQL_TYPE_TIMESTAMP)
+    return false;
+
+  switch (m_extract_spec) {
+  case EXTRACT_YMD:
+    prereq= has_date_args();
+    break;
+  case EXTRACT_YMDH:
+    prereq= has_datetime_args();
+    break;
+  }
+
+  return !prereq;
+}
+
+
+/**
+  Converts a UTC TIMESTAMP value to a broken-down representation (also in UTC).
+
+  @param time   Pointer to broken-down time structure.
+
+  @retval FALSE on success, TRUE otherwise.
+*/
+
+bool Item_func_utc_extract::get_arg0_timestamp(MYSQL_TIME *time)
+{
+  my_time_t value;
+  Item_field *item= (Item_field *) args[0];
+  Field_timestamp *field= (Field_timestamp *) item->field;
+
+  value= field->get_timestamp(&null_value);
+
+  if (null_value)
+    return true;
+
+  my_tz_UTC->gmt_sec_to_TIME(time, value);
+
+  return false;
+}
+
+
+/**
+  Convert a broken-down time representation (in UTC) to an integer in
+  the specified format.
+
+  @param time   Pointer to broken-down time structure.
+
+  @return   Integer value for the specified format.
+*/
+
+longlong Item_func_utc_extract::extract(MYSQL_TIME *time)
+{
+  longlong UNINIT_VAR(value);
+
+  switch (m_extract_spec) {
+  case EXTRACT_YMD:  /* YYYYMMDD */
+    value= time->year  * 10000LL +
+           time->month *   100LL +
+           time->day;
+    break;
+  case EXTRACT_YMDH: /* YYYYMMDDHH */
+    value= time->year  * 1000000LL +
+           time->month *   10000LL +
+           time->day   *     100LL +
+           time->hour;
+    break;
+  };
+
+  return value;
+}
+
+
+/**
+  Convert time value to an integer in the specified format.
+*/
+
+longlong Item_func_utc_extract::val_int()
+{
+  MYSQL_TIME time;
+
+  DBUG_ASSERT(fixed == 1);
+
+  /* Get time in a broken-down representation (also in UTC). */
+  if (get_utc_time(&time))
+    return 0;
+
+  return extract(&time);
+}
+
+
+bool Item_func_utc_extract::eq(const Item *item, bool binary_cmp) const
+{
+  const Item_func_utc_extract *utc_func_item;
+
+  if (this == item)
+    return true;
+
+  if (item->type() != FUNC_ITEM ||
+      functype() != ((Item_func *)item)->functype())
+    return false;
+
+  utc_func_item= (const Item_func_utc_extract *) item;
+
+  if (utc_func_item->m_extract_spec != m_extract_spec)
+    return false;
+
+  return args[0]->eq(utc_func_item->args[0], binary_cmp);
 }

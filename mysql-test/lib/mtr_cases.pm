@@ -137,6 +137,7 @@ sub collect_test_cases ($$$$) {
     {
       push(@$cases, collect_one_suite($suite, $opt_cases, $opt_skip_test_list));
       last if $some_test_found;
+      push(@$cases, collect_one_suite("i_".$suite, $opt_cases, $opt_skip_test_list));
     }
   }
 
@@ -288,13 +289,16 @@ sub collect_one_suite($)
       $suitedir= my_find_dir($::basedir,
 			     ["share/mysql-test/suite",
 			      "mysql-test/suite",
+			      "internal/mysql-test/suite",
 			      "mysql-test",
 			      # Look in storage engine specific suite dirs
 			      "storage/*/mtr",
 			      # Look in plugin specific suite dir
 			      "plugin/$suite/tests",
+			      "internal/plugin/$suite/tests",
 			     ],
-			     [$suite, "mtr"]);
+			     [$suite, "mtr"], ($suite =~ /^i_/));
+      return unless $suitedir;
     }
     mtr_verbose("suitedir: $suitedir");
   }
@@ -959,18 +963,11 @@ sub collect_one_test_case {
   if ( $tinfo->{'ndb_test'} )
   {
     # This is a NDB test
-    if ( $::opt_skip_ndbcluster == 2 )
+    if ( $::ndbcluster_enabled == 0)
     {
-      # Ndb is not supported, skip it
+      # ndbcluster is disabled
       $tinfo->{'skip'}= 1;
-      $tinfo->{'comment'}= "No ndbcluster support or ndb tests not enabled";
-      return $tinfo;
-    }
-    elsif ( $::opt_skip_ndbcluster )
-    {
-      # All ndb test's should be skipped
-      $tinfo->{'skip'}= 1;
-      $tinfo->{'comment'}= "No ndbcluster tests(--skip-ndbcluster)";
+      $tinfo->{'comment'}= "ndbcluster disabled";
       return $tinfo;
     }
   }

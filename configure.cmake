@@ -1,5 +1,4 @@
-
-# Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2013, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -54,20 +53,10 @@ IF(NOT SYSTEM_TYPE)
 ENDIF()
 
 
-# Always enable -Wall for gnu C/C++
 IF(CMAKE_COMPILER_IS_GNUCXX)
-  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-parameter")
-ENDIF()
-IF(CMAKE_COMPILER_IS_GNUCC)
-  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")
-ENDIF()
-
-
-IF(CMAKE_COMPILER_IS_GNUCXX)
-  # MySQL "canonical" GCC flags. At least -fno-rtti flag affects
-  # ABI and cannot be simply removed. 
+  # MySQL "canonical" GCC flags.
   SET(CMAKE_CXX_FLAGS 
-    "${CMAKE_CXX_FLAGS} -fno-implicit-templates -fno-exceptions -fno-rtti")
+    "${CMAKE_CXX_FLAGS} -fno-implicit-templates")
   IF(CMAKE_CXX_FLAGS)
     STRING(REGEX MATCH "fno-implicit-templates" NO_IMPLICIT_TEMPLATES
       ${CMAKE_CXX_FLAGS})
@@ -152,8 +141,15 @@ IF(UNIX)
 
   SET(CMAKE_REQUIRED_LIBRARIES 
     ${LIBM} ${LIBNSL} ${LIBBIND} ${LIBCRYPT} ${LIBSOCKET} ${LIBDL} ${CMAKE_THREAD_LIBS_INIT} ${LIBRT})
+  # Need explicit pthread for gcc -fsanitize=address
+  IF(CMAKE_USE_PTHREADS_INIT AND CMAKE_C_FLAGS MATCHES "-fsanitize=")
+    SET(CMAKE_REQUIRED_LIBRARIES ${CMAKE_REQUIRED_LIBRARIES} pthread)
+  ENDIF()
 
-  LIST(REMOVE_DUPLICATES CMAKE_REQUIRED_LIBRARIES)
+  LIST(LENGTH CMAKE_REQUIRED_LIBRARIES required_libs_length)
+  IF(${required_libs_length} GREATER 0)
+    LIST(REMOVE_DUPLICATES CMAKE_REQUIRED_LIBRARIES)
+  ENDIF()  
   LINK_LIBRARIES(${CMAKE_THREAD_LIBS_INIT})
   
   OPTION(WITH_LIBWRAP "Compile with tcp wrappers support" OFF)
@@ -182,6 +178,7 @@ ENDIF()
 # Tests for header files
 #
 INCLUDE (CheckIncludeFiles)
+INCLUDE (CheckIncludeFileCXX)
 
 CHECK_INCLUDE_FILES ("stdlib.h;stdarg.h;string.h;float.h" STDC_HEADERS)
 CHECK_INCLUDE_FILES (sys/types.h HAVE_SYS_TYPES_H)
@@ -189,7 +186,7 @@ CHECK_INCLUDE_FILES (alloca.h HAVE_ALLOCA_H)
 CHECK_INCLUDE_FILES (aio.h HAVE_AIO_H)
 CHECK_INCLUDE_FILES (arpa/inet.h HAVE_ARPA_INET_H)
 CHECK_INCLUDE_FILES (crypt.h HAVE_CRYPT_H)
-CHECK_INCLUDE_FILES (cxxabi.h HAVE_CXXABI_H)
+CHECK_INCLUDE_FILE_CXX (cxxabi.h HAVE_CXXABI_H)
 CHECK_INCLUDE_FILES (dirent.h HAVE_DIRENT_H)
 CHECK_INCLUDE_FILES (dlfcn.h HAVE_DLFCN_H)
 CHECK_INCLUDE_FILES (execinfo.h HAVE_EXECINFO_H)
@@ -619,6 +616,7 @@ ENDIF()
 
 # check whether time_t is unsigned
 CHECK_C_SOURCE_COMPILES("
+#include <time.h>
 int main()
 {
   int array[(((time_t)-1) > 0) ? 1 : -1];

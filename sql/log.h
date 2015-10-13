@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -151,6 +151,11 @@ class Relay_log_info;
 extern PSI_mutex_key key_LOG_INFO_lock;
 #endif
 
+/*
+  Note that we destroy the lock mutex in the desctructor here.
+  This means that object instances cannot be destroyed/go out of scope,
+  until we have reset thd->current_linfo to NULL;
+ */
 typedef struct st_log_info
 {
   char log_file_name[FN_REFLEN];
@@ -239,7 +244,7 @@ public:
   MYSQL_QUERY_LOG() : last_time(0) {}
   void reopen_file();
   bool write(time_t event_time, const char *user_host,
-             uint user_host_len, int thread_id,
+             uint user_host_len, my_thread_id thread_id,
              const char *command_type, uint command_type_len,
              const char *sql_text, uint sql_text_len);
   bool write(THD *thd, time_t current_time, time_t query_start_arg,
@@ -348,8 +353,8 @@ class MYSQL_BIN_LOG: public TC_LOG, private MYSQL_LOG
   int new_file_impl(bool need_lock);
 
 public:
-  MYSQL_LOG::generate_name;
-  MYSQL_LOG::is_open;
+  using MYSQL_LOG::generate_name;
+  using MYSQL_LOG::is_open;
 
   /* This is relay log */
   bool is_relay_log;
@@ -437,7 +442,8 @@ public:
   bool write(THD *thd, IO_CACHE *cache, Log_event *commit_event, bool incident);
   bool write_incident(THD *thd, bool lock);
 
-  int  write_cache(IO_CACHE *cache, bool lock_log, bool flush_and_sync);
+  int  write_cache(THD *thd, IO_CACHE *cache,
+                   bool lock_log, bool flush_and_sync);
   void set_write_error(THD *thd, bool is_transactional);
   bool check_write_error(THD *thd);
 
@@ -525,7 +531,7 @@ public:
   virtual bool log_error(enum loglevel level, const char *format,
                          va_list args)= 0;
   virtual bool log_general(THD *thd, time_t event_time, const char *user_host,
-                           uint user_host_len, int thread_id,
+                           uint user_host_len, my_thread_id thread_id,
                            const char *command_type, uint command_type_len,
                            const char *sql_text, uint sql_text_len,
                            CHARSET_INFO *client_cs)= 0;
@@ -554,7 +560,7 @@ public:
   virtual bool log_error(enum loglevel level, const char *format,
                          va_list args);
   virtual bool log_general(THD *thd, time_t event_time, const char *user_host,
-                           uint user_host_len, int thread_id,
+                           uint user_host_len, my_thread_id thread_id,
                            const char *command_type, uint command_type_len,
                            const char *sql_text, uint sql_text_len,
                            CHARSET_INFO *client_cs);
@@ -586,11 +592,12 @@ public:
   virtual bool log_error(enum loglevel level, const char *format,
                          va_list args);
   virtual bool log_general(THD *thd, time_t event_time, const char *user_host,
-                           uint user_host_len, int thread_id,
+                           uint user_host_len, my_thread_id thread_id,
                            const char *command_type, uint command_type_len,
                            const char *sql_text, uint sql_text_len,
                            CHARSET_INFO *client_cs);
   void flush();
+  void flush_slow_log();
   void init_pthread_objects();
   MYSQL_QUERY_LOG *get_mysql_slow_log() { return &mysql_slow_log; }
   MYSQL_QUERY_LOG *get_mysql_log() { return &mysql_log; }
@@ -671,6 +678,11 @@ public:
       return file_log_handler->get_mysql_log();
     return NULL;
   }
+
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  void twitter_log_write(THD *thd, enum enum_server_command command,
+                         const char *query, uint query_length);
+#endif
 };
 
 enum enum_binlog_format {
@@ -703,6 +715,20 @@ bool general_log_print(THD *thd, enum enum_server_command command,
 
 bool general_log_write(THD *thd, enum enum_server_command command,
                        const char *query, uint query_length);
+
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+void twitter_audit_log(THD *thd, enum enum_server_command command,
+                       const char *query, uint query_length,
+                       my_bool twitter_audit = false, void *acl = 0);
+
+void twitter_audit_print(THD *thd, enum enum_server_command command,
+                         void *acl, const char *format, va_list args);
+
+void twitter_audit_logins(THD *thd, enum enum_server_command command,
+                          void *acl, const char *format,...);
+
+bool twitter_audit_acl_check(void *acl);
+#endif
 
 void sql_perror(const char *message);
 bool flush_error_log();

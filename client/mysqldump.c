@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -12,7 +12,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
 
 /* mysqldump.c  - Dump a tables contents and format to an ASCII file
@@ -55,8 +55,6 @@
 
 #include <welcome_copyright_notice.h> /* ORACLE_WELCOME_COPYRIGHT_NOTICE */
 
-#include <welcome_copyright_notice.h> /* ORACLE_WELCOME_COPYRIGHT_NOTICE */
-
 /* Exit codes */
 
 #define EX_USAGE 1
@@ -84,6 +82,7 @@
 #define IGNORE_NONE 0x00 /* no ignore */
 #define IGNORE_DATA 0x01 /* don't dump data for this table */
 #define IGNORE_INSERT_DELAYED 0x02 /* table doesn't support INSERT DELAYED */
+
 
 static void add_load_option(DYNAMIC_STRING *str, const char *option,
                              const char *option_value);
@@ -605,7 +604,7 @@ static void short_usage_sub(void)
 static void usage(void)
 {
   print_version();
-  puts(ORACLE_WELCOME_COPYRIGHT_NOTICE("2000, 2011"));
+  puts(ORACLE_WELCOME_COPYRIGHT_NOTICE("2000"));
   puts("Dumping structure and contents of MySQL databases and tables.");
   short_usage_sub();
   print_defaults("my",load_default_groups);
@@ -2233,7 +2232,6 @@ static uint dump_routines_for_db(char *db)
   const char *routine_type[]= {"FUNCTION", "PROCEDURE"};
   char       db_name_buff[NAME_LEN*2+3], name_buff[NAME_LEN*2+3];
   char       *routine_name;
-  char       *query_str;
   int        i;
   FILE       *sql_file= md_result_file;
   MYSQL_RES  *routine_res, *routine_list_res;
@@ -2315,10 +2313,10 @@ static uint dump_routines_for_db(char *db)
           {
             if (opt_xml)
             {
-              if (i)                            // Procedures.
+              if (i)                            /* Procedures. */
                 print_xml_row(sql_file, "routine", routine_res, &row,
                               "Create Procedure");
-              else                              // Functions.
+              else                              /* Functions. */
                 print_xml_row(sql_file, "routine", routine_res, &row,
                               "Create Function");
               continue;
@@ -2326,17 +2324,6 @@ static uint dump_routines_for_db(char *db)
             if (opt_drop)
               fprintf(sql_file, "/*!50003 DROP %s IF EXISTS %s */;\n",
                       routine_type[i], routine_name);
-
-            query_str= cover_definer_clause(row[2], strlen(row[2]),
-                                            C_STRING_WITH_LEN("50020"),
-                                            C_STRING_WITH_LEN("50003"),
-                                            C_STRING_WITH_LEN(" FUNCTION"));
-
-            if (!query_str)
-              query_str= cover_definer_clause(row[2], strlen(row[2]),
-                                              C_STRING_WITH_LEN("50020"),
-                                              C_STRING_WITH_LEN("50003"),
-                                              C_STRING_WITH_LEN(" PROCEDURE"));
 
             if (mysql_num_fields(routine_res) >= 6)
             {
@@ -2375,9 +2362,9 @@ static uint dump_routines_for_db(char *db)
 
             fprintf(sql_file,
                     "DELIMITER ;;\n"
-                    "/*!50003 %s */;;\n"
+                    "%s ;;\n"
                     "DELIMITER ;\n",
-                    (const char *) (query_str != NULL ? query_str : row[2]));
+                    (const char *) row[2]);
 
             restore_sql_mode(sql_file, ";");
 
@@ -2392,7 +2379,6 @@ static uint dump_routines_for_db(char *db)
               }
             }
 
-            my_free(query_str);
           }
         } /* end of routine printing */
         mysql_free_result(routine_res);
@@ -2414,6 +2400,15 @@ static uint dump_routines_for_db(char *db)
   if (lock_tables)
     (void) mysql_query_with_error_report(mysql, 0, "UNLOCK TABLES");
   DBUG_RETURN(0);
+}
+
+/* general_log or slow_log tables under mysql database */
+static inline my_bool general_log_or_slow_log_tables(const char *db,
+                                                     const char *table)
+{
+  return (!my_strcasecmp(charset_info, db, "mysql")) &&
+          (!my_strcasecmp(charset_info, table, "general_log") ||
+           !my_strcasecmp(charset_info, table, "slow_log"));
 }
 
 /*
@@ -2451,6 +2446,7 @@ static uint get_table_structure(char *table, char *db, char *table_type,
                                 "TABLE_SCHEMA = '%s' AND TABLE_NAME = '%s'";
   FILE       *sql_file= md_result_file;
   int        len;
+  my_bool    is_log_table;
   MYSQL_RES  *result;
   MYSQL_ROW  row;
   DBUG_ENTER("get_table_structure");
@@ -2485,7 +2481,7 @@ static uint get_table_structure(char *table, char *db, char *table_type,
   verbose_msg("-- Retrieving table structure for table %s...\n", table);
 
   len= my_snprintf(query_buff, sizeof(query_buff),
-                   "SET OPTION SQL_QUOTE_SHOW_CREATE=%d",
+                   "SET SQL_QUOTE_SHOW_CREATE=%d",
                    (opt_quoted || opt_keywords));
   if (!create_options)
     strmov(query_buff+len,
@@ -2535,9 +2531,12 @@ static uint get_table_structure(char *table, char *db, char *table_type,
       /*
         Even if the "table" is a view, we do a DROP TABLE here.  The
         view-specific code below fills in the DROP VIEW.
+        We will skip the DROP TABLE for general_log and slow_log, since
+        those stmts will fail, in case we apply dump by enabling logging.
        */
-        fprintf(sql_file, "DROP TABLE IF EXISTS %s;\n",
-                opt_quoted_table);
+        if (!general_log_or_slow_log_tables(db, table))
+          fprintf(sql_file, "DROP TABLE IF EXISTS %s;\n",
+                  opt_quoted_table);
         check_io(sql_file);
       }
 
@@ -2545,6 +2544,7 @@ static uint get_table_structure(char *table, char *db, char *table_type,
       if (strcmp(field->name, "View") == 0)
       {
         char *scv_buff= NULL;
+        my_ulonglong n_cols;
 
         verbose_msg("-- It's a view, create dummy table for view\n");
 
@@ -2559,8 +2559,8 @@ static uint get_table_structure(char *table, char *db, char *table_type,
           the same name in order to satisfy views that depend on this view.
           The table will be removed when the actual view is created.
 
-          The properties of each column, aside from the data type, are not
-          preserved in this temporary table, because they are not necessary.
+          The properties of each column, are not preserved in this temporary
+          table, because they are not necessary.
 
           This will not be necessary once we can determine dependencies
           between views and can simply dump them in the appropriate order.
@@ -2587,8 +2587,23 @@ static uint get_table_structure(char *table, char *db, char *table_type,
         else
           my_free(scv_buff);
 
-        if (mysql_num_rows(result))
+        n_cols= mysql_num_rows(result);
+        if (0 != n_cols)
         {
+
+          /*
+            The actual formula is based on the column names and how the .FRM
+            files are stored and is too volatile to be repeated here.
+            Thus we simply warn the user if the columns exceed a limit we
+            know works most of the time.
+          */
+          if (n_cols >= 1000)
+            fprintf(stderr,
+                    "-- Warning: Creating a stand-in table for view %s may"
+                    " fail when replaying the dump file produced because "
+                    "of the number of columns exceeding 1000. Exercise "
+                    "caution when replaying the produced dump file.\n", 
+                    table);
           if (opt_drop)
           {
             /*
@@ -2615,14 +2630,19 @@ static uint get_table_structure(char *table, char *db, char *table_type,
 
           row= mysql_fetch_row(result);
 
-          fprintf(sql_file, "  %s %s", quote_name(row[0], name_buff, 0),
-                  row[1]);
+          /*
+            The actual column type doesn't matter anyway, since the table will
+            be dropped at run time.
+            We do tinyint to avoid hitting the row size limit.
+          */
+          fprintf(sql_file, "  %s tinyint NOT NULL",
+                  quote_name(row[0], name_buff, 0));
 
           while((row= mysql_fetch_row(result)))
           {
             /* col name, col type */
-            fprintf(sql_file, ",\n  %s %s",
-                    quote_name(row[0], name_buff, 0), row[1]);
+            fprintf(sql_file, ",\n  %s tinyint NOT NULL",
+                    quote_name(row[0], name_buff, 0));
           }
 
           /*
@@ -2649,12 +2669,25 @@ static uint get_table_structure(char *table, char *db, char *table_type,
 
       row= mysql_fetch_row(result);
 
-      fprintf(sql_file, (opt_compatible_mode & 3) ? "%s;\n" :
-              "/*!40101 SET @saved_cs_client     = @@character_set_client */;\n"
-              "/*!40101 SET character_set_client = utf8 */;\n"
-              "%s;\n"
-              "/*!40101 SET character_set_client = @saved_cs_client */;\n",
-              row[1]);
+      is_log_table= general_log_or_slow_log_tables(db, table);
+      if (is_log_table)
+        row[1]+= 13; /* strlen("CREATE TABLE ")= 13 */
+      if (opt_compatible_mode & 3)
+      {
+        fprintf(sql_file,
+                is_log_table ? "CREATE TABLE IF NOT EXISTS %s;\n" : "%s;\n",
+                row[1]);
+      }
+      else
+      {
+        fprintf(sql_file,
+                "/*!40101 SET @saved_cs_client     = @@character_set_client */;\n"
+                "/*!40101 SET character_set_client = utf8 */;\n"
+                "%s%s;\n"
+                "/*!40101 SET character_set_client = @saved_cs_client */;\n",
+                is_log_table ? "CREATE TABLE IF NOT EXISTS " : "",
+                row[1]);
+      }
 
       check_io(sql_file);
       mysql_free_result(result);
@@ -3361,7 +3394,8 @@ static void dump_table(char *table, char *db)
   if (!opt_events && !my_strcasecmp(&my_charset_latin1, db, "mysql") &&
       !my_strcasecmp(&my_charset_latin1, table, "event"))
   {
-    verbose_msg("-- Skipping data table mysql.event, --skip-events was used\n");
+    fprintf(stderr, "-- Warning: Skipping the data of table mysql.event."
+            " Specify the --events option explicitly.\n");
     DBUG_VOID_RETURN;
   }
 
@@ -4252,7 +4286,8 @@ static int dump_all_tables_in_db(char *database)
   char table_buff[NAME_LEN*2+3];
   char hash_key[2*NAME_LEN+2];  /* "db.tablename" */
   char *afterdot;
-  int using_mysql_db= my_strcasecmp(&my_charset_latin1, database, "mysql");
+  my_bool general_log_table_exists= 0, slow_log_table_exists=0;
+  int using_mysql_db= !my_strcasecmp(charset_info, database, "mysql");
   DBUG_ENTER("dump_all_tables_in_db");
 
   afterdot= strmov(hash_key, database);
@@ -4308,6 +4343,26 @@ static int dump_all_tables_in_db(char *database)
         }
       }
     }
+    else
+    {
+      /*
+        If general_log and slow_log exists in the 'mysql' database,
+         we should dump the table structure. But we cannot
+         call get_table_structure() here as 'LOCK TABLES' query got executed
+         above on the session and that 'LOCK TABLES' query does not contain
+         'general_log' and 'slow_log' tables. (you cannot acquire lock
+         on log tables). Hence mark the existence of these log tables here and
+         after 'UNLOCK TABLES' query is executed on the session, get the table
+         structure from server and dump it in the file.
+      */
+      if (using_mysql_db)
+      {
+        if (!my_strcasecmp(charset_info, table, "general_log"))
+          general_log_table_exists= 1;
+        else if (!my_strcasecmp(charset_info, table, "slow_log"))
+          slow_log_table_exists= 1;
+      }
+    }
   }
   if (opt_events && mysql_get_server_version(mysql) >= 50106)
   {
@@ -4326,7 +4381,26 @@ static int dump_all_tables_in_db(char *database)
   }
   if (lock_tables)
     (void) mysql_query_with_error_report(mysql, 0, "UNLOCK TABLES");
-  if (flush_privileges && using_mysql_db == 0)
+  if (using_mysql_db)
+  {
+    char table_type[NAME_LEN];
+    char ignore_flag;
+    if (general_log_table_exists)
+    {
+      if (!get_table_structure((char *) "general_log",
+                               database, table_type, &ignore_flag) )
+        verbose_msg("-- Warning: get_table_structure() failed with some internal "
+                    "error for 'general_log' table\n");
+    }
+    if (slow_log_table_exists)
+    {
+      if (!get_table_structure((char *) "slow_log",
+                               database, table_type, &ignore_flag) )
+        verbose_msg("-- Warning: get_table_structure() failed with some internal "
+                    "error for 'slow_log' table\n");
+    }
+  }
+  if (flush_privileges && using_mysql_db)
   {
     fprintf(md_result_file,"\n--\n-- Flush Grant Tables \n--\n");
     fprintf(md_result_file,"\n/*! FLUSH PRIVILEGES */;\n");
@@ -4697,7 +4771,7 @@ static int do_show_slave_status(MYSQL *mysql_con)
         if (row[1])
           fprintf(md_result_file, "MASTER_HOST='%s', ", row[1]);
         if (row[3])
-          fprintf(md_result_file, "MASTER_PORT='%s', ", row[3]);
+          fprintf(md_result_file, "MASTER_PORT=%s, ", row[3]);
       }
       fprintf(md_result_file,
               "MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;\n", row[9], row[21]);
@@ -5149,7 +5223,7 @@ static my_bool get_view_structure(char *table, char* db)
   verbose_msg("-- Retrieving view structure for table %s...\n", table);
 
 #ifdef NOT_REALLY_USED_YET
-  sprintf(insert_pat,"SET OPTION SQL_QUOTE_SHOW_CREATE=%d",
+  sprintf(insert_pat, "SET SQL_QUOTE_SHOW_CREATE=%d",
           (opt_quoted || opt_keywords));
 #endif
 
@@ -5463,19 +5537,36 @@ int main(int argc, char **argv)
       dump_all_tablespaces();
     dump_all_databases();
   }
-  else if (argc > 1 && !opt_databases)
-  {
-    /* Only one database and selected table(s) */
-    if (!opt_alltspcs && !opt_notspcs)
-      dump_tablespaces_for_tables(*argv, (argv + 1), (argc -1));
-    dump_selected_tables(*argv, (argv + 1), (argc - 1));
-  }
   else
   {
-    /* One or more databases, all tables */
-    if (!opt_alltspcs && !opt_notspcs)
-      dump_tablespaces_for_databases(argv);
-    dump_databases(argv);
+    // Check all arguments meet length condition. Currently database and table
+    // names are limited to NAME_LEN bytes and stack-based buffers assumes
+    // that escaped name will be not longer than NAME_LEN*2 + 2 bytes long.
+    int argument;
+    for (argument= 0; argument < argc; argument++)
+    {
+      size_t argument_length= strlen(argv[argument]);
+      if (argument_length > NAME_LEN)
+      {
+        die(EX_CONSCHECK, "[ERROR] Argument '%s' is too long, it cannot be "
+          "name for any table or database.\n", argv[argument]);
+      }
+    }
+
+    if (argc > 1 && !opt_databases)
+    {
+      /* Only one database and selected table(s) */
+      if (!opt_alltspcs && !opt_notspcs)
+        dump_tablespaces_for_tables(*argv, (argv + 1), (argc - 1));
+      dump_selected_tables(*argv, (argv + 1), (argc - 1));
+    }
+    else
+    {
+      /* One or more databases, all tables */
+      if (!opt_alltspcs && !opt_notspcs)
+        dump_tablespaces_for_databases(argv);
+      dump_databases(argv);
+    }
   }
 
   /* if --dump-slave , start the slave sql thread */

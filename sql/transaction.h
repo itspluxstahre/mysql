@@ -1,5 +1,4 @@
-/* Copyright (c) 2008 MySQL AB, 2009 Sun Microsystems, Inc.
-   Use is subject to license terms.
+/* Copyright (c) 2008, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -30,6 +29,7 @@ bool trans_begin(THD *thd, uint flags= 0);
 bool trans_commit(THD *thd);
 bool trans_commit_implicit(THD *thd);
 bool trans_rollback(THD *thd);
+bool trans_rollback_implicit(THD *thd);
 
 bool trans_commit_stmt(THD *thd);
 bool trans_rollback_stmt(THD *thd);

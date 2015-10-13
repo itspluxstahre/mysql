@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,6 +19,26 @@ if("${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION}" GREATER 2.6)
  CMAKE_POLICY(VERSION 2.8)
 endif()
 
+# We use PROPERTIES LINK_INTERFACE_LIBRARIES. See cmake --help-policy CMP0022
+IF(CMAKE_VERSION VERSION_EQUAL "2.8.12" OR
+   CMAKE_VERSION VERSION_GREATER "2.8.12")
+ CMAKE_POLICY(SET CMP0022 OLD)
+ENDIF()
+
+# We use the LOCATION target property (CMP0026)
+# and get_target_property() for non-existent targets (CMP0045)
+# and INSTALL_NAME_DIR (CMP0042)
+IF(CMAKE_VERSION VERSION_EQUAL "3.0.0" OR
+   CMAKE_VERSION VERSION_GREATER "3.0.0")
+ CMAKE_POLICY(SET CMP0026 OLD)
+ CMAKE_POLICY(SET CMP0045 OLD)
+ CMAKE_POLICY(SET CMP0042 OLD)
+ENDIF()
+
+MESSAGE(STATUS "Running cmake version ${CMAKE_VERSION}")
+
+# Will set GIT_EXECUTABLE and GIT_FOUND
+FIND_PACKAGE(Git)
 
 SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/cmake)
 
@@ -58,11 +78,9 @@ ENDIF()
 SET(BUILDTYPE_DOCSTRING
  "Choose the type of build, options are: None(CMAKE_CXX_FLAGS or
  CMAKE_C_FLAGS used) Debug Release RelWithDebInfo MinSizeRel")
- 
+
 IF(WITH_DEBUG)
   SET(CMAKE_BUILD_TYPE "Debug" CACHE STRING ${BUILDTYPE_DOCSTRING} FORCE)
-  SET(MYSQL_MAINTAINER_MODE ON CACHE BOOL
-      "MySQL maintainer-specific development environment")
   IF(UNIX AND NOT APPLE)
     # Compiling with PIC speeds up embedded build, on PIC sensitive systems 
     # Predefine it to ON, in case user chooses to build embedded. 
@@ -92,6 +110,15 @@ ELSE()
 ENDIF()
 PROJECT(${MYSQL_PROJECT_NAME})
 
+# Maintainer mode is default on only for Linux debug builds using GCC/G++
+IF(CMAKE_BUILD_TYPE MATCHES "Debug" OR WITH_DEBUG)
+  IF(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+     CMAKE_COMPILER_IS_GNUCC AND CMAKE_COMPILER_IS_GNUCXX)
+    SET(MYSQL_MAINTAINER_MODE ON CACHE BOOL
+        "MySQL maintainer-specific development environment")
+  ENDIF()
+ENDIF()
+
 IF(BUILD_CONFIG)
   INCLUDE(
   ${CMAKE_SOURCE_DIR}/cmake/build_configurations/${BUILD_CONFIG}.cmake)
@@ -115,36 +142,10 @@ FOREACH(_base
 ENDFOREACH()
 
 
-
 # Following autotools tradition, add preprocessor definitions
 # specified in environment variable CPPFLAGS
 IF(DEFINED ENV{CPPFLAGS})
   ADD_DEFINITIONS($ENV{CPPFLAGS})
-ENDIF()
-
-#
-# Control aspects of the development environment which are
-# specific to MySQL maintainers and developers.
-#
-INCLUDE(maintainer)
-
-OPTION(MYSQL_MAINTAINER_MODE
-       "MySQL maintainer-specific development environment" OFF)
-
-# Whether the maintainer mode compiler options should be enabled.
-IF(MYSQL_MAINTAINER_MODE)
-  IF(CMAKE_C_COMPILER_ID MATCHES "GNU")
-    SET_MYSQL_MAINTAINER_GNU_C_OPTIONS()
-  ENDIF()
-  IF(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    SET_MYSQL_MAINTAINER_GNU_CXX_OPTIONS()
-  ENDIF()
-  IF(CMAKE_C_COMPILER_ID MATCHES "Intel")
-    SET_MYSQL_MAINTAINER_INTEL_C_OPTIONS()
-  ENDIF()
-  IF(CMAKE_CXX_COMPILER_ID MATCHES "Intel")
-    SET_MYSQL_MAINTAINER_INTEL_CXX_OPTIONS()
-  ENDIF()
 ENDIF()
 
 # Add macros
@@ -176,7 +177,82 @@ ENDIF()
 OPTION (WITH_UNIT_TESTS "Compile MySQL with unit tests" ON)
 MARK_AS_ADVANCED(CYBOZU BACKUP_TEST WITHOUT_SERVER DISABLE_SHARED)
 
- 
+
+include(CheckCSourceCompiles)
+include(CheckCXXSourceCompiles)
+# We need some extra FAIL_REGEX patterns
+# Note that CHECK_C_SOURCE_COMPILES is a misnomer, it will also link.
+MACRO (MY_CHECK_C_COMPILER_FLAG FLAG RESULT)
+  SET(SAVE_CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
+  SET(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${FLAG}")
+  CHECK_C_SOURCE_COMPILES("int main(void) { return 0; }" ${RESULT}
+    FAIL_REGEX "argument unused during compilation"
+    FAIL_REGEX "unsupported .*option"
+    FAIL_REGEX "unknown .*option"
+    FAIL_REGEX "unrecognized .*option"
+    FAIL_REGEX "ignoring unknown option"
+    FAIL_REGEX "[Ww]arning: [Oo]ption"
+    )
+  SET(CMAKE_REQUIRED_FLAGS "${SAVE_CMAKE_REQUIRED_FLAGS}")
+ENDMACRO()
+
+MACRO (MY_CHECK_CXX_COMPILER_FLAG FLAG RESULT)
+  SET(SAVE_CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
+  SET(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${FLAG}")
+  CHECK_CXX_SOURCE_COMPILES("int main(void) { return 0; }" ${RESULT}
+    FAIL_REGEX "argument unused during compilation"
+    FAIL_REGEX "unsupported .*option"
+    FAIL_REGEX "unknown .*option"
+    FAIL_REGEX "unrecognized .*option"
+    FAIL_REGEX "ignoring unknown option"
+    FAIL_REGEX "[Ww]arning: [Oo]ption"
+    )
+  SET(CMAKE_REQUIRED_FLAGS "${SAVE_CMAKE_REQUIRED_FLAGS}")
+ENDMACRO()
+
+OPTION(WITH_ASAN "Enable address sanitizer" OFF)
+IF (WITH_ASAN)
+  # gcc 4.8.1 and new versions of clang
+  MY_CHECK_C_COMPILER_FLAG("-fsanitize=address" HAVE_C_FSANITIZE)
+  MY_CHECK_CXX_COMPILER_FLAG("-fsanitize=address" HAVE_CXX_FSANITIZE)
+
+  IF(HAVE_C_FSANITIZE AND HAVE_CXX_FSANITIZE)
+    # We switch on basic optimization also for debug builds.
+    # With optimization we may get some warnings, so we switch off -Werror
+    SET(CMAKE_C_FLAGS_DEBUG
+      "${CMAKE_C_FLAGS_DEBUG} -fsanitize=address -O1 -Wno-error -fPIC")
+    SET(CMAKE_C_FLAGS_RELWITHDEBINFO
+      "${CMAKE_C_FLAGS_RELWITHDEBINFO} -fsanitize=address -fPIC")
+    SET(CMAKE_CXX_FLAGS_DEBUG
+      "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=address -O1 -Wno-error -fPIC")
+    SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO
+      "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fsanitize=address -fPIC")
+    SET(WITH_ASAN_OK 1)
+  ELSE()
+    # older versions of clang
+    MY_CHECK_C_COMPILER_FLAG("-faddress-sanitizer" HAVE_C_FADDRESS)
+    MY_CHECK_CXX_COMPILER_FLAG("-faddress-sanitizer" HAVE_CXX_FFADDRESS)
+
+    IF(HAVE_C_FADDRESS AND HAVE_CXX_FFADDRESS)
+      # We switch on basic optimization also for debug builds.
+      SET(CMAKE_C_FLAGS_DEBUG
+        "${CMAKE_C_FLAGS_DEBUG} -faddress-sanitizer -O1 -fPIC")
+      SET(CMAKE_C_FLAGS_RELWITHDEBINFO
+        "${CMAKE_C_FLAGS_RELWITHDEBINFO} -faddress-sanitizer -fPIC")
+      SET(CMAKE_CXX_FLAGS_DEBUG
+        "${CMAKE_CXX_FLAGS_DEBUG} -faddress-sanitizer -O1 -fPIC")
+      SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -faddress-sanitizer -fPIC")
+      SET(WITH_ASAN_OK 1)
+    ENDIF()
+  ENDIF()
+
+  IF(NOT WITH_ASAN_OK)
+    MESSAGE(FATAL_ERROR "Do not know how to enable address sanitizer")
+  ENDIF()
+ENDIF()
+
+
 OPTION(ENABLE_DEBUG_SYNC "Enable debug sync (debug builds only)" ON) 
 IF(ENABLE_DEBUG_SYNC) 
   SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DENABLED_DEBUG_SYNC") 
@@ -252,6 +328,16 @@ IF(SYSCONFDIR)
   SET(DEFAULT_SYSCONFDIR "${SYSCONFDIR}")
 ENDIF()
 
+SET(TMPDIR "P_tmpdir"
+  CACHE PATH
+  "PATH to MySQL TMP dir. Defaults to the P_tmpdir macro in <stdio.h>")
+IF(TMPDIR STREQUAL "P_tmpdir")
+  # Do not quote it, to refer to the P_tmpdir macro.
+  SET(DEFAULT_TMPDIR "P_tmpdir")
+ELSE()
+  # Quote it, to make it a const char string.
+  SET(DEFAULT_TMPDIR "\"${TMPDIR}\"")
+ENDIF()
 
 # Run platform tests
 INCLUDE(configure.cmake)
@@ -266,19 +352,21 @@ MYSQL_CHECK_ZLIB_WITH_COMPRESS()
 MYSQL_CHECK_SSL()
 # Add readline or libedit.
 MYSQL_CHECK_READLINE()
+# Google Breakpad crash reporting.
+INCLUDE(breakpad)
 
 #
 # Setup maintainer mode options by the end. Platform checks are
 # not run with the warning options as to not perturb fragile checks
 # (i.e. do not make warnings into errors).
 #
-IF(MYSQL_MAINTAINER_MODE)
-  # Set compiler flags required under maintainer mode.
-  MESSAGE(STATUS "C warning options: ${MY_MAINTAINER_C_WARNINGS}")
-  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${MY_MAINTAINER_C_WARNINGS}")
-  MESSAGE(STATUS "C++ warning options: ${MY_MAINTAINER_CXX_WARNINGS}")
-  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${MY_MAINTAINER_CXX_WARNINGS}")
-ENDIF()
+# Why doesn't these flags affect the entire build?
+# Because things may already have been included with ADD_SUBDIRECTORY
+#
+OPTION(MYSQL_MAINTAINER_MODE
+       "MySQL maintainer-specific development environment" OFF)
+
+INCLUDE(maintainer)
 
 IF(NOT WITHOUT_SERVER)
 SET (MYSQLD_STATIC_PLUGIN_LIBS "" CACHE INTERNAL "")
@@ -294,13 +382,13 @@ ADD_SUBDIRECTORY(regex)
 ADD_SUBDIRECTORY(mysys)
 ADD_SUBDIRECTORY(libmysql)
 
-
 IF(WITH_UNIT_TESTS)
  ENABLE_TESTING()
 ENDIF()
 IF(WITH_UNIT_TESTS)
   ADD_SUBDIRECTORY(unittest/mytap)
   ADD_SUBDIRECTORY(unittest/mysys)
+  ADD_SUBDIRECTORY(unittest/my_decimal)
 ENDIF()
 
 ADD_SUBDIRECTORY(extra)
@@ -324,6 +412,11 @@ IF(NOT WITHOUT_SERVER)
   IF(UNIX)
     ADD_SUBDIRECTORY(man)
   ENDIF()
+  IF(EXISTS ${CMAKE_SOURCE_DIR}/internal/CMakeLists.txt)
+    ADD_SUBDIRECTORY(internal)
+  ENDIF()
+  ADD_SUBDIRECTORY(packaging/rpm-oel)
+  ADD_SUBDIRECTORY(packaging/rpm-sles)
 ENDIF()
 
 INCLUDE(cmake/abi_check.cmake)
@@ -336,13 +429,14 @@ CONFIGURE_FILE(${CMAKE_SOURCE_DIR}/include/mysql_version.h.in
 CONFIGURE_FILE(${CMAKE_SOURCE_DIR}/sql/sql_builtin.cc.in
     ${CMAKE_BINARY_DIR}/sql/sql_builtin.cc)
 CONFIGURE_FILE(
-    ${CMAKE_SOURCE_DIR}/cmake/info_macros.cmake.in ${CMAKE_BINARY_DIR}/info_macros.cmake @ONLY)
+    ${CMAKE_SOURCE_DIR}/cmake/info_macros.cmake.in
+    ${CMAKE_BINARY_DIR}/info_macros.cmake @ONLY)
 
 # Handle the "INFO_*" files.
 INCLUDE(${CMAKE_BINARY_DIR}/info_macros.cmake)
 # Source: This can be done during the cmake phase, all information is
 # available, but should be repeated on each "make" just in case someone
-# does "cmake ; make ; bzr pull ; make".
+# does "cmake ; make ; git pull ; make".
 CREATE_INFO_SRC(${CMAKE_BINARY_DIR}/Docs)
 ADD_CUSTOM_TARGET(INFO_SRC ALL
   COMMAND ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/cmake/info_src.cmake
@@ -361,12 +455,12 @@ ELSE()
   SET(CPACK_GENERATOR "TGZ")
 ENDIF() 
 ADD_SUBDIRECTORY(packaging/WiX)
+ADD_SUBDIRECTORY(packaging/solaris)
 
 # Create a single package with "make package"
 # (see http://public.kitware.com/Bug/view.php?id=11452)
 SET(CPACK_MONOLITHIC_INSTALL 1 CACHE INTERNAL "")
 
-INCLUDE(CPack)
 IF(UNIX)
   INSTALL(FILES Docs/mysql.info DESTINATION ${INSTALL_INFODIR} OPTIONAL COMPONENT Info)
 ENDIF()
@@ -379,7 +473,7 @@ IF(NOT INSTALL_LAYOUT MATCHES "RPM")
   COMPONENT Readme
   OPTIONAL
   )
-  INSTALL(FILES README DESTINATION ${INSTALL_DOCREADMEDIR} COMPONENT Readme)
+  INSTALL(FILES README-MySQL DESTINATION ${INSTALL_DOCREADMEDIR} COMPONENT Readme RENAME README)
   INSTALL(FILES ${CMAKE_BINARY_DIR}/Docs/INFO_SRC ${CMAKE_BINARY_DIR}/Docs/INFO_BIN DESTINATION ${INSTALL_DOCDIR})
   IF(UNIX)
     INSTALL(FILES Docs/INSTALL-BINARY DESTINATION ${INSTALL_DOCREADMEDIR} COMPONENT Readme)
@@ -397,4 +491,40 @@ IF(NOT INSTALL_LAYOUT MATCHES "RPM")
     PATTERN "mysql.info" EXCLUDE
     PATTERN "sp-imp-spec.txt" EXCLUDE
   )
+ENDIF()
+
+INCLUDE(CPack)
+
+# C compiler flags consist of:
+# CPPFLAGS        Taken from environment, see above.
+# ADD_DEFINITIONS In each individual CMakeLists.txt
+# CMAKE_C_FLAGS   From command line.
+#                 We extend these in maintainer.cmake
+# ENV{CFLAGS}     From environment, but environment is ignored if
+#                 CMAKE_C_FLAGS is also given on command line
+# CMAKE_C_FLAGS_${CMAKE_BUILD_TYPE}
+#                 We extend these in compiler_options.cmake
+#
+# Note that CMakeCache.txt contains cmake builtins for these variables,
+# *not* the values that will actually be used:
+
+IF(CMAKE_GENERATOR MATCHES "Makefiles")
+  MESSAGE(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
+ENDIF()
+GET_PROPERTY(cwd_definitions DIRECTORY PROPERTY COMPILE_DEFINITIONS)
+MESSAGE(STATUS "COMPILE_DEFINITIONS: ${cwd_definitions}")
+MESSAGE(STATUS "CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
+MESSAGE(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
+IF(CMAKE_BUILD_TYPE AND CMAKE_GENERATOR MATCHES "Makefiles")
+  STRING(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKEBT)
+  MESSAGE(STATUS "CMAKE_C_FLAGS_${CMAKEBT}: ${CMAKE_C_FLAGS_${CMAKEBT}}")
+  MESSAGE(STATUS "CMAKE_CXX_FLAGS_${CMAKEBT}: ${CMAKE_CXX_FLAGS_${CMAKEBT}}")
+ENDIF()
+IF(NOT CMAKE_GENERATOR MATCHES "Makefiles")
+  MESSAGE(STATUS "CMAKE_C_FLAGS_DEBUG: ${CMAKE_C_FLAGS_DEBUG}")
+  MESSAGE(STATUS "CMAKE_CXX_FLAGS_DEBUG: ${CMAKE_CXX_FLAGS_DEBUG}")
+  MESSAGE(STATUS
+    "CMAKE_C_FLAGS_RELWITHDEBINFO: ${CMAKE_C_FLAGS_RELWITHDEBINFO}")
+  MESSAGE(STATUS
+    "CMAKE_CXX_FLAGS_RELWITHDEBINFO: ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
 ENDIF()

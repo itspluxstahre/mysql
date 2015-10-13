@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,26 +21,35 @@ MACRO (INSTALL_DEBUG_SYMBOLS targets)
     GET_TARGET_PROPERTY(location ${target} LOCATION)
     GET_TARGET_PROPERTY(type ${target} TYPE)
     IF(NOT INSTALL_LOCATION)
-      IF(type MATCHES "STATIC_LIBRARY" OR type MATCHES "MODULE_LIBRARY" OR type MATCHES "SHARED_LIBRARY")
+      IF(type MATCHES "STATIC_LIBRARY"
+          OR type MATCHES "MODULE_LIBRARY"
+          OR type MATCHES "SHARED_LIBRARY")
         SET(INSTALL_LOCATION "lib")
       ELSEIF(type MATCHES "EXECUTABLE")
         SET(INSTALL_LOCATION "bin")
       ELSE()
-        MESSAGE(FATAL_ERROR "cannot determine type of ${target}. Don't now where to install")
+        MESSAGE(FATAL_ERROR
+          "cannot determine type of ${target}. Don't now where to install")
      ENDIF()
     ENDIF()
     STRING(REPLACE ".exe" ".pdb" pdb_location ${location})
     STRING(REPLACE ".dll" ".pdb" pdb_location ${pdb_location})
     STRING(REPLACE ".lib" ".pdb" pdb_location ${pdb_location})
     IF(CMAKE_GENERATOR MATCHES "Visual Studio")
-      STRING(REPLACE "${CMAKE_CFG_INTDIR}" "\${CMAKE_INSTALL_CONFIG_NAME}" pdb_location ${pdb_location})
+      STRING(REPLACE
+        "${CMAKE_CFG_INTDIR}" "\${CMAKE_INSTALL_CONFIG_NAME}"
+        pdb_location ${pdb_location})
     ENDIF()
     IF(target STREQUAL "mysqld")
 	  SET(comp Server)
     ELSE()
       SET(comp Debuginfo)
     ENDIF()	  
-    INSTALL(FILES ${pdb_location} DESTINATION ${INSTALL_LOCATION} COMPONENT ${comp})
+    # No .pdb file for static libraries.
+    IF(NOT type MATCHES "STATIC_LIBRARY")
+      INSTALL(FILES ${pdb_location}
+        DESTINATION ${INSTALL_LOCATION} COMPONENT ${comp})
+    ENDIF()
   ENDFOREACH()
   ENDIF()
 ENDMACRO()
@@ -111,28 +120,28 @@ FUNCTION(INSTALL_SCRIPT)
 ENDFUNCTION()
 
 # Install symbolic link to CMake target. 
-# the link is created in the same directory as target
-# and extension will be the same as for target file.
-MACRO(INSTALL_SYMLINK linkname target destination component)
+# We do 'cd path; ln -s target_name link_name'
+# We also add an INSTALL target for "${path}/${link_name}"
+MACRO(INSTALL_SYMLINK target target_name link_name destination component)
 IF(UNIX)
   GET_TARGET_PROPERTY(location ${target} LOCATION)
   GET_FILENAME_COMPONENT(path ${location} PATH)
-  GET_FILENAME_COMPONENT(name ${location} NAME)
-  SET(output ${path}/${linkname})
+
+  SET(output ${path}/${link_name})
   ADD_CUSTOM_COMMAND(
     OUTPUT ${output}
     COMMAND ${CMAKE_COMMAND} ARGS -E remove -f ${output}
     COMMAND ${CMAKE_COMMAND} ARGS -E create_symlink 
-      ${name} 
-      ${linkname}
+      ${target_name} 
+      ${link_name}
     WORKING_DIRECTORY ${path}
     DEPENDS ${target}
     )
   
-  ADD_CUSTOM_TARGET(symlink_${linkname}
+  ADD_CUSTOM_TARGET(symlink_${link_name}
     ALL
     DEPENDS ${output})
-  SET_TARGET_PROPERTIES(symlink_${linkname} PROPERTIES CLEAN_DIRECT_OUTPUT 1)
+  SET_TARGET_PROPERTIES(symlink_${link_name} PROPERTIES CLEAN_DIRECT_OUTPUT 1)
   IF(CMAKE_GENERATOR MATCHES "Xcode")
     # For Xcode, replace project config with install config
     STRING(REPLACE "${CMAKE_CFG_INTDIR}" 

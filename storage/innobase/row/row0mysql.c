@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2011, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2014, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -51,6 +51,9 @@ Created 9/17/2000 Heikki Tuuri
 #include "btr0sea.h"
 #include "fil0fil.h"
 #include "ibuf0ibuf.h"
+#include "m_string.h"
+#include "my_sys.h"
+#include "ha_prototypes.h"
 
 /** Provide optional 4.x backwards compatibility for 5.0 and above */
 UNIV_INTERN ibool	row_rollback_on_timeout	= FALSE;
@@ -959,17 +962,12 @@ row_update_statistics_if_needed(
 
 	table->stat_modified_counter = counter + 1;
 
-	/* Calculate new statistics if 1 / 16 of table has been modified
-	since the last time a statistics batch was run, or if
-	stat_modified_counter > 2 000 000 000 (to avoid wrap-around).
-	We calculate statistics at most every 16th round, since we may have
-	a counter table which is very small and updated very often. */
+	if (DICT_TABLE_CHANGED_TOO_MUCH(table)) {
 
-	if (counter > 2000000000
-	    || ((ib_int64_t)counter > 16 + table->stat_n_rows / 16)) {
-
-		dict_update_statistics(table, FALSE /* update even if stats
-						    are initialized */);
+		dict_update_statistics(
+			table,
+			FALSE, /* update even if stats are initialized */
+			TRUE /* only update if stats changed too much */);
 	}
 }
 
@@ -1443,6 +1441,8 @@ row_update_for_mysql(
 		return(DB_ERROR);
 	}
 
+	DEBUG_SYNC_C("innodb_row_update_for_mysql_begin");
+
 	trx->op_info = "updating or deleting";
 
 	row_mysql_delay_if_needed();
@@ -1783,7 +1783,7 @@ row_mysql_freeze_data_dictionary_func(
 {
 	ut_a(trx->dict_operation_lock_mode == 0);
 
-	rw_lock_s_lock_func(&dict_operation_lock, 0, file, line);
+	rw_lock_s_lock_inline(&dict_operation_lock, 0, file, line);
 
 	trx->dict_operation_lock_mode = RW_S_LATCH;
 }
@@ -1820,7 +1820,7 @@ row_mysql_lock_data_dictionary_func(
 	/* Serialize data dictionary operations with dictionary mutex:
 	no deadlocks or lock waits can occur then in these operations */
 
-	rw_lock_x_lock_func(&dict_operation_lock, 0, file, line);
+	rw_lock_x_lock_inline(&dict_operation_lock, 0, file, line);
 	trx->dict_operation_lock_mode = RW_X_LATCH;
 
 	mutex_enter(&(dict_sys->mutex));
@@ -1850,7 +1850,8 @@ Creates a table for MySQL. If the name of the table ends in
 one of "innodb_monitor", "innodb_lock_monitor", "innodb_tablespace_monitor",
 "innodb_table_monitor", then this will also start the printing of monitor
 output by the master thread. If the table name ends in "innodb_mem_validate",
-InnoDB will try to invoke mem_validate().
+InnoDB will try to invoke mem_validate(). On failure the transaction will
+be rolled back and the 'table' object will be freed.
 @return	error code or DB_SUCCESS */
 UNIV_INTERN
 int
@@ -1984,17 +1985,20 @@ err_exit:
 		ut_print_name(stderr, trx, TRUE, table->name);
 		fputs(" because tablespace full\n", stderr);
 
-		if (dict_table_get_low(table->name)) {
+		if (dict_table_get_low(table->name, DICT_ERR_IGNORE_NONE)) {
 
 			row_drop_table_for_mysql(table->name, trx, FALSE);
 			trx_commit_for_mysql(trx);
+		} else {
+			dict_mem_table_free(table);
 		}
 		break;
 
 	case DB_TOO_MANY_CONCURRENT_TRXS:
 		/* We already have .ibd file here. it should be deleted. */
 
-		if (table->space && !fil_delete_tablespace(table->space)) {
+		if (table->space && !fil_delete_tablespace(table->space,
+							   FALSE)) {
 			ut_print_timestamp(stderr);
 			fprintf(stderr,
 				"  InnoDB: Error: not able to"
@@ -2063,7 +2067,7 @@ row_create_index_for_mysql(
 	que_run_threads()) and thus index->table_name is not available. */
 	table_name = mem_strdup(index->table_name);
 
-	table = dict_table_get_low(table_name);
+	table = dict_table_get_low(table_name, DICT_ERR_IGNORE_NONE);
 
 	trx_start_if_not_started(trx);
 
@@ -2172,7 +2176,8 @@ row_table_add_foreign_constraints(
 					      name, reject_fks);
 	if (err == DB_SUCCESS) {
 		/* Check that also referencing constraints are ok */
-		err = dict_load_foreigns(name, FALSE, TRUE);
+		err = dict_load_foreigns(name, FALSE, TRUE,
+					 DICT_ERR_IGNORE_NONE);
 	}
 
 	if (err != DB_SUCCESS) {
@@ -2274,7 +2279,7 @@ loop:
 	}
 
 	mutex_enter(&(dict_sys->mutex));
-	table = dict_table_get_low(drop->table_name);
+	table = dict_table_get_low(drop->table_name, DICT_ERR_IGNORE_NONE);
 	mutex_exit(&(dict_sys->mutex));
 
 	if (table == NULL) {
@@ -2442,7 +2447,7 @@ row_discard_tablespace_for_mysql(
 
 	row_mysql_lock_data_dictionary(trx);
 
-	table = dict_table_get_low(name);
+	table = dict_table_get_low(name, DICT_ERR_IGNORE_NONE);
 
 	if (!table) {
 		err = DB_TABLE_NOT_FOUND;
@@ -2632,7 +2637,7 @@ row_import_tablespace_for_mysql(
 
 	row_mysql_lock_data_dictionary(trx);
 
-	table = dict_table_get_low(name);
+	table = dict_table_get_low(name, DICT_ERR_IGNORE_NONE);
 
 	if (!table) {
 		ut_print_timestamp(stderr);
@@ -3041,8 +3046,10 @@ next_rec:
 	dict_table_autoinc_lock(table);
 	dict_table_autoinc_initialize(table, 1);
 	dict_table_autoinc_unlock(table);
-	dict_update_statistics(table, FALSE /* update even if stats are
-					    initialized */);
+	dict_update_statistics(
+		table,
+		FALSE, /* update even if stats are initialized */
+		FALSE /* update even if not changed too much */);
 
 	trx_commit_for_mysql(trx);
 
@@ -3075,12 +3082,16 @@ row_drop_table_for_mysql(
 {
 	dict_foreign_t*	foreign;
 	dict_table_t*	table;
+	dict_index_t*	index;
 	ulint		space_id;
 	ulint		err;
 	const char*	table_name;
 	ulint		namelen;
 	ibool		locked_dictionary	= FALSE;
 	pars_info_t*    info			= NULL;
+	DBUG_ENTER("row_drop_table_for_mysql");
+
+	DBUG_PRINT("row_drop_table_for_mysql", ("table: %s", name));
 
 	ut_a(name != NULL);
 
@@ -3091,7 +3102,7 @@ row_drop_table_for_mysql(
 		      "InnoDB: Shut down mysqld and edit my.cnf so that newraw"
 		      " is replaced with raw.\n", stderr);
 
-		return(DB_ERROR);
+		DBUG_RETURN(DB_ERROR);
 	}
 
 	trx->op_info = "dropping table";
@@ -3150,7 +3161,7 @@ row_drop_table_for_mysql(
 	ut_ad(rw_lock_own(&dict_operation_lock, RW_LOCK_EX));
 #endif /* UNIV_SYNC_DEBUG */
 
-	table = dict_table_get_low_ignore_err(
+	table = dict_table_get_low(
 		name, DICT_ERR_IGNORE_INDEX_ROOT | DICT_ERR_IGNORE_CORRUPT);
 
 	if (!table) {
@@ -3281,6 +3292,18 @@ check_next_foreign:
 
 	trx_set_dict_operation(trx, TRX_DICT_OP_TABLE);
 	trx->table_id = table->id;
+
+	/* Mark all indexes unavailable in the data dictionary cache
+	before starting to drop the table. */
+
+	for (index = dict_table_get_first_index(table);
+	     index != NULL;
+	     index = dict_table_get_next_index(index)) {
+		rw_lock_x_lock(dict_index_get_lock(index));
+		ut_ad(!index->to_be_dropped);
+		index->to_be_dropped = TRUE;
+		rw_lock_x_unlock(dict_index_get_lock(index));
+	}
 
 	/* We use the private SQL parser of Innobase to generate the
 	query graphs needed in deleting the dictionary data from system
@@ -3420,7 +3443,7 @@ check_next_foreign:
 					"InnoDB: of table ");
 				ut_print_name(stderr, trx, TRUE, name);
 				fprintf(stderr, ".\n");
-			} else if (!fil_delete_tablespace(space_id)) {
+			} else if (!fil_delete_tablespace(space_id, FALSE)) {
 				fprintf(stderr,
 					"InnoDB: We removed now the InnoDB"
 					" internal data dictionary entry\n"
@@ -3447,6 +3470,17 @@ check_next_foreign:
 		the undo log. We can directly exit here
 		and return the DB_TOO_MANY_CONCURRENT_TRXS
 		error. */
+
+		/* Mark all indexes available in the data dictionary
+		cache again. */
+
+		for (index = dict_table_get_first_index(table);
+		     index != NULL;
+		     index = dict_table_get_next_index(index)) {
+			rw_lock_x_lock(dict_index_get_lock(index));
+			index->to_be_dropped = FALSE;
+			rw_lock_x_unlock(dict_index_get_lock(index));
+		}
 		break;
 
 	case DB_OUT_OF_FILE_SPACE:
@@ -3473,7 +3507,7 @@ funct_exit:
 
 	srv_wake_master_thread();
 
-	return((int) err);
+	DBUG_RETURN((int) err);
 }
 
 /*********************************************************************//**
@@ -3647,7 +3681,7 @@ loop:
 	while ((table_name = dict_get_first_table_name_in_db(name))) {
 		ut_a(memcmp(table_name, name, namelen) == 0);
 
-		table = dict_table_get_low(table_name);
+		table = dict_table_get_low(table_name, DICT_ERR_IGNORE_NONE);
 
 		ut_a(table);
 
@@ -3803,9 +3837,11 @@ row_rename_table_for_mysql(
 	ulint		n_constraints_to_drop	= 0;
 	ibool		old_is_tmp, new_is_tmp;
 	pars_info_t*	info			= NULL;
+	int		retry;
 
 	ut_a(old_name != NULL);
 	ut_a(new_name != NULL);
+	ut_ad(trx->conc_state == TRX_ACTIVE);
 
 	if (srv_created_new_raw || srv_force_recovery) {
 		fputs("InnoDB: A new raw disk partition was initialized or\n"
@@ -3830,12 +3866,11 @@ row_rename_table_for_mysql(
 	}
 
 	trx->op_info = "renaming table";
-	trx_start_if_not_started(trx);
 
 	old_is_tmp = row_is_mysql_tmp_table_name(old_name);
 	new_is_tmp = row_is_mysql_tmp_table_name(new_name);
 
-	table = dict_table_get_low(old_name);
+	table = dict_table_get_low(old_name, DICT_ERR_IGNORE_NONE);
 
 	if (!table) {
 		err = DB_TABLE_NOT_FOUND;
@@ -3885,6 +3920,25 @@ row_rename_table_for_mysql(
 		}
 	}
 
+	/* Is a foreign key check running on this table? */
+	for (retry = 0; retry < 100
+	     && table->n_foreign_key_checks_running > 0; ++retry) {
+		row_mysql_unlock_data_dictionary(trx);
+		os_thread_yield();
+		row_mysql_lock_data_dictionary(trx);
+	}
+
+	if (table->n_foreign_key_checks_running > 0) {
+		ut_print_timestamp(stderr);
+		fputs(" InnoDB: Error: in ALTER TABLE ", stderr);
+		ut_print_name(stderr, trx, TRUE, old_name);
+		fprintf(stderr, "\n"
+			"InnoDB: a FOREIGN KEY check is running.\n"
+			"InnoDB: Cannot rename table.\n");
+		err = DB_TABLE_IN_FK_CHECK;
+		goto funct_exit;
+	}
+
 	/* We use the private SQL parser of Innobase to generate the query
 	graphs needed in updating the dictionary data from system tables. */
 
@@ -3906,11 +3960,44 @@ row_rename_table_for_mysql(
 		goto end;
 	} else if (!new_is_tmp) {
 		/* Rename all constraints. */
+		char	new_table_name[MAX_TABLE_NAME_LEN] = "";
+		char	old_table_utf8[MAX_TABLE_NAME_LEN] = "";
+		uint	errors = 0;
+
+		strncpy(old_table_utf8, old_name, MAX_TABLE_NAME_LEN);
+		innobase_convert_to_system_charset(
+			strchr(old_table_utf8, '/') + 1,
+			strchr(old_name, '/') +1,
+			MAX_TABLE_NAME_LEN, &errors);
+
+		if (errors) {
+			/* Table name could not be converted from charset
+			my_charset_filename to UTF-8. This means that the
+			table name is already in UTF-8 (#mysql#50). */
+			strncpy(old_table_utf8, old_name, MAX_TABLE_NAME_LEN);
+		}
 
 		info = pars_info_create();
 
 		pars_info_add_str_literal(info, "new_table_name", new_name);
 		pars_info_add_str_literal(info, "old_table_name", old_name);
+		pars_info_add_str_literal(info, "old_table_name_utf8",
+					  old_table_utf8);
+
+		strncpy(new_table_name, new_name, MAX_TABLE_NAME_LEN);
+		innobase_convert_to_system_charset(
+			strchr(new_table_name, '/') + 1,
+			strchr(new_name, '/') +1,
+			MAX_TABLE_NAME_LEN, &errors);
+
+		if (errors) {
+			/* Table name could not be converted from charset
+			my_charset_filename to UTF-8. This means that the
+			table name is already in UTF-8 (#mysql#50). */
+			strncpy(new_table_name, new_name, MAX_TABLE_NAME_LEN);
+		}
+
+		pars_info_add_str_literal(info, "new_table_utf8", new_table_name);
 
 		err = que_eval_sql(
 			info,
@@ -3923,6 +4010,7 @@ row_rename_table_for_mysql(
 			"old_t_name_len INT;\n"
 			"new_db_name_len INT;\n"
 			"id_len INT;\n"
+			"offset INT;\n"
 			"found INT;\n"
 			"BEGIN\n"
 			"found := 1;\n"
@@ -3931,8 +4019,8 @@ row_rename_table_for_mysql(
 			"new_db_name := SUBSTR(:new_table_name, 0,\n"
 			"                      new_db_name_len);\n"
 			"old_t_name_len := LENGTH(:old_table_name);\n"
-			"gen_constr_prefix := CONCAT(:old_table_name,\n"
-			"                            '_ibfk_');\n"
+			"gen_constr_prefix := CONCAT(:old_table_name_utf8,\n"
+			"			     '_ibfk_');\n"
 			"WHILE found = 1 LOOP\n"
 			"       SELECT ID INTO foreign_id\n"
 			"        FROM SYS_FOREIGN\n"
@@ -3951,10 +4039,11 @@ row_rename_table_for_mysql(
 			"               IF (INSTR(foreign_id,\n"
 			"                         gen_constr_prefix) > 0)\n"
 			"               THEN\n"
+                        "                offset := INSTR(foreign_id, '_ibfk_') - 1;\n"
 			"                new_foreign_id :=\n"
-			"                CONCAT(:new_table_name,\n"
-			"                SUBSTR(foreign_id, old_t_name_len,\n"
-			"                       id_len - old_t_name_len));\n"
+			"                CONCAT(:new_table_utf8,\n"
+			"                SUBSTR(foreign_id, offset,\n"
+			"                       id_len - offset));\n"
 			"               ELSE\n"
 			"                new_foreign_id :=\n"
 			"                CONCAT(new_db_name,\n"
@@ -4054,7 +4143,8 @@ end:
 		an ALTER, not in a RENAME. */
 
 		err = dict_load_foreigns(
-			new_name, FALSE, !old_is_tmp || trx->check_foreigns);
+			new_name, FALSE, !old_is_tmp || trx->check_foreigns,
+			DICT_ERR_IGNORE_NONE);
 
 		if (err != DB_SUCCESS) {
 			ut_print_timestamp(stderr);
@@ -4087,6 +4177,13 @@ end:
 			trx->error_state = DB_SUCCESS;
 			trx_general_rollback_for_mysql(trx, NULL);
 			trx->error_state = DB_SUCCESS;
+		} else {
+			if (old_is_tmp && !new_is_tmp) {
+				/* After ALTER TABLE the table statistics
+				needs to be rebuilt.  It will be rebuilt
+				when the table is loaded again. */
+				table->stat_initialized = FALSE;
+			}
 		}
 	}
 

@@ -26,8 +26,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -111,13 +111,13 @@ extern ulint	srv_max_file_format_at_startup;
 /** Place locks to records only i.e. do not use next-key locking except
 on duplicate key checking and foreign key checking */
 extern ibool	srv_locks_unsafe_for_binlog;
-#endif /* !UNIV_HOTBACKUP */
 
 /* If this flag is TRUE, then we will use the native aio of the
 OS (provided we compiled Innobase with it in), otherwise we will
 use simulated aio we build below with threads.
 Currently we support native aio on windows and linux */
 extern my_bool	srv_use_native_aio;
+#endif /* !UNIV_HOTBACKUP */
 #ifdef __WIN__
 extern ibool	srv_use_native_conditions;
 #endif
@@ -131,6 +131,13 @@ extern ulint	srv_last_file_size_max;
 extern char**	srv_log_group_home_dirs;
 #ifndef UNIV_HOTBACKUP
 extern ulong	srv_auto_extend_increment;
+
+extern double	srv_segment_fill_factor;
+extern double	srv_index_fill_factor;
+extern my_bool	srv_lease_fragment_extents;
+
+extern my_bool	srv_reserve_free_extents;
+extern double	srv_free_extents_rsvn_factor;
 
 extern ibool	srv_created_new_raw;
 
@@ -146,6 +153,9 @@ even if they are marked as "corrupted". Mostly it is for DBA to process
 corrupted index and table */
 extern my_bool	srv_load_corrupted;
 
+extern ulint	srv_n_corrupted_page_reads;
+extern ulint	srv_n_corrupted_table_opens;
+
 /* The sort order table of the MySQL latin1_swedish_ci character set
 collation */
 extern const byte*	srv_latin1_ordering;
@@ -157,12 +167,15 @@ extern ibool	srv_use_sys_malloc;
 extern ulint	srv_buf_pool_size;	/*!< requested size in bytes */
 extern my_bool	srv_buf_pool_populate;	/*!< virtual page preallocation */
 extern ulint    srv_buf_pool_instances; /*!< requested number of buffer pool instances */
+extern my_bool	srv_flush_neighbors;	/*!< whether or not to flush
+					neighbors of a block */
 extern ulint	srv_buf_pool_old_size;	/*!< previously requested size */
 extern ulint	srv_buf_pool_curr_size;	/*!< current size in bytes */
 extern ulint	srv_mem_pool_size;
 extern ulint	srv_lock_table_size;
 
 extern uint	srv_buf_flush_dirty_pages_age;
+extern my_bool	srv_anticipatory_flushing;
 
 extern ulint	srv_n_file_io_threads;
 extern my_bool	srv_random_read_ahead;
@@ -202,6 +215,9 @@ extern ulong	srv_thread_concurrency;
 extern ulint	srv_max_n_threads;
 
 extern lint	srv_conc_n_threads;
+
+/* This mutex protects srv_conc data structures */
+extern	os_fast_mutex_t	srv_conc_mutex;
 
 extern ulint	srv_fast_shutdown;	 /* If this is 1, do not do a
 					 purge and index buffer merge.
@@ -267,7 +283,12 @@ extern	ibool	srv_print_latch_waits;
 
 extern ulint	srv_activity_count;
 extern ulint	srv_fatal_semaphore_wait_threshold;
+#define SRV_SEMAPHORE_WAIT_EXTENSION	7200
 extern ulint	srv_dml_needed_delay;
+
+#ifdef UNIV_DEBUG
+extern my_bool	srv_purge_view_update_only_debug;
+#endif /* UNIV_DEBUG */
 
 extern mutex_t*	kernel_mutex_temp;/* mutex protecting the server, trx structs,
 				query threads, and lock table: we allocate
@@ -336,6 +357,54 @@ extern ulint srv_buf_pool_flushed;
 /** Number of buffer pool reads that led to the
 reading of a disk page */
 extern ulint srv_buf_pool_reads;
+
+/** Number of pages scanned as part of a flush batch. */
+extern ulint srv_buf_pool_flush_batch_scanned;
+
+/** Number of pages flushed as part of sync batches. */
+extern ulint srv_buf_pool_flush_sync_page;
+
+/** Number of pages flushed as part of async batches. */
+extern ulint srv_buf_pool_flush_async_page;
+
+/** Number of pages flushed as part of adaptive batches. */
+extern ulint srv_buf_pool_flush_adaptive_pages;
+
+/** Number of pages flushed as part of anticipatory batches. */
+extern ulint srv_buf_pool_flush_anticipatory_pages;
+
+/** Number of pages flushed as part of background (async) batches. */
+extern ulint srv_buf_pool_flush_background_pages;
+
+/** Number of pages flushed as part of max_dirty batches. */
+extern ulint srv_buf_pool_flush_max_dirty_pages;
+
+/** Number of pages flushed as part of neighbor flush. */
+extern ulint srv_buf_pool_flush_neighbor_pages;
+
+/** Number of pages scanned as part of LRU batches. */
+extern ulint srv_buf_pool_flush_LRU_batch_scanned;
+
+/** Number of pages flushed as part of LRU batches. */
+extern ulint srv_buf_pool_flush_LRU_page_count;
+
+/** Number of pages scanned as part of LRU search. */
+extern ulint srv_buf_pool_LRU_search_scanned;
+
+/** Number of pages scanned as part of LRU unzip search. */
+extern ulint srv_buf_pool_LRU_unzip_search_scanned;
+
+/** Number of searches performed for a clean page. */
+extern ulint srv_buf_pool_LRU_get_free_search;
+
+/** Number of semaphore stalls. */
+extern ulint srv_n_semaphore_stalls;
+
+/** print all user-level transactions deadlocks to mysqld stderr */
+extern my_bool srv_print_all_deadlocks;
+
+/** Perform deadlock detection check. */
+extern my_bool srv_deadlock_check;
 
 /** Status variables to be passed to MySQL */
 typedef struct export_var_struct export_struc;
@@ -592,6 +661,13 @@ srv_conc_exit_innodb(
 /*=================*/
 	trx_t*	trx);	/*!< in: transaction object associated with the
 			thread */
+/*********************************************************************//**
+Wake all threads in the queue, this is called when the concurrency setting
+is set to 0 by the user. */
+UNIV_INTERN
+void
+srv_conc_wake_all(void);
+/*===================*/
 /***************************************************************//**
 Puts a MySQL OS thread to wait for a lock to be released. If an error
 occurs during the wait trx->error_state associated with thr is
@@ -683,12 +759,14 @@ srv_que_task_enqueue_low(
 	que_thr_t*	thr);	/*!< in: query thread */
 
 /**********************************************************************//**
-Check whether any background thread is active.
-@return FALSE if all are are suspended or have exited. */
+Check whether any background thread is active. If so, return the thread
+type.
+@return ULINT_UNDEFINED if all are are suspended or have exited, thread
+type if any are still active. */
 UNIV_INTERN
-ibool
-srv_is_any_background_thread_active(void);
-/*======================================*/
+ulint
+srv_get_active_thread_type(void);
+/*============================*/
 
 /** Status variables to be passed to MySQL */
 struct export_var_struct{
@@ -702,7 +780,9 @@ struct export_var_struct{
 	ulint innodb_data_reads;		/*!< I/O read requests */
 	ulint innodb_buffer_pool_pages_total;	/*!< Buffer pool size */
 	ulint innodb_buffer_pool_pages_data;	/*!< Data pages */
+	ulint innodb_buffer_pool_bytes_data;	/*!< File bytes used */
 	ulint innodb_buffer_pool_pages_dirty;	/*!< Dirty data pages */
+	ulint innodb_buffer_pool_bytes_dirty;	/*!< File bytes modified */
 	ulint innodb_buffer_pool_pages_misc;	/*!< Miscellanous pages */
 	ulint innodb_buffer_pool_pages_free;	/*!< Free pages */
 #ifdef UNIV_DEBUG
@@ -723,6 +803,14 @@ struct export_var_struct{
 	ulint innodb_files_closed;		/*!< os_file_acct.n_close */
 	ulint innodb_files_flushed;		/*!< os_file_acct.n_flush */
 	ibool innodb_have_atomic_builtins;	/*!< HAVE_ATOMIC_BUILTINS */
+	ulint innodb_ibuf_discarded_delete_marks;/*!< stat->n_discarded_ops[IBUF_OP_DELETE_MARK] */
+	ulint innodb_ibuf_discarded_deletes;	/*!< stat->n_discarded_ops[IBUF_OP_DELETE] */
+	ulint innodb_ibuf_discarded_inserts;	/*!< stat->n_discarded_ops[IBUF_OP_INSERT] */
+	ulint innodb_ibuf_merged_delete_marks;	/*!< stat->n_merged_ops[IBUF_OP_DELETE_MARK] */
+	ulint innodb_ibuf_merged_deletes;	/*!< stat->n_merged_ops[IBUF_OP_DELETE] */
+	ulint innodb_ibuf_merged_inserts;	/*!< stat->n_merged_ops[IBUF_OP_INSERT] */
+	ulint innodb_ibuf_merged_pages;		/*!< stat->n_merges */
+	ulint innodb_ibuf_pages;		/*!< ibuf->size */
 	ulint innodb_lock_deadlocks;		/*!< srv_n_lock_deadlock_count */
 	ulint innodb_log_waits;			/*!< srv_log_waits */
 	ulint innodb_log_write_requests;	/*!< srv_log_write_requests */
@@ -738,6 +826,8 @@ struct export_var_struct{
 	ulint innodb_pages_created;		/*!< buf_pool->stat.n_pages_created */
 	ulint innodb_pages_read;		/*!< buf_pool->stat.n_pages_read */
 	ulint innodb_pages_written;		/*!< buf_pool->stat.n_pages_written */
+	ulint innodb_corrupted_page_reads;	/*!< srv_n_corrupted_page_reads */
+	ulint innodb_corrupted_table_opens;	/*!< srv_n_corrupted_table_opens */
 	ulint innodb_row_lock_waits;		/*!< srv_n_lock_wait_count */
 	ulint innodb_row_lock_current_waits;	/*!< srv_n_lock_wait_current_count */
 	ib_int64_t innodb_row_lock_time;	/*!< srv_n_lock_wait_time
@@ -756,6 +846,53 @@ struct export_var_struct{
 	ulint innodb_tablespace_files_opened;	/*!< fil_n_tablespace_opened */
 	ulint innodb_tablespace_files_closed;	/*!< fil_n_tablespace_closed */
 	ulint innodb_truncated_status_writes;	/*!< srv_truncated_status_writes */
+	ulint innodb_buffer_pool_flush_batch_scanned;
+						/*!< srv_buf_pool_flush_batch_scanned */
+	ulint innodb_buffer_pool_flush_sync_page;
+						/*!< srv_buf_pool_flush_sync_page */
+	ulint innodb_buffer_pool_flush_async_page;
+						/*!< srv_buf_pool_flush_async_page */
+	ulint innodb_buffer_pool_flush_adaptive_pages;
+						/*!< srv_buf_pool_flush_adaptive_pages */
+	ulint innodb_buffer_pool_flush_anticipatory_pages;
+						/*!< srv_buf_pool_flush_anticipatory_pages */
+	ulint innodb_buffer_pool_flush_background_pages;
+						/*!< srv_buf_pool_flush_background_pages */
+	ulint innodb_buffer_pool_flush_max_dirty_pages;
+						/*!< srv_buf_pool_flush_max_dirty_pages */
+	ulint innodb_buffer_pool_flush_neighbor_pages;
+						/*!< srv_buf_pool_flush_neighbor_pages */
+	ulint innodb_buffer_pool_flush_LRU_batch_scanned;
+						/*!< srv_buf_pool_flush_LRU_batch_scanned */
+	ulint innodb_buffer_pool_flush_LRU_page_count;
+						/*!< srv_buf_pool_flush_LRU_page_count */
+	ulint innodb_buffer_pool_LRU_search_scanned;
+						/*!< srv_buf_pool_LRU_search_scanned */
+	ulint innodb_buffer_pool_LRU_unzip_search_scanned;
+						/*!< srv_buf_pool_LRU_unzip_search_scanned */
+	ulint innodb_buffer_pool_LRU_get_free_search;
+						/*!< srv_buf_pool_LRU_get_free_search */
+	ulint innodb_btree_page_reorganize;	/*!< btr_n_page_reorganize */
+	ulint innodb_btree_page_split;		/*!< btr_n_page_split */
+	ulint innodb_btree_page_merge;		/*!< btr_n_page_merge */
+	ulint innodb_btree_page_merge_succ;	/*!< btr_n_page_merge_succ */
+	ulint innodb_btree_page_discard;	/*!< btr_n_page_discard */
+	ulint innodb_semaphore_stalls;		/*!< srv_n_semaphore_stalls */
+	ib_uint64_t innodb_trx_max_id;		/*!< trx_sys->max_trx_id */
+	ib_uint64_t innodb_purge_trx_no;	/*!< purge_sys->purge_trx_no */
+	ib_uint64_t innodb_purge_undo_no;	/*!< purge_sys->purge_undo_no */
+	ulint innodb_thread_concurrency_active;	/*!< srv_conc_n_threads */
+	ulint innodb_thread_concurrency_waiting;/*!< srv_conc_n_waiting_threads */
+	ulint innodb_btree_row_searches;        /*!< btr_cur_n_non_sea */
+	ulint innodb_hash_row_searches;         /*!< btr_cur_n_sea */
+	ib_int64_t innodb_mysql_master_log_pos;	/*!< Master binlog file position. */
+	char innodb_mysql_master_log_name[TRX_SYS_MYSQL_LOG_NAME_LEN + 1];
+						/*!< Master binlog file name. */
+#ifdef UNIV_DEBUG
+	ulint innodb_purge_trx_id_age;		/*!< max_trx_id - purged trx_id */
+	ulint innodb_purge_view_trx_id_age;	/*!< rw_max_trx_id
+						- purged view's min trx_id */
+#endif /* UNIV_DEBUG */
 };
 
 /** Thread slot in the thread table */

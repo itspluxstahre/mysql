@@ -1,6 +1,5 @@
 /*
-   Copyright (c) 2005-2008 MySQL AB, 2009 Sun Microsystems, Inc.
-   Use is subject to license terms.
+   Copyright (c) 2005, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -50,7 +49,7 @@ void buildClientHello(SSL& ssl, ClientHello& hello)
     hello.suite_len_ = ssl.getSecurity().get_parms().suites_size_;
     memcpy(hello.cipher_suites_, ssl.getSecurity().get_parms().suites_,
            hello.suite_len_);
-    hello.comp_len_ = 1;                   
+    hello.comp_len_ = 1;
 
     hello.set_length(sizeof(ProtocolVersion) +
                      RAN_LEN +
@@ -221,11 +220,44 @@ void buildSHA(SSL& ssl, Finished& fin, const opaque* sender)
 }
 
 
+// sanity checks on encrypted message size
+static int sanity_check_message(SSL& ssl, uint msgSz)
+{
+    uint minSz = 0;
+
+    if (ssl.getSecurity().get_parms().cipher_type_ == block) {
+        uint blockSz = ssl.getCrypto().get_cipher().get_blockSize();
+        if (msgSz % blockSz)
+            return -1;
+
+        minSz = ssl.getSecurity().get_parms().hash_size_ + 1;  // pad byte too
+        if (blockSz > minSz)
+            minSz = blockSz;
+
+        if (ssl.isTLSv1_1())
+            minSz += blockSz;   // explicit IV
+    }
+    else {      // stream
+        minSz = ssl.getSecurity().get_parms().hash_size_;
+    }
+
+    if (msgSz < minSz)
+        return -1;
+
+    return 0;
+}
+
+
 // decrypt input message in place, store size in case needed later
 void decrypt_message(SSL& ssl, input_buffer& input, uint sz)
 {
     input_buffer plain(sz);
     opaque*      cipher = input.get_buffer() + input.get_current();
+
+    if (sanity_check_message(ssl, sz) != 0) {
+        ssl.SetError(sanityCipher_error);
+        return;
+    }
 
     ssl.useCrypto().use_cipher().decrypt(plain.get_buffer(), cipher, sz);
     memcpy(cipher, plain.get_buffer(), sz);
@@ -490,7 +522,7 @@ void buildSHA_CertVerify(SSL& ssl, byte* digest)
 // some clients still send sslv2 client hello
 void ProcessOldClientHello(input_buffer& input, SSL& ssl)
 {
-    if (input.get_remaining() < 2) {
+    if (input.get_error() || input.get_remaining() < 2) {
         ssl.SetError(bad_input);
         return;
     }
@@ -517,19 +549,24 @@ void ProcessOldClientHello(input_buffer& input, SSL& ssl)
 
     byte len[2];
 
-    input.read(len, sizeof(len));
+    len[0] = input[AUTO];
+    len[1] = input[AUTO];
     ato16(len, ch.suite_len_);
 
-    input.read(len, sizeof(len));
+    len[0] = input[AUTO];
+    len[1] = input[AUTO];
     uint16 sessionLen;
     ato16(len, sessionLen);
     ch.id_len_ = sessionLen;
 
-    input.read(len, sizeof(len));
+    len[0] = input[AUTO];
+    len[1] = input[AUTO];
     uint16 randomLen;
     ato16(len, randomLen);
-    if (ch.suite_len_ > MAX_SUITE_SZ || sessionLen > ID_LEN ||
-        randomLen > RAN_LEN) {
+
+    if (input.get_error() || ch.suite_len_ > MAX_SUITE_SZ ||
+                             ch.suite_len_ > input.get_remaining() ||
+                             sessionLen > ID_LEN || randomLen > RAN_LEN) {
         ssl.SetError(bad_input);
         return;
     }
@@ -547,13 +584,12 @@ void ProcessOldClientHello(input_buffer& input, SSL& ssl)
     ch.suite_len_ = j;
 
     if (ch.id_len_)
-        input.read(ch.session_id_, ch.id_len_);
+        input.read(ch.session_id_, ch.id_len_);   // id_len_ from sessionLen
 
     if (randomLen < RAN_LEN)
         memset(ch.random_, 0, RAN_LEN - randomLen);
     input.read(&ch.random_[RAN_LEN - randomLen], randomLen);
  
-
     ch.Process(input, ssl);
 }
 
@@ -707,7 +743,7 @@ int DoProcessReply(SSL& ssl)
 {
     // wait for input if blocking
     if (!ssl.useSocket().wait()) {
-      ssl.SetError(receive_error);
+        ssl.SetError(receive_error);
         return 0;
     }
     uint ready = ssl.getSocket().get_ready();
@@ -750,9 +786,12 @@ int DoProcessReply(SSL& ssl)
         if (static_cast<uint>(RECORD_HEADER) > buffer.get_remaining())
             needHdr = true;
         else {
-        buffer >> hdr;
-        ssl.verifyState(hdr);
+            buffer >> hdr;
+            ssl.verifyState(hdr);
         }
+
+        if (ssl.GetError())
+            return 0;
 
         // make sure we have enough input in buffer to process this record
         if (needHdr || hdr.length_ > buffer.get_remaining()) {
@@ -766,8 +805,19 @@ int DoProcessReply(SSL& ssl)
 
         while (buffer.get_current() < hdr.length_ + RECORD_HEADER + offset) {
             // each message in record, can be more than 1 if not encrypted
-            if (ssl.getSecurity().get_parms().pending_ == false) // cipher on
+            if (ssl.GetError())
+                return 0;
+
+            if (ssl.getSecurity().get_parms().pending_ == false) { // cipher on
+                // sanity check for malicious/corrupted/illegal input
+                if (buffer.get_remaining() < hdr.length_) {
+                    ssl.SetError(bad_input);
+                    return 0;
+                }
                 decrypt_message(ssl, buffer, hdr.length_);
+                if (ssl.GetError())
+                    return 0;
+            }
                 
             mySTL::auto_ptr<Message> msg(mf.CreateObject(hdr.type_));
             if (!msg.get()) {
@@ -789,9 +839,8 @@ int DoProcessReply(SSL& ssl)
 void processReply(SSL& ssl)
 {
     if (ssl.GetError()) return;
-
-    if (DoProcessReply(ssl))
-    {
+  
+    if (DoProcessReply(ssl)) {
         // didn't complete process
         if (!ssl.getSocket().IsNonBlocking()) {
             // keep trying now, blocking ok
@@ -857,6 +906,7 @@ void sendServerKeyExchange(SSL& ssl, BufferOutput buffer)
     if (ssl.GetError()) return;
     ServerKeyExchange sk(ssl);
     sk.build(ssl);
+    if (ssl.GetError()) return;
 
     RecordLayerHeader rlHeader;
     HandShakeHeader   hsHeader;
@@ -875,8 +925,7 @@ void sendServerKeyExchange(SSL& ssl, BufferOutput buffer)
 // send change cipher
 void sendChangeCipher(SSL& ssl, BufferOutput buffer)
 {
-    if (ssl.getSecurity().get_parms().entity_ == server_end)
-    {
+    if (ssl.getSecurity().get_parms().entity_ == server_end) {
         if (ssl.getSecurity().get_resuming())
             ssl.verifyState(clientKeyExchangeComplete);
         else
@@ -913,7 +962,7 @@ void sendFinished(SSL& ssl, ConnectionEnd side, BufferOutput buffer)
     }
     else {
         if (!ssl.getSecurity().GetContext()->GetSessionCacheOff())
-        GetSessions().add(ssl);  // store session
+            GetSessions().add(ssl);  // store session
         if (side == client_end)
             buildFinished(ssl, ssl.useHashes().use_verify(), server); // server
     }   
@@ -929,12 +978,22 @@ void sendFinished(SSL& ssl, ConnectionEnd side, BufferOutput buffer)
 // send data
 int sendData(SSL& ssl, const void* buffer, int sz)
 {
+    int sent = 0;
+
     if (ssl.GetError() == YasslError(SSL_ERROR_WANT_READ))
         ssl.SetError(no_error);
 
+    if (ssl.GetError() == YasslError(SSL_ERROR_WANT_WRITE)) {
+        ssl.SetError(no_error);
+        ssl.SendWriteBuffered();
+        if (!ssl.GetError()) {
+            // advance sent to prvevious sent + plain size just sent
+            sent = ssl.useBuffers().prevSent + ssl.useBuffers().plainSz;
+        }
+    }
+
     ssl.verfiyHandShakeComplete();
     if (ssl.GetError()) return -1;
-    int sent = 0;
 
     for (;;) {
         int len = min(sz - sent, MAX_RECORD_SIZE);
@@ -942,6 +1001,8 @@ int sendData(SSL& ssl, const void* buffer, int sz)
         input_buffer tmp;
 
         Data data;
+
+        if (sent == sz) break;
 
         if (ssl.CompressionOn()) {
             if (Compress(static_cast<const opaque*>(buffer) + sent, len,
@@ -957,9 +1018,14 @@ int sendData(SSL& ssl, const void* buffer, int sz)
         buildMessage(ssl, out, data);
         ssl.Send(out.get_buffer(), out.get_size());
 
-        if (ssl.GetError()) return -1;
+        if (ssl.GetError()) {
+            if (ssl.GetError() == YasslError(SSL_ERROR_WANT_WRITE)) {
+                ssl.useBuffers().plainSz  = len;
+                ssl.useBuffers().prevSent = sent;
+            }
+            return -1;
+        }
         sent += len;
-        if (sent == sz) break;
     }
     ssl.useLog().ShowData(sent, true);
     return sent;
@@ -992,7 +1058,7 @@ int receiveData(SSL& ssl, Data& data, bool peek)
     if (peek)
         ssl.PeekData(data);
     else
-    ssl.fillData(data);
+        ssl.fillData(data);
 
     ssl.useLog().ShowData(data.get_length());
     if (ssl.GetError()) return -1;
@@ -1101,6 +1167,8 @@ void sendCertificateRequest(SSL& ssl, BufferOutput buffer)
 void sendCertificateVerify(SSL& ssl, BufferOutput buffer)
 {
     if (ssl.GetError()) return;
+
+    if(ssl.getCrypto().get_certManager().sendBlankCert()) return;
 
     CertificateVerify  verify;
     verify.Build(ssl);

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -52,7 +52,7 @@ void AES::Process(byte* out, const byte* in, word32 sz)
             in  += BLOCK_SIZE;
         }
     else if (mode_ == CBC) {
-        if (dir_ == ENCRYPTION)
+        if (dir_ == ENCRYPTION) {
             while (blocks--) {
                 r_[0] ^= *(word32*)in;
                 r_[1] ^= *(word32*)(in +  4);
@@ -65,7 +65,8 @@ void AES::Process(byte* out, const byte* in, word32 sz)
                 out += BLOCK_SIZE;
                 in  += BLOCK_SIZE;
             }
-        else
+        }
+        else {
             while (blocks--) {
                 AsmDecrypt(in, out, (void*)Td0);
                 
@@ -78,6 +79,7 @@ void AES::Process(byte* out, const byte* in, word32 sz)
                 out += BLOCK_SIZE;
                 in  += BLOCK_SIZE;
             }
+        }
     }
 }
 
@@ -86,8 +88,13 @@ void AES::Process(byte* out, const byte* in, word32 sz)
 
 void AES::SetKey(const byte* userKey, word32 keylen, CipherDir /*dummy*/)
 {
-    assert( (keylen == 16) || (keylen == 24) || (keylen == 32) );
-
+    if (keylen <= 16)
+        keylen = 16;
+    else if (keylen >= 32)
+        keylen = 32;
+    else if (keylen != 24)
+        keylen = 24;
+    
     rounds_ = keylen/4 + 6;
 
     word32 temp, *rk = key_;
@@ -245,34 +252,34 @@ void AES::encrypt(const byte* inBlock, const byte* xorBlock,
     for (;;) {
         t0 =
             Te0[GETBYTE(s0, 3)] ^
-            Te1[GETBYTE(s1, 2)] ^
-            Te2[GETBYTE(s2, 1)] ^
-            Te3[GETBYTE(s3, 0)] ^
+            Te1[GETBYTE(s1, 2)]  ^
+            Te2[GETBYTE(s2, 1)]  ^
+            Te3[GETBYTE(s3, 0)]  ^
             rk[4];
         t1 =
             Te0[GETBYTE(s1, 3)] ^
-            Te1[GETBYTE(s2, 2)] ^
-            Te2[GETBYTE(s3, 1)] ^
-            Te3[GETBYTE(s0, 0)] ^
+            Te1[GETBYTE(s2, 2)]  ^
+            Te2[GETBYTE(s3, 1)]  ^
+            Te3[GETBYTE(s0, 0)]  ^
             rk[5];
         t2 =
             Te0[GETBYTE(s2, 3)] ^
-            Te1[GETBYTE(s3, 2)] ^
-            Te2[GETBYTE(s0, 1)] ^
-            Te3[GETBYTE(s1, 0)] ^
+            Te1[GETBYTE(s3, 2)]  ^
+            Te2[GETBYTE(s0, 1)]  ^
+            Te3[GETBYTE(s1, 0)]  ^
             rk[6];
         t3 =
             Te0[GETBYTE(s3, 3)] ^
-            Te1[GETBYTE(s0, 2)] ^
-            Te2[GETBYTE(s1, 1)] ^
-            Te3[GETBYTE(s2, 0)] ^
+            Te1[GETBYTE(s0, 2)]  ^
+            Te2[GETBYTE(s1, 1)]  ^
+            Te3[GETBYTE(s2, 0)]  ^
             rk[7];
 
         rk += 8;
         if (--r == 0) {
             break;
         }
-
+        
         s0 =
             Te0[GETBYTE(t0, 3)] ^
             Te1[GETBYTE(t1, 2)] ^
@@ -421,7 +428,7 @@ void AES::decrypt(const byte* inBlock, const byte* xorBlock,
         (Td4[GETBYTE(t3, 2)] & 0x00ff0000) ^
         (Td4[GETBYTE(t2, 1)] & 0x0000ff00) ^
         (Td4[GETBYTE(t1, 0)] & 0x000000ff) ^
-    rk[0];
+        rk[0];
     s1 =
         (Td4[GETBYTE(t1, 3)] & 0xff000000) ^
         (Td4[GETBYTE(t0, 2)] & 0x00ff0000) ^
@@ -447,27 +454,30 @@ void AES::decrypt(const byte* inBlock, const byte* xorBlock,
 
 #if defined(DO_AES_ASM)
     #ifdef __GNUC__
-        #define AS1(x)    asm(#x);
-        #define AS2(x, y) asm(#x ", " #y);
+        #define AS1(x)    #x ";"
+        #define AS2(x, y) #x ", " #y ";"
 
         #define PROLOG()  \
-            asm(".intel_syntax noprefix"); \
-            AS2(    movd  mm3, edi                      )   \
-            AS2(    movd  mm4, ebx                      )   \
-            AS2(    sub   esp, 4                        )   \
-            AS2(    movd  mm7, ebp                      )   \
-            AS2(    mov   [ebp - 4], esi                )   \
-            AS2(    mov   ecx, DWORD PTR [ebp +  8]     )   \
-            AS2(    mov   esi, DWORD PTR [ebp + 12]     )   \
-            AS2(    mov   ebp, DWORD PTR [ebp + 20]     )
-
+        __asm__ __volatile__ \
+        ( \
+            ".intel_syntax noprefix;" \
+            "push ebx;" \
+            "push ebp;" \
+            "movd mm7, ebp;" \
+            "movd mm4, eax;" \
+            "mov  ebp, edx;"  \
+            "sub  esp, 4;" 
         #define EPILOG()  \
-            AS2(    mov  esi, [ebp - 4]             )   \
-            AS2(    mov  esp, ebp                   )   \
-            AS2(    movd ebx, mm4                   )   \
-            AS2(    movd edi, mm3                   )   \
-            AS1(    emms                            )   \
-            asm(".att_syntax");
+            "add esp, 4;" \
+            "pop ebp;" \
+            "pop ebx;" \
+       	    "emms;" \
+       	    ".att_syntax;" \
+                : \
+                : "c" (this), "S" (inBlock), "d" (boxes), "a" (outBlock) \
+                : "%edi", "memory", "cc" \
+        );
+
     #else
         #define AS1(x)    __asm x
         #define AS2(x, y) __asm x, y
@@ -499,6 +509,8 @@ void AES::decrypt(const byte* inBlock, const byte* xorBlock,
 
 #ifdef _MSC_VER
     __declspec(naked) 
+#else
+    __attribute__ ((noinline))
 #endif
 void AES::AsmEncrypt(const byte* inBlock, byte* outBlock, void* boxes) const
 {
@@ -532,7 +544,11 @@ void AES::AsmEncrypt(const byte* inBlock, byte* outBlock, void* boxes) const
     AS2(    xor   ecx, DWORD PTR [edi +  8]          )   // s2
     AS2(    xor   edx, DWORD PTR [edi + 12]          )   // s3
 
-    AS1(loop1:                                                          )
+#ifdef _MSC_VER
+    AS1( loop1: )  // loop1
+#else
+    AS1(1:  )      // loop1
+#endif
             /* Put0 (mm0) =  
                 Te0[get0,rs 24] ^
                 Te1[get1,rs 16] ^
@@ -647,7 +663,11 @@ void AES::AsmEncrypt(const byte* inBlock, byte* outBlock, void* boxes) const
     AS1(    dec   edi                                                   )
     AS2(    movd  mm5, edi                                              )
 
-    AS1(    jnz   loop1                                                 )
+#ifdef _MSC_VER
+    AS1(    jnz   loop1)  // loop1
+#else
+    AS1(    jnz   1b )    // loop1
+#endif
 
             // last round
             /*
@@ -794,9 +814,9 @@ void AES::AsmEncrypt(const byte* inBlock, byte* outBlock, void* boxes) const
 
             // store
     #ifdef __GNUC__
-        AS2(    mov esi, DWORD PTR [ebp + 16]       )   //  outBlock
+        AS2(    movd esi, mm4                       )   //  outBlock
     #else
-        AS2(    mov esi, DWORD PTR [ebp + 12]       )   //  outBlock
+        AS2(    mov  esi, DWORD PTR [ebp + 12]      )   //  outBlock
     #endif
 
     AS1(    bswap ecx                                                   )
@@ -814,6 +834,8 @@ void AES::AsmEncrypt(const byte* inBlock, byte* outBlock, void* boxes) const
 
 #ifdef _MSC_VER
     __declspec(naked) 
+#else
+    __attribute__ ((noinline))
 #endif
 void AES::AsmDecrypt(const byte* inBlock, byte* outBlock, void* boxes) const
 {
@@ -848,7 +870,11 @@ void AES::AsmDecrypt(const byte* inBlock, byte* outBlock, void* boxes) const
     AS2(    xor   edx, DWORD PTR [edi + 12]          )   // s3
 
 
-    AS1(loop2:                                                          )
+#ifdef _MSC_VER
+    AS1( loop2: )  // loop2
+#else
+    AS1(2:  )      // loop2
+#endif
        /*   Put0 (mm0) =
             Td0[GETBYTE(get0, rs24)] ^
             Td1[GETBYTE(get3, rs16)] ^
@@ -959,7 +985,11 @@ void AES::AsmDecrypt(const byte* inBlock, byte* outBlock, void* boxes) const
     AS1(    dec   edi                                                   )
     AS2(    movd  mm5, edi                                              )
 
-    AS1(    jnz   loop2                                                 )
+#ifdef _MSC_VER
+    AS1(    jnz   loop2)  // loop2
+#else
+    AS1(    jnz   2b )    // loop2
+#endif
 
             // last round
             /*
@@ -1109,9 +1139,9 @@ void AES::AsmDecrypt(const byte* inBlock, byte* outBlock, void* boxes) const
 
             // store
     #ifdef __GNUC__
-        AS2(    mov esi, DWORD PTR [ebp + 16]       )   //  outBlock
+        AS2(    movd esi, mm4                        )   //  outBlock
     #else
-        AS2(    mov esi, DWORD PTR [ebp + 12]       )   //  outBlock
+        AS2(    mov esi,  DWORD PTR [ebp + 12]       )   //  outBlock
     #endif
     AS2(    mov DWORD PTR [esi],      eax                               )
     AS2(    mov DWORD PTR [esi +  4], ebx                               )

@@ -1843,14 +1843,10 @@ rename table t2 to t0, t1 to t2, t0 to t1;;
 # for 'deadlock_con1' which holds shared metadata lock on 't2'.
 # 
 # The below statement should not wait as doing so will cause deadlock.
-# Instead it should fail and emit ER_LOCK_DEADLOCK statement.
+# Instead it should fail and emit ER_LOCK_DEADLOCK statement and 
+# transaction should be rolled back.
 select * from t1;
 ERROR 40001: Deadlock found when trying to get lock; try restarting transaction
-#
-# Let us check that failure of the above statement has not released
-# metadata lock on table 't1', i.e. that RENAME TABLE is still blocked.
-# Commit transaction to unblock RENAME TABLE.
-commit;
 #
 # Switching to connection 'default'.
 # Reap RENAME TABLE.
@@ -1888,15 +1884,9 @@ unlock tables;
 # Switching to connection 'deadlock_con1'.
 # Since the latest RENAME TABLE entered in deadlock with SELECT
 # statement the latter should be aborted and emit ER_LOCK_DEADLOCK
-# error.
+# error and transaction should be rolled back.
 # Reap SELECT * FROM t1.
 ERROR 40001: Deadlock found when trying to get lock; try restarting transaction
-#
-# Again let us check that failure of the SELECT statement has not
-# released metadata lock on table 't2', i.e. that the latest RENAME
-# is blocked.
-# Commit transaction to unblock this RENAME TABLE.
-commit;
 #
 # Switching to connection 'deadlock_con2'.
 # Reap RENAME TABLE ... .
@@ -1931,14 +1921,10 @@ alter table t1 add column j int, rename to t2;;
 # metadata lock on 't2' and starts waiting for connection
 # 'deadlock_con1' which holds shared lock on 't1'.
 # The below statement should not wait as it will cause deadlock.
-# An appropriate error should be reported instead.
+# An appropriate error should be reported instead and transaction
+# should be rolled back.
 select * from t2;
 ERROR 40001: Deadlock found when trying to get lock; try restarting transaction
-# Again let us check that failure of the above statement has not
-# released all metadata locks in connection 'deadlock_con1' and
-# so ALTER TABLE ... RENAME is still blocked.
-# Commit transaction to unblock ALTER TABLE ... RENAME.
-commit;
 #
 # Switching to connection 'default'.
 # Reap ALTER TABLE ... RENAME.
@@ -2425,12 +2411,6 @@ set debug_sync='mdl_acquire_lock_wait SIGNAL alter_go';
 # fail due to 't1' changing its name to 't2').
 update t1 set c3=c3+1 where c2 = 3;
 ERROR 40001: Deadlock found when trying to get lock; try restarting transaction
-#
-# Let us check that failure of the above statement has not released
-# metadata lock on table 't1', i.e. that ALTER TABLE is still blocked.
-# Unblock ALTER TABLE by commiting transaction and thus releasing
-# metadata lock on 't1'.
-commit;
 #
 # Switching to connection 'con46273'.
 # Reap ALTER TABLE.
@@ -2961,4 +2941,117 @@ SET DEBUG_SYNC= 'now SIGNAL continue';
 # Reaping: DELETE FROM t2 WHERE a = 3
 # Connection default
 DROP TABLE m1, t1, t2;
+SET DEBUG_SYNC= 'RESET';
+#
+# A non-blocking mode for ALTER TABLE
+#
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1,1),(2,2),(3,3);
+
+# While rebuilding a table, wait after copying one record.
+
+# connection: con1
+SET debug_sync = "copy_record_between_tables SIGNAL read WAIT_FOR copy EXECUTE 1";
+ALTER TABLE t1 NO_WAIT, ENGINE=InnoDB;
+
+# Attempt to use the table while it's being rebuilt.
+
+# connection: default
+# Wait for first record to be copied.
+SET debug_sync = "now WAIT_FOR read";
+SET debug_sync = "copy_record_between_tables SIGNAL copy";
+# Read from the table.
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	1
+2	2
+3	3
+# Attempt to write to table, should fail.
+INSERT INTO t1 VALUES (4, 4);
+ERROR HY000: Wait on a lock was aborted due to a conflicting lock
+# Read from the table (no side effect from write attempt).
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	1
+2	2
+3	3
+# Attempt a locking read.
+SELECT b FROM t1 WHERE A = 5 FOR UPDATE;
+ERROR HY000: Wait on a lock was aborted due to a conflicting lock
+# Read from the table (no side effect from locking read).
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	1
+2	2
+3	3
+SET debug_sync = "now SIGNAL copy";
+# Reap ALTER TABLE result
+SET DEBUG_SYNC= 'RESET';
+
+# Test that pending lock requests are aborted if the lock
+# is granted to an ALTER TABLE NO_WAIT statement.
+
+# connection: default
+LOCK TABLES t1 WRITE;
+# Add con1 (ALTER TABLE) to the table's lock wait queue.
+# connection: con1
+SET debug_sync = "copy_record_between_tables SIGNAL read WAIT_FOR copy EXECUTE 1";
+ALTER TABLE t1 NO_WAIT, ENGINE=InnoDB;
+# Wait for con1 to be waiting to acquire the lock.
+# connection: default
+# Add con2 (INSERT) to the table's lock wait queue.
+# connection: con2
+INSERT INTO t1 VALUES (4, 4);
+# Wait for con2 to be waiting to acquire the lock.
+# connection: default
+# Unlock table, lock should now be granted to con1 (ALTER).
+UNLOCK TABLES;
+# Wait for con1 to take the lock and copy the first record.
+SET debug_sync = "now WAIT_FOR read";
+SET debug_sync = "copy_record_between_tables SIGNAL copy";
+# Reap con2, INSERT should have been aborted.
+# connection: con2
+ERROR HY000: Wait on a lock was aborted due to a conflicting lock
+# Ensure that the table is still readable.
+# connection: default
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	1
+2	2
+3	3
+SET debug_sync = "now SIGNAL copy";
+# Reap ALTER TABLE result
+# connection: con1
+# Cleanup
+# connection: default
+DROP TABLE t1;
+
+# NO_WAIT used in conjuction with the LOCK clause.
+
+SET DEBUG_SYNC= 'RESET';
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1,1),(2,2),(3,3);
+# While rebuilding a table, wait after copying one record.
+# connection: con1
+SET debug_sync = "copy_record_between_tables SIGNAL read WAIT_FOR copy EXECUTE 1";
+ALTER TABLE t1 NO_WAIT, LOCK = EXCLUSIVE, ENGINE=InnoDB;
+# connection: default
+# Wait for first record to be copied.
+SET debug_sync = "now WAIT_FOR read";
+SET debug_sync = "copy_record_between_tables SIGNAL copy";
+# Table should be locked in exclusive mode, any attempt
+# to use it should fail.
+SELECT * FROM t1 ORDER BY a;
+ERROR HY000: Wait on a lock was aborted due to a conflicting lock
+INSERT INTO t1 VALUES (4, 4);
+ERROR HY000: Wait on a lock was aborted due to a conflicting lock
+# Reap ALTER TABLE result
+SET debug_sync = "now SIGNAL copy";
+# Read from table and cleanup.
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	1
+2	2
+3	3
+DROP TABLE t1;
 SET DEBUG_SYNC= 'RESET';

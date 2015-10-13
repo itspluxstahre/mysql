@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2011, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2014, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@ ${CMAKE_SOURCE_DIR}/regex
 ${ZLIB_INCLUDE_DIR}
 ${SSL_INCLUDE_DIRS}
 ${CMAKE_BINARY_DIR}/sql
+${BREAKPAD_INCLUDE_DIRS}
 )
 
 SET(GEN_SOURCES
@@ -45,7 +46,8 @@ SET (SQL_SOURCE
                handler.cc hash_filo.h sql_plugin_services.h
                hostname.cc init.cc item.cc item_buff.cc item_cmpfunc.cc 
                item_create.cc item_func.cc item_geofunc.cc item_row.cc 
-               item_strfunc.cc item_subselect.cc item_sum.cc item_timefunc.cc 
+               item_strfunc.cc item_subselect.cc item_sum.cc item_timefunc.cc
+               item_inetfunc.cc
                key.cc log.cc lock.cc
                log_event.cc rpl_record.cc rpl_reporting.cc
                log_event_old.cc rpl_record_old.cc
@@ -76,12 +78,24 @@ SET (SQL_SOURCE
                sql_profile.cc event_parse_data.cc sql_alter.cc
                sql_signal.cc rpl_handler.cc mdl.cc sql_admin.cc
                transaction.cc sys_vars.cc sql_truncate.cc datadict.cc
-               sql_reload.cc
+               sql_reload.cc query_stats.cc
                ${GEN_SOURCES}
                ${MYSYS_LIBWRAP_SOURCE})
 
 IF(HAVE_MY_TIMER)
   SET(SQL_SOURCE ${SQL_SOURCE} sql_timer.cc)
+ENDIF()
+
+IF(HAVE_BREAKPAD)
+  SET(SQL_SOURCE ${SQL_SOURCE} minidump.cc)
+ENDIF()
+
+# These files have unused result errors, so we skip Werror
+CHECK_C_COMPILER_FLAG("-Werror" HAVE_WERROR_FLAG)
+IF(HAVE_WERROR_FLAG)
+  INCLUDE(${MYSQL_CMAKE_SCRIPT_DIR}/compile_flags.cmake)
+  ADD_COMPILE_FLAGS(filesort.cc  COMPILE_FLAGS "-Wno-error")
+  ADD_COMPILE_FLAGS(opt_range.cc COMPILE_FLAGS "-Wno-error")
 ENDIF()
 
 MYSQL_ADD_PLUGIN(partition ha_partition.cc STORAGE_ENGINE DEFAULT STATIC_ONLY
@@ -93,7 +107,7 @@ DTRACE_INSTRUMENT(sql)
 TARGET_LINK_LIBRARIES(sql ${MYSQLD_STATIC_PLUGIN_LIBS} 
   mysys dbug strings vio regex   
   ${LIBWRAP} ${LIBCRYPT} ${LIBDL}
-  ${SSL_LIBRARIES})
+  ${SSL_LIBRARIES} ${BREAKPAD_LIBRARIES})
 
 #
 # On Windows platform we compile in the clinet-side Windows Native Authentication
@@ -241,14 +255,15 @@ IF(WIN32 OR HAVE_DLOPEN AND NOT DISABLE_SHARED)
 ENDIF()
 
 FOREACH(tool glibtoolize libtoolize aclocal autoconf autoheader automake gtar 
- tar bzr)
+ tar git)
  STRING(TOUPPER ${tool}  TOOL)
  FIND_PROGRAM(${TOOL}_EXECUTABLE ${tool} DOC "path to the executable")
  MARK_AS_ADVANCED(${TOOL}_EXECUTABLE)
 ENDFOREACH()
 
 CONFIGURE_FILE(
-  ${CMAKE_SOURCE_DIR}/cmake/make_dist.cmake.in ${CMAKE_BINARY_DIR}/make_dist.cmake @ONLY)
+  ${CMAKE_SOURCE_DIR}/cmake/make_dist.cmake.in
+  ${CMAKE_BINARY_DIR}/make_dist.cmake @ONLY)
 
 ADD_CUSTOM_TARGET(dist 
   COMMAND ${CMAKE_COMMAND} -P ${CMAKE_BINARY_DIR}/make_dist.cmake
@@ -258,19 +273,15 @@ ADD_CUSTOM_TARGET(dist
 
 ADD_CUSTOM_TARGET(distclean
   COMMAND ${CMAKE_COMMAND} -E echo  WARNING: distclean target is not functional
-  COMMAND ${CMAKE_COMMAND} -E echo  Use 'bzr clean-tree' with --unknown and/or
-    --ignored parameter instead
+  COMMAND ${CMAKE_COMMAND} -E echo  Use 'git clean -fdx' instead
   VERBATIM
   )
 
 IF(INSTALL_LAYOUT STREQUAL "STANDALONE")
 
-# We need to create empty directories (data/test) the installation.  
-# This does not work with current CPack due to http://www.cmake.org/Bug/view.php?id=8767
-# Avoid completely empty directories and install dummy file instead.
-SET(DUMMY_FILE ${CMAKE_CURRENT_BINARY_DIR}/.empty ) 
-FILE(WRITE ${DUMMY_FILE} "")
-INSTALL(FILES ${DUMMY_FILE} DESTINATION data/test COMPONENT DataFiles)
+# Copy db.opt into data/test/
+SET(DBOPT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/db.opt ) 
+INSTALL(FILES ${DBOPT_FILE} DESTINATION data/test COMPONENT DataFiles)
 
 # Install initial database on windows
 IF(NOT CMAKE_CROSSCOMPILING)
@@ -292,15 +303,17 @@ IF(WIN32 AND MYSQLD_EXECUTABLE)
      COMMAND ${CMAKE_COMMAND}
      ${CONFIG_PARAM} -P ${CMAKE_CURRENT_BINARY_DIR}/create_initial_db.cmake
      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/data
-     COMMAND  ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/initdb.dep
      DEPENDS mysqld
   )
   ADD_CUSTOM_TARGET(initial_database  
     ALL
     DEPENDS  initdb.dep
   )
-  INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/data DESTINATION . 
-  COMPONENT DataFiles PATTERN "initdb.dep" EXCLUDE  PATTERN "bootstrap.sql" EXCLUDE)
+  INSTALL(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/data
+    DESTINATION . 
+    COMPONENT DataFiles
+    PATTERN "initdb.dep" EXCLUDE
+    PATTERN "bootstrap.sql" EXCLUDE)
 ELSE()
   # Not windows or cross compiling, just install an empty directory
   INSTALL(FILES ${DUMMY_FILE} DESTINATION data/mysql COMPONENT DataFiles)

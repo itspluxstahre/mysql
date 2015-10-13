@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2013, Oracle and/or its affiliates. All rights reserved.
  
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -315,6 +315,8 @@
 #define USE_MB 1
 #define USE_MB_IDENT 1
 
+#cmakedefine HAVE_UTF8_GENERAL_CS 1
+
 #cmakedefine HAVE_VALGRIND
 
 /* Types we may use */
@@ -573,6 +575,7 @@
 #cmakedefine HAVE_UCA_COLLATIONS 1
 #cmakedefine HAVE_COMPRESS 1
 
+#cmakedefine HAVE_BREAKPAD 1
 
 /*
   Stuff that always need to be defined (compile breaks without it)
@@ -604,6 +607,7 @@
 #cmakedefine DEFAULT_CHARSET_HOME "@DEFAULT_CHARSET_HOME@"
 #cmakedefine PLUGINDIR "@PLUGINDIR@"
 #cmakedefine DEFAULT_SYSCONFDIR "@DEFAULT_SYSCONFDIR@"
+#cmakedefine DEFAULT_TMPDIR @DEFAULT_TMPDIR@
 
 #cmakedefine SO_EXT "@CMAKE_SHARED_MODULE_SUFFIX@"
 

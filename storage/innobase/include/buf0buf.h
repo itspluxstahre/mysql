@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2010, Innobase Oy. All Rights Reserved.
+Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -68,10 +68,9 @@ Created 11/5/1995 Heikki Tuuri
 					position of the block. */
 /* @} */
 
-#define MAX_BUFFER_POOLS_BITS	6	/*!< Number of bits to representing
+#define MAX_BUFFER_POOLS_BITS	6 	/*!< Number of bits to representing
 					a buffer pool ID */
-
-#define MAX_BUFFER_POOLS 	(1 << MAX_BUFFER_POOLS_BITS)
+#define MAX_BUFFER_POOLS	(1 << MAX_BUFFER_POOLS_BITS)
 					/*!< The maximum number of buffer
 					pools that can be defined */
 
@@ -199,6 +198,15 @@ struct buf_pool_info_struct{
 
 typedef struct buf_pool_info_struct	buf_pool_info_t;
 
+/** The occupied bytes of lists in all buffer pools */
+struct buf_pools_list_size_struct {
+	ulint	LRU_bytes;		/*!< LRU size in bytes */
+	ulint	unzip_LRU_bytes;	/*!< unzip_LRU size in bytes */
+	ulint	flush_list_bytes;	/*!< flush_list size in bytes */
+};
+
+typedef struct buf_pools_list_size_struct	buf_pools_list_size_t;
+
 #ifndef UNIV_HOTBACKUP
 /********************************************************************//**
 Acquire mutex on all buffer pool instances */
@@ -222,7 +230,7 @@ ulint
 buf_pool_init(
 /*=========*/
 	ulint	size,		/*!< in: Size of the total pool in bytes */
-	my_bool	populate,	/*!< in: Force virtual page preallocation */
+	ibool	populate,	/*!< in: Force virtual page preallocation */
 	ulint	n_instances);	/*!< in: Number of instances */
 /********************************************************************//**
 Frees the buffer pool at shutdown.  This must not be invoked before
@@ -598,6 +606,31 @@ ib_uint64_t
 buf_block_get_modify_clock(
 /*=======================*/
 	buf_block_t*	block);	/*!< in: block */
+/*******************************************************************//**
+Increments the bufferfix count. */
+UNIV_INLINE
+void
+buf_block_buf_fix_inc_func(
+/*=======================*/
+# ifdef UNIV_SYNC_DEBUG
+	const char*	file,	/*!< in: file name */
+	ulint		line,	/*!< in: line */
+# endif /* UNIV_SYNC_DEBUG */
+	buf_block_t*	block)	/*!< in/out: block to bufferfix */
+	__attribute__((nonnull));
+# ifdef UNIV_SYNC_DEBUG
+/** Increments the bufferfix count.
+@param b	in/out: block to bufferfix
+@param f	in: file name where requested
+@param l	in: line number where requested */
+# define buf_block_buf_fix_inc(b,f,l) buf_block_buf_fix_inc_func(f,l,b)
+# else /* UNIV_SYNC_DEBUG */
+/** Increments the bufferfix count.
+@param b	in/out: block to bufferfix
+@param f	in: file name where requested
+@param l	in: line number where requested */
+# define buf_block_buf_fix_inc(b,f,l) buf_block_buf_fix_inc_func(b)
+# endif /* UNIV_SYNC_DEBUG */
 #else /* !UNIV_HOTBACKUP */
 # define buf_block_modify_clock_inc(block) ((void) 0)
 #endif /* !UNIV_HOTBACKUP */
@@ -631,9 +664,12 @@ UNIV_INTERN
 ibool
 buf_page_is_corrupted(
 /*==================*/
+	ibool		check_lsn,	/*!< in: TRUE if we need to check
+					and complain about the LSN */
 	const byte*	read_buf,	/*!< in: a database page */
-	ulint		zip_size);	/*!< in: size of compressed page;
+	ulint		zip_size)	/*!< in: size of compressed page;
 					0 for uncompressed pages */
+	__attribute__((warn_unused_result));
 #ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Gets the space id, page offset, and byte offset within page of a
@@ -685,6 +721,13 @@ buf_print(void);
 /*============*/
 #endif /* UNIV_DEBUG_PRINT || UNIV_DEBUG || UNIV_BUF_DEBUG */
 #endif /* !UNIV_HOTBACKUP */
+enum buf_page_print_flags {
+	/** Do not crash at the end of buf_page_print(). */
+	BUF_PAGE_PRINT_NO_CRASH	= 1,
+	/** Do not print the full page dump. */
+	BUF_PAGE_PRINT_NO_FULL = 2
+};
+
 /********************************************************************//**
 Prints a page to stderr. */
 UNIV_INTERN
@@ -692,8 +735,12 @@ void
 buf_page_print(
 /*===========*/
 	const byte*	read_buf,	/*!< in: a database page */
-	ulint		zip_size);	/*!< in: compressed page size, or
+	ulint		zip_size,	/*!< in: compressed page size, or
 					0 for uncompressed pages */
+	ulint		flags)		/*!< in: 0 or
+					BUF_PAGE_PRINT_NO_CRASH or
+					BUF_PAGE_PRINT_NO_FULL */
+	__attribute__((nonnull));
 /********************************************************************//**
 Decompress a block.
 @return	TRUE if successful */
@@ -770,11 +817,11 @@ buf_all_freed(void);
 /*********************************************************************//**
 Checks that there currently are no pending i/o-operations for the buffer
 pool.
-@return	TRUE if there is no pending i/o */
+@return	number of pending i/o operations */
 UNIV_INTERN
-ibool
-buf_pool_check_no_pending_io(void);
-/*==============================*/
+ulint
+buf_pool_check_num_pending_io(void);
+/*===============================*/
 /*********************************************************************//**
 Invalidates the file pages in the buffer pool when an archive recovery is
 completed. All the file pages buffered must be in a replaceable state when
@@ -990,8 +1037,7 @@ UNIV_INLINE
 void
 buf_page_set_accessed(
 /*==================*/
-	buf_page_t*	bpage,		/*!< in/out: control block */
-	ulint		time_ms)	/*!< in: ut_time_ms() */
+	buf_page_t*	bpage)		/*!< in/out: control block */
 	__attribute__((nonnull));
 /*********************************************************************//**
 Gets the buf_block_t handle of a buffered file block if an uncompressed
@@ -1143,9 +1189,10 @@ buf_page_init_for_read(
 	ulint		offset);/*!< in: page number */
 /********************************************************************//**
 Completes an asynchronous read or write request of a file page to or from
-the buffer pool. */
+the buffer pool.
+@return TRUE if successful */
 UNIV_INTERN
-void
+ibool
 buf_page_io_complete(
 /*=================*/
 	buf_page_t*	bpage);	/*!< in: pointer to the block in question */
@@ -1298,6 +1345,14 @@ buf_get_total_list_len(
 	ulint*		LRU_len,	/*!< out: length of all LRU lists */
 	ulint*		free_len,	/*!< out: length of all free lists */
 	ulint*		flush_list_len);/*!< out: length of all flush lists */
+/********************************************************************//**
+Get total list size in bytes from all buffer pools. */
+UNIV_INTERN
+void
+buf_get_total_list_size_in_bytes(
+/*=============================*/
+	buf_pools_list_size_t*	buf_pools_list_size);	/*!< out: list sizes
+							in all buffer pools */
 /********************************************************************//**
 Get total buffer pool statistics. */
 UNIV_INTERN
@@ -1469,10 +1524,11 @@ struct buf_page_struct{
 					to read this for heuristic
 					purposes without holding any
 					mutex or latch */
-	unsigned	access_time:32;	/*!< time of first access, or
-					0 if the block was never accessed
-					in the buffer pool */
 	/* @} */
+	unsigned	access_time;	/*!< time of first access, or
+					0 if the block was never accessed
+					in the buffer pool. Protected by
+					block mutex */
 # if defined UNIV_DEBUG_FILE_ACCESSES || defined UNIV_DEBUG
 	ibool		file_page_was_freed;
 					/*!< this is set to TRUE when fsp
@@ -1650,6 +1706,8 @@ struct buf_pool_stat_struct{
 				young because the first access
 				was not long enough ago, in
 				buf_page_peek_if_too_old() */
+	ulint	LRU_bytes;	/*!< LRU size in bytes */
+	ulint	flush_list_bytes;/*!< flush_list size in bytes */
 };
 
 /** Statistics of buddy blocks of a given size. */

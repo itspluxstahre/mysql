@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc., 
+51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
 *****************************************************************************/
 
@@ -34,6 +34,11 @@ Created 3/26/1996 Heikki Tuuri
 /** maximum length that a formatted trx_t::id could take, not including
 the terminating NUL character. */
 #define TRX_ID_MAX_LEN		17
+
+/** Maximum length of MySQL binlog file name, in bytes.
+@see trx_sys_mysql_master_log_name
+@see trx_sys_mysql_bin_log_name */
+#define TRX_SYS_MYSQL_LOG_NAME_LEN	512
 
 /** Memory objects */
 /* @{ */

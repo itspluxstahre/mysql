@@ -169,4 +169,170 @@ SELECT 1 AS STATUS FROM gsv
 
 SET GLOBAL innodb_file_per_table = @old_innodb_file_per_table;
 
+--echo #
+--echo # InnoDB status variables Innodb_page_{splits,merges,reorganizes}
+--echo #
+
+SET @old_innodb_file_per_table = @@GLOBAL.innodb_file_per_table;
+SET GLOBAL innodb_file_per_table = ON;
+
+CREATE TABLE t1 (a BIGINT PRIMARY KEY, b VARCHAR(2048),
+  c VARCHAR(2048)) ENGINE=InnoDB;
+
+SELECT VARIABLE_VALUE INTO @page_splits_1 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_SPLITS';
+
+--echo #
+--echo # Insert a set of records that won't fit on a single page,
+--echo # causing a page to be split.
+--echo #
+
+INSERT INTO t1 VALUES(1, REPEAT('b', 2048), REPEAT('c', 2048));
+INSERT INTO t1 VALUES(2, REPEAT('b', 2048), REPEAT('c', 2048));
+INSERT INTO t1 VALUES(3, REPEAT('b', 2048), REPEAT('c', 2048));
+INSERT INTO t1 VALUES(4, REPEAT('b', 2048), REPEAT('c', 2048));
+
+SELECT VARIABLE_VALUE INTO @page_merges_1 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_MERGES';
+
+SELECT VARIABLE_VALUE INTO @page_merges_succ_1 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_MERGES_SUCCEEDED';
+
+SELECT VARIABLE_VALUE INTO @page_reorganizes_1 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_REORGANIZES';
+
+--echo #
+--echo # Reduce the size of a couple of records so that the page
+--echo # fill factor will be below the minimum threshold, causing
+--echo # the page to be merged.
+--echo #
+
+UPDATE t1 SET b = 'b', c = 'c' WHERE a = 3;
+UPDATE t1 SET b = 'b', c = 'c' WHERE a = 4;
+
+SELECT VARIABLE_VALUE INTO @page_merges_2 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_MERGES';
+SELECT VARIABLE_VALUE INTO @page_merges_succ_2 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_MERGES_SUCCEEDED';
+SELECT VARIABLE_VALUE INTO @page_reorganizes_2 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_REORGANIZES';
+SELECT VARIABLE_VALUE INTO @page_splits_2 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_SPLITS';
+
+--echo #
+--echo # Ensure that the page split/merge/reorganize counters
+--echo # were incremented.
+--echo #
+
+SELECT (@page_merges_2 - @page_merges_1) AS 'INNODB_PAGE_MERGES';
+SELECT (@page_merges_succ_2 - @page_merges_succ_1) AS 'INNODB_PAGE_MERGES_SUCCEEDED';
+SELECT (@page_reorganizes_2 - @page_reorganizes_1) AS 'INNODB_PAGE_REORGANIZES';
+SELECT (@page_splits_2 - @page_splits_1) AS 'INNODB_PAGE_SPLITS';
+
+DROP TABLE t1;
+
+--echo #
+--echo # Export insert buffer statistics
+--echo #
+
+SET @old_innodb_change_buffering_debug = @@innodb_change_buffering_debug;
+SET GLOBAL innodb_change_buffering_debug = 1;
+
+CREATE TABLE t1 (a INT AUTO_INCREMENT, b INT, c INT,
+  PRIMARY KEY (a), INDEX (b)) ENGINE=InnoDB;
+
+--echo # Collect status values for later comparison.
+SELECT VARIABLE_VALUE INTO @merged_delete_marks FROM gsv
+  WHERE VARIABLE_NAME = 'INNODB_IBUF_MERGED_DELETE_MARKS';
+SELECT VARIABLE_VALUE INTO @merged_inserts FROM gsv
+  WHERE VARIABLE_NAME = 'INNODB_IBUF_MERGED_INSERTS';
+SELECT VARIABLE_VALUE INTO @merged_pages FROM gsv
+  WHERE VARIABLE_NAME = 'INNODB_IBUF_MERGED_PAGES';
+
+--echo # Populate table so that insert buffering is used.
+INSERT INTO t1 VALUES (0, 1, 1);
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+
+--echo # Perform changes that are buffered.
+BEGIN;
+DELETE FROM t1 WHERE a = 1;
+INSERT INTO t1 VALUES (1, 2, 1);
+SELECT b FROM t1 LIMIT 3;
+ROLLBACK;
+
+--echo # Wait for status values to be updated.
+let $wait_condition=
+  SELECT COUNT(*) > 0 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_IBUF_MERGED_DELETE_MARKS' AND
+  VARIABLE_VALUE > @merged_delete_marks;
+--source include/wait_condition.inc
+
+let $wait_condition=
+  SELECT COUNT(*) > 0 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_IBUF_MERGED_INSERTS' AND
+  VARIABLE_VALUE > @merged_inserts;
+--source include/wait_condition.inc
+
+let $wait_condition=
+  SELECT COUNT(*) > 0 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_IBUF_MERGED_PAGES' AND
+  VARIABLE_VALUE > @merged_pages;
+--source include/wait_condition.inc
+
+DROP TABLE t1;
+
+SET GLOBAL innodb_change_buffering_debug = @old_innodb_change_buffering_debug;
+
+--echo #
+--echo # Add counters for page_merges_succeeded and page_discards
+--echo #
+
+CREATE TABLE t1 (a BIGINT AUTO_INCREMENT PRIMARY KEY, b VARCHAR(2048),
+  c VARCHAR(2048)) ENGINE=InnoDB;
+
+--echo # Populate table with a few pages worth of data.
+INSERT INTO t1 VALUES(1, REPEAT('b', 2048), REPEAT('c', 2048));
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+INSERT INTO t1 SELECT 0,b,c FROM t1;
+
+--echo # Collect status values for later comparison.
+SELECT VARIABLE_VALUE INTO @page_discard FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_DISCARD';
+
+--echo # Delete all records from the right-most page.
+DELETE FROM t1 WHERE a > 17 ORDER BY a;
+
+--echo # Wait for records to be purged.
+let $wait_condition = SELECT COUNT(*) = 1 FROM gsv WHERE VARIABLE_NAME =
+  'INNODB_PURGE_TRX_NO' AND VARIABLE_VALUE = (SELECT VARIABLE_VALUE FROM
+  gsv WHERE VARIABLE_NAME = 'INNODB_TRX_MAX_ID');
+--source include/wait_condition.inc
+
+--echo # Wait for the page_discard status value to be updated.
+let $wait_condition=
+  SELECT COUNT(*) > 0 FROM gsv WHERE
+  VARIABLE_NAME = 'INNODB_PAGE_DISCARD' AND
+  VARIABLE_VALUE > @page_discard;
+--source include/wait_condition.inc
+
+DROP TABLE t1;
+
+--echo #
+--echo # Cleanup
+--echo #
+
+SET GLOBAL innodb_file_per_table = @old_innodb_file_per_table;
+
 DROP VIEW gsv;

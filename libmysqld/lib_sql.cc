@@ -2,6 +2,9 @@
  * Copyright (c)  2000
  * SWsoft  company
  *
+ * Modifications copyright (c) 2001, 2013. Oracle and/or its affiliates.
+ * All rights reserved.
+ *
  * This material is provided "as is", with absolutely no warranty expressed
  * or implied. Any use is at your own risk.
  *
@@ -343,6 +346,8 @@ static int emb_stmt_execute(MYSQL_STMT *stmt)
     set_stmt_errmsg(stmt, net);
     DBUG_RETURN(1);
   }
+  else if (stmt->mysql->status == MYSQL_STATUS_GET_RESULT)
+           stmt->mysql->status= MYSQL_STATUS_STATEMENT_GET_RESULT;
   DBUG_RETURN(0);
 }
 
@@ -556,7 +561,7 @@ int init_embedded_server(int argc, char **argv, char **groups)
     opt_mysql_tmpdir=getenv("TMP");
 #endif
   if (!opt_mysql_tmpdir || !opt_mysql_tmpdir[0])
-    opt_mysql_tmpdir=(char*) P_tmpdir;		/* purecov: inspected */
+    opt_mysql_tmpdir= const_cast<char*>(DEFAULT_TMPDIR); /* purecov: inspected*/
 
   init_ssl();
   umask(((~my_umask) & 0666));
@@ -697,7 +702,8 @@ int check_embedded_connection(MYSQL *mysql, const char *db)
   thd_init_client_charset(thd, mysql->charset->number);
   thd->update_charset();
   Security_context *sctx= thd->security_ctx;
-  sctx->host_or_ip= sctx->host= (char*) my_localhost;
+  sctx->set_host(my_localhost);
+  sctx->host_or_ip= sctx->get_host()->ptr();
   strmake(sctx->priv_host, (char*) my_localhost,  MAX_HOSTNAME-1);
   strmake(sctx->priv_user, mysql->user,  USERNAME_LENGTH-1);
   sctx->user= my_strdup(mysql->user, MYF(0));
@@ -725,14 +731,14 @@ int check_embedded_connection(MYSQL *mysql, const char *db)
 
   if (mysql->options.client_ip)
   {
-    sctx->host= my_strdup(mysql->options.client_ip, MYF(0));
-    sctx->ip= my_strdup(sctx->host, MYF(0));
+    sctx->set_host(my_strdup(mysql->options.client_ip, MYF(0)));
+    sctx->set_ip(my_strdup(sctx->get_host()->ptr(), MYF(0)));
   }
   else
-    sctx->host= (char*)my_localhost;
-  sctx->host_or_ip= sctx->host;
+    sctx->set_host((char*)my_localhost);
+  sctx->host_or_ip= sctx->host->ptr();
 
-  if (acl_check_host(sctx->host, sctx->ip))
+  if (acl_check_host(sctx->get_host()->ptr(), sctx->get_ip()->ptr()))
     goto err;
 
   /* construct a COM_CHANGE_USER packet */

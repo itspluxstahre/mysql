@@ -1,4 +1,4 @@
-/* Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2007, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Library General Public
@@ -1416,20 +1416,27 @@ static double my_strtod_int(const char *s00, char **se, int *error, char *buf, s
     c= *++s;
     if (!nd)
     {
-      for (; s < end && c == '0'; c= *++s)
+      for (; s < end; ++s)
+      {
+        c= *s;
+        if (c != '0')
+          break;
         nz++;
+      }
       if (s < end && c > '0' && c <= '9')
       {
         s0= s;
         nf+= nz;
         nz= 0;
-        goto have_dig;
       }
-      goto dig_done;
+      else
+        goto dig_done;
     }
-    for (; s < end && c >= '0' && c <= '9'; c = *++s)
+    for (; s < end; ++s)
     {
- have_dig:
+      c= *s;
+      if (c < '0' || c > '9')
+        break;
       /*
         Here we are parsing the fractional part.
         We can stop counting digits after a while: the extra digits

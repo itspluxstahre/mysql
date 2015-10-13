@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -163,6 +163,7 @@ typedef int (*mysql_show_var_func)(MYSQL_THD, struct st_mysql_show_var*, char *)
 #define PLUGIN_VAR_STR          0x0005
 #define PLUGIN_VAR_ENUM         0x0006
 #define PLUGIN_VAR_SET          0x0007
+#define PLUGIN_VAR_DOUBLE       0x0008
 #define PLUGIN_VAR_UNSIGNED     0x0080
 #define PLUGIN_VAR_THDLOCAL     0x0100 /* Variable is per-connection */
 #define PLUGIN_VAR_READONLY     0x0200 /* Server variable is read only */
@@ -345,6 +346,11 @@ DECLARE_MYSQL_SYSVAR_TYPELIB(name, unsigned long long) = { \
   PLUGIN_VAR_SET | ((opt) & PLUGIN_VAR_MASK), \
   #name, comment, check, update, &varname, def, typelib }
 
+#define MYSQL_SYSVAR_DOUBLE(name, varname, opt, comment, check, update, def, min, max, blk) \
+DECLARE_MYSQL_SYSVAR_SIMPLE(name, double) = { \
+  PLUGIN_VAR_DOUBLE | ((opt) & PLUGIN_VAR_MASK), \
+  #name, comment, check, update, &varname, def, min, max, blk }
+
 #define MYSQL_THDVAR_BOOL(name, opt, comment, check, update, def) \
 DECLARE_MYSQL_THDVAR_BASIC(name, char) = { \
   PLUGIN_VAR_BOOL | PLUGIN_VAR_THDLOCAL | ((opt) & PLUGIN_VAR_MASK), \
@@ -394,6 +400,11 @@ DECLARE_MYSQL_THDVAR_TYPELIB(name, unsigned long) = { \
 DECLARE_MYSQL_THDVAR_TYPELIB(name, unsigned long long) = { \
   PLUGIN_VAR_SET | PLUGIN_VAR_THDLOCAL | ((opt) & PLUGIN_VAR_MASK), \
   #name, comment, check, update, -1, def, NULL, typelib }
+
+#define MYSQL_THDVAR_DOUBLE(name, opt, comment, check, update, def, min, max, blk) \
+DECLARE_MYSQL_THDVAR_SIMPLE(name, double) = { \
+  PLUGIN_VAR_DOUBLE | PLUGIN_VAR_THDLOCAL | ((opt) & PLUGIN_VAR_MASK), \
+  #name, comment, check, update, -1, def, min, max, blk, NULL }
 
 /* accessor macros */
 
@@ -545,6 +556,8 @@ char *thd_security_context(MYSQL_THD thd, char *buffer, unsigned int length,
 /* Increments the row counter, see THD::row_count */
 void thd_inc_row_count(MYSQL_THD thd);
 
+#define EXTENDED_FOR_USERSTAT
+
 /**
   Create a temporary file.
 
@@ -589,6 +602,14 @@ int thd_killed(const MYSQL_THD thd);
   @param thd  user thread connection handle
 */
 void thd_set_kill_status(const MYSQL_THD thd);
+
+/**
+ Set deadlock report status to print more deadlock info.
+
+ @param thd   user thread connection handle
+ @param val   true or false
+*/
+void thd_set_deadlock_report(MYSQL_THD thd, int val);
 
 /**
   Return the thread id of a user thread

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2012, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -11,13 +11,14 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA */
 
 #include "my_global.h"
 #include <signal.h>
 
 #include "sys_vars.h"
 #include "my_stacktrace.h"
+#include "minidump.h"
 
 #ifdef __WIN__
 #include <crtdbg.h>
@@ -131,6 +132,7 @@ extern "C" sig_handler handle_fatal_signal(int sig)
     "Hope that's ok; if not, decrease some variables in the equation.\n\n");
 
 #if defined(HAVE_LINUXTHREADS)
+#define UNSAFE_DEFAULT_LINUX_THREADS 200
   if (sizeof(char*) == 4 && thread_count > UNSAFE_DEFAULT_LINUX_THREADS)
   {
     my_safe_printf_stderr(
@@ -193,12 +195,14 @@ extern "C" sig_handler handle_fatal_signal(int sig)
                           (ulong) thd->thread_id);
     my_safe_printf_stderr("Status: %s\n\n", kreason);
   }
+#endif /* HAVE_STACKTRACE */
+
+  my_write_minidump(opt_minidump_dir);
+
   my_safe_printf_stderr("%s",
     "The manual page at "
     "http://dev.mysql.com/doc/mysql/en/crashing.html contains\n"
     "information that should help you find out what is causing the crash.\n");
-
-#endif /* HAVE_STACKTRACE */
 
 #ifdef HAVE_INITGROUPS
   if (calling_initgroups)

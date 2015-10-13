@@ -1,6 +1,5 @@
 #!/bin/sh
-# Copyright (c) 2000-2008 MySQL AB, 2009, 2010 Sun Microsystems, Inc.
-# Use is subject to license terms.
+# Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -50,8 +49,8 @@ Usage: $0 [OPTIONS]
                        Read this file after the global files are read.
   --defaults-file=name Only read default options from the given file name.
   --force              Causes mysql_install_db to run even if DNS does not
-                       work.  In that case, grant table entries that normally
-                       use hostnames will use IP addresses.
+                       work.  In that case, grant table entries that
+                       normally use hostnames will use IP addresses.
   --help               Display this help and exit.                     
   --ldata=path         The path to the MySQL data directory. Same as --datadir.
   --no-defaults        Don't read default options from any option file.
@@ -427,8 +426,8 @@ else
   echo "describes problems on your OS.  Another information source are the"
   echo "MySQL email archives available at http://lists.mysql.com/."
   echo
-  echo "Please check all of the above before mailing us!  And remember, if"
-  echo "you do mail us, you MUST use the $scriptdir/mysqlbug script!"
+  echo "Please check all of the above before submitting a bug report"
+  echo "at http://bugs.mysql.com/"
   echo
   exit 1
 fi
@@ -479,7 +478,7 @@ then
   fi
 
   echo
-  echo "Please report any problems with the $scriptdir/mysqlbug script!"
+  echo "Please report any problems at http://bugs.mysql.com/"
   echo
 fi
 

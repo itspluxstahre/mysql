@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -192,7 +192,7 @@ static enum_field_types field_types_merge_rules [FIELDTYPE_NUM][FIELDTYPE_NUM]=
   //MYSQL_TYPE_NULL         MYSQL_TYPE_TIMESTAMP
     MYSQL_TYPE_LONG,         MYSQL_TYPE_VARCHAR,
   //MYSQL_TYPE_LONGLONG     MYSQL_TYPE_INT24
-    MYSQL_TYPE_LONGLONG,    MYSQL_TYPE_INT24,
+    MYSQL_TYPE_LONGLONG,    MYSQL_TYPE_LONG,
   //MYSQL_TYPE_DATE         MYSQL_TYPE_TIME
     MYSQL_TYPE_VARCHAR,     MYSQL_TYPE_VARCHAR,
   //MYSQL_TYPE_DATETIME     MYSQL_TYPE_YEAR
@@ -223,7 +223,7 @@ static enum_field_types field_types_merge_rules [FIELDTYPE_NUM][FIELDTYPE_NUM]=
   //MYSQL_TYPE_NULL         MYSQL_TYPE_TIMESTAMP
     MYSQL_TYPE_FLOAT,       MYSQL_TYPE_VARCHAR,
   //MYSQL_TYPE_LONGLONG     MYSQL_TYPE_INT24
-    MYSQL_TYPE_FLOAT,       MYSQL_TYPE_INT24,
+    MYSQL_TYPE_FLOAT,       MYSQL_TYPE_FLOAT,
   //MYSQL_TYPE_DATE         MYSQL_TYPE_TIME
     MYSQL_TYPE_VARCHAR,     MYSQL_TYPE_VARCHAR,
   //MYSQL_TYPE_DATETIME     MYSQL_TYPE_YEAR
@@ -254,7 +254,7 @@ static enum_field_types field_types_merge_rules [FIELDTYPE_NUM][FIELDTYPE_NUM]=
   //MYSQL_TYPE_NULL         MYSQL_TYPE_TIMESTAMP
     MYSQL_TYPE_DOUBLE,      MYSQL_TYPE_VARCHAR,
   //MYSQL_TYPE_LONGLONG     MYSQL_TYPE_INT24
-    MYSQL_TYPE_DOUBLE,      MYSQL_TYPE_INT24,
+    MYSQL_TYPE_DOUBLE,      MYSQL_TYPE_DOUBLE,
   //MYSQL_TYPE_DATE         MYSQL_TYPE_TIME
     MYSQL_TYPE_VARCHAR,     MYSQL_TYPE_VARCHAR,
   //MYSQL_TYPE_DATETIME     MYSQL_TYPE_YEAR
@@ -285,7 +285,7 @@ static enum_field_types field_types_merge_rules [FIELDTYPE_NUM][FIELDTYPE_NUM]=
   //MYSQL_TYPE_NULL         MYSQL_TYPE_TIMESTAMP
     MYSQL_TYPE_NULL,        MYSQL_TYPE_TIMESTAMP,
   //MYSQL_TYPE_LONGLONG     MYSQL_TYPE_INT24
-    MYSQL_TYPE_LONGLONG,    MYSQL_TYPE_INT24,
+    MYSQL_TYPE_LONGLONG,    MYSQL_TYPE_LONGLONG,
   //MYSQL_TYPE_DATE         MYSQL_TYPE_TIME
     MYSQL_TYPE_NEWDATE,     MYSQL_TYPE_TIME,
   //MYSQL_TYPE_DATETIME     MYSQL_TYPE_YEAR
@@ -7376,11 +7376,10 @@ int Field_blob::store(const char *from,uint length,CHARSET_INFO *cs)
       If content of the 'from'-address is cached in the 'value'-object
       it is possible that the content needs a character conversion.
     */
-    uint32 dummy_offset;
-    if (!String::needs_conversion(length, cs, field_charset, &dummy_offset))
+    if (!String::needs_conversion_on_storage(length, cs, field_charset))
     {
       Field_blob::store_length(length);
-      bmove(ptr+packlength,(char*) &from,sizeof(char*));
+      bmove(ptr+packlength, &from, sizeof(char*));
       return 0;
     }
     if (tmpstr.copy(from, length, cs))
@@ -7897,7 +7896,7 @@ int Field_geom::store(const char *from, uint length, CHARSET_INFO *cs)
       value.copy(from, length, cs);
       from= value.ptr();
     }
-    bmove(ptr + packlength, (char*) &from, sizeof(char*));
+    bmove(ptr + packlength, &from, sizeof(char*));
   }
   return 0;
 
@@ -7975,12 +7974,11 @@ int Field_enum::store(const char *from,uint length,CHARSET_INFO *cs)
 {
   ASSERT_COLUMN_MARKED_FOR_WRITE;
   int err= 0;
-  uint32 not_used;
   char buff[STRING_BUFFER_USUAL_SIZE];
   String tmpstr(buff,sizeof(buff), &my_charset_bin);
 
   /* Convert character set if necessary */
-  if (String::needs_conversion(length, cs, field_charset, &not_used))
+  if (String::needs_conversion_on_storage(length, cs, field_charset))
   { 
     uint dummy_errors;
     tmpstr.copy(from, length, cs, field_charset, &dummy_errors);
@@ -8196,12 +8194,11 @@ int Field_set::store(const char *from,uint length,CHARSET_INFO *cs)
   int err= 0;
   char *not_used;
   uint not_used2;
-  uint32 not_used_offset;
   char buff[STRING_BUFFER_USUAL_SIZE];
   String tmpstr(buff,sizeof(buff), &my_charset_bin);
 
   /* Convert character set if necessary */
-  if (String::needs_conversion(length, cs, field_charset, &not_used_offset))
+  if (String::needs_conversion_on_storage(length, cs, field_charset))
   { 
     uint dummy_errors;
     tmpstr.copy(from, length, cs, field_charset, &dummy_errors);
@@ -8257,8 +8254,19 @@ String *Field_set::val_str(String *val_buffer,
   ulonglong tmp=(ulonglong) Field_enum::val_int();
   uint bitnr=0;
 
-  val_buffer->length(0);
+  if (tmp == 0)
+  {
+    /*
+      Some callers expect *val_buffer to contain the result,
+      so we assign to it, rather than doing 'return &empty_set_string.
+     */
+    *val_buffer= empty_set_string;
+    return val_buffer;
+  }
+
   val_buffer->set_charset(field_charset);
+  val_buffer->length(0);
+
   while (tmp && bitnr < (uint) typelib->count)
   {
     if (tmp & 1)
@@ -9918,6 +9926,17 @@ Create_field::Create_field(Field *old_field,Field *orig_field)
     geom_type= ((Field_geom*)old_field)->geom_type;
     break;
 #endif
+  case MYSQL_TYPE_YEAR:
+    if (length != 4)
+    {
+      char buff[sizeof("YEAR()") + MY_INT64_NUM_DECIMAL_DIGITS + 1];
+      my_snprintf(buff, sizeof(buff), "YEAR(%lu)", length);
+      push_warning_printf(current_thd, MYSQL_ERROR::WARN_LEVEL_NOTE,
+                          ER_WARN_DEPRECATED_SYNTAX,
+                          ER(ER_WARN_DEPRECATED_SYNTAX),
+                          buff, "YEAR(4)");
+    }
+    break;
   default:
     break;
   }

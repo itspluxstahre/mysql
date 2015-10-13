@@ -2457,6 +2457,8 @@ hex(concat(a))	a
 30303030303030303030303030303031303030302E31	00000000000000010000.1
 drop table t1;
 create table t1 (a year(2));
+Warnings:
+Note	1287	'YEAR(2)' is deprecated and will be removed in a future release. Please use YEAR(4) instead
 insert into t1 values (1);
 select hex(concat(a)) from t1;
 hex(concat(a))
@@ -2770,6 +2772,8 @@ hex(a)
 drop table t1;
 drop view v1;
 create table t1 (a year(2));
+Warnings:
+Note	1287	'YEAR(2)' is deprecated and will be removed in a future release. Please use YEAR(4) instead
 insert into t1 values (1);
 create view v1(a) as select concat(a) from t1;
 show columns from v1;
@@ -3289,3 +3293,25 @@ Note	1003	select 'abcdó' AS `abcdó`,_latin1'abcd\xC3\xB3' AS `abcdó`,_utf8'ab
 #
 # End of 5.5 tests
 #
+# Bugs#12635232: VALGRIND WARNINGS: IS_IPV6, IS_IPV4, INET6_ATON,
+# INET6_NTOA + MULTIBYTE CHARSET.
+#
+SET NAMES latin1;
+SELECT is_ipv4(inet_ntoa('1'));
+is_ipv4(inet_ntoa('1'))
+1
+SELECT is_ipv6(inet_ntoa('1'));
+is_ipv6(inet_ntoa('1'))
+0
+SELECT inet6_aton(inet_ntoa('1'));
+inet6_aton(inet_ntoa('1'))
+   
+SELECT inet6_ntoa(inet_ntoa('1'));
+inet6_ntoa(inet_ntoa('1'))
+NULL
+#
+# Bug#14040277 UNINITIALIZED VALUE REFERENCED IN STR_TO_IPV6
+#
+SELECT inet6_aton(soundex('a'));
+inet6_aton(soundex('a'))
+NULL

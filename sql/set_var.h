@@ -1,6 +1,6 @@
 #ifndef SET_VAR_INCLUDED
 #define SET_VAR_INCLUDED
-/* Copyright (c) 2002, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
 
 /**
   @file
@@ -82,7 +82,7 @@ protected:
   ptrdiff_t offset;     ///< offset to the value from global_system_variables
   on_check_function on_check;
   on_update_function on_update;
-  struct { uint version; const char *substitute; } deprecated;
+  const char *const deprecation_substitute;
   bool is_os_charset; ///< true if the value is in character_set_filesystem
 
 public:
@@ -91,7 +91,7 @@ public:
           enum get_opt_arg_type getopt_arg_type, SHOW_TYPE show_val_type_arg,
           longlong def_val, PolyLock *lock, enum binlog_status_enum binlog_status_arg,
           on_check_function on_check_func, on_update_function on_update_func,
-          uint deprecated_version, const char *substitute, int parse_flag);
+          const char *substitute, int parse_flag);
 
   virtual ~sys_var() {}
 
@@ -107,7 +107,13 @@ public:
 
   bool check(THD *thd, set_var *var);
   uchar *value_ptr(THD *thd, enum_var_type type, LEX_STRING *base);
-  bool set_default(THD *thd, enum_var_type type);
+
+  /**
+     Update the system variable with the default value from either
+     session or global scope.  The default value is stored in the
+     'var' argument. Return false when successful.
+  */
+  bool set_default(THD *thd, set_var *var);
   bool update(THD *thd, set_var *var);
 
   SHOW_TYPE show_type() { return show_val_type; }
@@ -137,6 +143,7 @@ public:
     return (option.id != -1) && (m_parse_flag & parse_flags) &&
            insert_dynamic(array, (uchar*)&option);
   }
+  void do_deprecated_warning(THD *thd);
 
 private:
   virtual bool do_check(THD *thd, set_var *var) = 0;
@@ -150,7 +157,7 @@ private:
   virtual void global_save_default(THD *thd, set_var *var) = 0;
   virtual bool session_update(THD *thd, set_var *var) = 0;
   virtual bool global_update(THD *thd, set_var *var) = 0;
-  void do_deprecated_warning(THD *thd);
+
 protected:
   /**
     A pointer to a value of the variable for SHOW.
@@ -225,13 +232,23 @@ public:
     if (value_arg && value_arg->type() == Item::FIELD_ITEM)
     {
       Item_field *item= (Item_field*) value_arg;
-      if (!(value=new Item_string(item->field_name,
-                                  (uint) strlen(item->field_name),
-                                  system_charset_info))) // names are utf8
-        value=value_arg;                        /* Give error message later */
+      if (item->field_name)
+      {
+        if (!(value= new Item_string(item->field_name,
+                                     (uint) strlen(item->field_name),
+                                     system_charset_info))) // names are utf8
+	  value= value_arg;			/* Give error message later */
+      }
+      else
+      {
+        /* Both Item_field and Item_insert_value will return the type as
+        Item::FIELD_ITEM. If the item->field_name is NULL, we assume the
+        object to be Item_insert_value. */
+        value= value_arg;
+      }
     }
     else
-      value=value_arg;
+      value= value_arg;
   }
   int check(THD *thd);
   int update(THD *thd);
@@ -316,6 +333,8 @@ bool sql_mode_string_representation(THD *thd, ulong sql_mode, LEX_STRING *ls);
 extern sys_var *Sys_autocommit_ptr;
 
 CHARSET_INFO *get_old_charset_by_name(const char *old_name);
+
+ulong get_expire_logs_seconds(void);
 
 int sys_var_init();
 int sys_var_add_options(DYNAMIC_ARRAY *long_options, int parse_flags);

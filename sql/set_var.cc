@@ -1,4 +1,4 @@
-/* Copyright (c) 2002, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -134,9 +134,9 @@ void sys_var_end()
                    put your additional checks here
   @param on_update_func a function to be called at the end of sys_var::update,
                    any post-update activity should happen here
-  @param deprecated_version if not 0 - when this variable will go away
-  @param substitute if not 0 - what one should use instead when this
-                   deprecated variable
+  @param substitute If non-NULL, this variable is deprecated and the
+  string describes what one should use instead. If an empty string,
+  the variable is deprecated but no replacement is offered.
   @param parse_flag either PARSE_EARLY or PARSE_NORMAL
 */
 sys_var::sys_var(sys_var_chain *chain, const char *name_arg,
@@ -146,12 +146,12 @@ sys_var::sys_var(sys_var_chain *chain, const char *name_arg,
                  PolyLock *lock, enum binlog_status_enum binlog_status_arg,
                  on_check_function on_check_func,
                  on_update_function on_update_func,
-                 uint deprecated_version, const char *substitute,
-                 int parse_flag) :
+                 const char *substitute, int parse_flag) :
   next(0),
   binlog_status(binlog_status_arg),
   flags(flags_arg), m_parse_flag(parse_flag), show_val_type(show_val_type_arg),
   guard(lock), offset(off), on_check(on_check_func), on_update(on_update_func),
+  deprecation_substitute(substitute),
   is_os_charset(FALSE)
 {
   /*
@@ -176,12 +176,6 @@ sys_var::sys_var(sys_var_chain *chain, const char *name_arg,
   option.arg_type= getopt_arg_type;
   option.value= (uchar **)global_var_ptr();
   option.def_value= def_val;
-
-  deprecated.version= deprecated_version;
-  deprecated.substitute= substitute;
-  DBUG_ASSERT((deprecated_version != 0) || (substitute == 0));
-  DBUG_ASSERT(deprecated_version % 100 == 0);
-  DBUG_ASSERT(!deprecated_version || MYSQL_VERSION_ID < deprecated_version);
 
   if (chain->last)
     chain->last->next= this;
@@ -223,7 +217,6 @@ uchar *sys_var::global_value_ptr(THD *thd, LEX_STRING *base)
 
 bool sys_var::check(THD *thd, set_var *var)
 {
-  do_deprecated_warning(thd);
   if ((var->value && do_check(thd, var))
       || (on_check && on_check(this, thd, var)))
   {
@@ -262,36 +255,36 @@ uchar *sys_var::value_ptr(THD *thd, enum_var_type type, LEX_STRING *base)
     return session_value_ptr(thd, base);
 }
 
-bool sys_var::set_default(THD *thd, enum_var_type type)
+bool sys_var::set_default(THD *thd, set_var* var)
 {
-  LEX_STRING empty={0,0};
-  set_var var(type, 0, &empty, 0);
-
-  if (type == OPT_GLOBAL || scope() == GLOBAL)
-    global_save_default(thd, &var);
+  if (var->type == OPT_GLOBAL || scope() == GLOBAL)
+    global_save_default(thd, var);
   else
-    session_save_default(thd, &var);
+    session_save_default(thd, var);
 
-  return check(thd, &var) || update(thd, &var);
+  return check(thd, var) || update(thd, var);
 }
 
 void sys_var::do_deprecated_warning(THD *thd)
 {
-  if (deprecated.version)
+  if (deprecation_substitute != NULL)
   {
-    char buf1[NAME_CHAR_LEN + 3], buf2[10];
+    char buf1[NAME_CHAR_LEN + 3];
     strxnmov(buf1, sizeof(buf1)-1, "@@", name.str, 0);
-    my_snprintf(buf2, sizeof(buf2), "%d.%d", deprecated.version/100/100,
-                deprecated.version/100%100);
-    uint errmsg= deprecated.substitute
-                        ? ER_WARN_DEPRECATED_SYNTAX_WITH_VER
-                        : ER_WARN_DEPRECATED_SYNTAX_NO_REPLACEMENT;
+
+    /* 
+       if deprecation_substitute is an empty string,
+       there is no replacement for the syntax
+    */
+    uint errmsg= deprecation_substitute[0] == '\0'
+      ? ER_WARN_DEPRECATED_SYNTAX_NO_REPLACEMENT
+      : ER_WARN_DEPRECATED_SYNTAX;
     if (thd)
       push_warning_printf(thd, MYSQL_ERROR::WARN_LEVEL_WARN,
                           ER_WARN_DEPRECATED_SYNTAX, ER(errmsg),
-                          buf1, buf2, deprecated.substitute);
+                          buf1, deprecation_substitute);
     else
-      sql_print_warning(ER_DEFAULT(errmsg), buf1, buf2, deprecated.substitute);
+      sql_print_warning(ER_DEFAULT(errmsg), buf1, deprecation_substitute);
   }
 }
 
@@ -599,6 +592,7 @@ err:
 
 int set_var::check(THD *thd)
 {
+  var->do_deprecated_warning(thd);
   if (var->is_readonly())
   {
     my_error(ER_INCORRECT_GLOBAL_LOCAL_VAR, MYF(0), var->name.str, "read only");
@@ -671,7 +665,7 @@ int set_var::light_check(THD *thd)
 */
 int set_var::update(THD *thd)
 {
-  return value ? var->update(thd, this) : var->set_default(thd, type);
+  return value ? var->update(thd, this) : var->set_default(thd, this);
 }
 
 

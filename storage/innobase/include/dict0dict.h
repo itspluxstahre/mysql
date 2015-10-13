@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2009, Innobase Oy. All Rights Reserved.
+Copyright (c) 1996, 2014, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -39,6 +39,7 @@ Created 1/8/1996 Heikki Tuuri
 #include "ut0rnd.h"
 #include "ut0byte.h"
 #include "trx0types.h"
+#include "ut0rbt.h"
 
 #ifndef UNIV_HOTBACKUP
 # include "sync0sync.h"
@@ -328,9 +329,11 @@ UNIV_INTERN
 ulint
 dict_foreign_add_to_cache(
 /*======================*/
-	dict_foreign_t*	foreign,	/*!< in, own: foreign key constraint */
-	ibool		check_charsets);/*!< in: TRUE=check charset
-					compatibility */
+	dict_foreign_t*		foreign,	/*!< in, own: foreign key
+						constraint */
+	ibool			check_charsets,	/*!< in: TRUE=check charset
+						compatibility */
+	dict_err_ignore_t	ignore_err);	/*!< in: error to be ignored */
 /*********************************************************************//**
 Check if the index is referenced by a foreign key, if TRUE return the
 matching instance NULL otherwise.
@@ -426,10 +429,14 @@ UNIV_INTERN
 dict_table_t*
 dict_table_get(
 /*===========*/
-	const char*	table_name,	/*!< in: table name */
-	ibool		inc_mysql_count);
+	const char*		table_name,
+					/*!< in: table name */
+	ibool			inc_mysql_count,
 					/*!< in: whether to increment the open
 					handle count on the table */
+	dict_err_ignore_t	ignore_err);
+					/*!< in: errors to ignore when loading
+					the table */
 /**********************************************************************//**
 Returns a index object, based on table and index id, and memoryfixes it.
 @return	index, NULL if does not exist */
@@ -454,21 +461,12 @@ function.
 @return	table, NULL if not found */
 UNIV_INLINE
 dict_table_t*
-dict_table_get_low_ignore_err(
-/*===========================*/
+dict_table_get_low(
+/*===============*/
 	const char*	table_name,	/*!< in: table name */
 	dict_err_ignore_t
 			ignore_err);	/*!< in: error to be ignored when
 					loading a table definition */
-/**********************************************************************//**
-Gets a table; loads it to the dictionary cache if necessary. A low-level
-function.
-@return	table, NULL if not found */
-UNIV_INLINE
-dict_table_t*
-dict_table_get_low(
-/*===============*/
-	const char*	table_name);	/*!< in: table name */
 /**********************************************************************//**
 Returns a table object based on table id.
 @return	table, NULL if does not exist */
@@ -750,6 +748,7 @@ ulint
 dict_table_zip_size(
 /*================*/
 	const dict_table_t*	table);	/*!< in: table */
+#ifndef UNIV_HOTBACKUP
 /*********************************************************************//**
 Obtain exclusive locks on all index trees of the table. This is to prevent
 accessing index trees while InnoDB is updating internal metadata for
@@ -766,6 +765,7 @@ void
 dict_table_x_unlock_indexes(
 /*========================*/
 	dict_table_t*	table);	/*!< in: table */
+#endif /* !UNIV_HOTBACKUP */
 /********************************************************************//**
 Checks if a column is in the ordering columns of the clustered index of a
 table. Column prefixes are treated like whole columns.
@@ -907,6 +907,18 @@ dict_index_get_nth_col_pos(
 /*=======================*/
 	const dict_index_t*	index,	/*!< in: index */
 	ulint			n);	/*!< in: column number */
+/********************************************************************//**
+Looks for column n in an index.
+@return position in internal representation of the index;
+ULINT_UNDEFINED if not contained */
+UNIV_INTERN
+ulint
+dict_index_get_nth_col_or_prefix_pos(
+/*=================================*/
+	const dict_index_t*	index,		/*!< in: index */
+	ulint			n,		/*!< in: column number */
+	ibool			inc_prefix);	/*!< in: TRUE=consider
+						column prefixes too */
 /********************************************************************//**
 Returns TRUE if the index contains a column or a prefix of that column.
 @return	TRUE if contains the column or its prefix */
@@ -1087,14 +1099,6 @@ dict_index_get_page(
 /*================*/
 	const dict_index_t*	tree);	/*!< in: index */
 /*********************************************************************//**
-Sets the page number of the root of index tree. */
-UNIV_INLINE
-void
-dict_index_set_page(
-/*================*/
-	dict_index_t*	index,	/*!< in/out: index */
-	ulint		page);	/*!< in: page number */
-/*********************************************************************//**
 Gets the read-write lock of the index tree.
 @return	read-write lock */
 UNIV_INLINE
@@ -1118,6 +1122,18 @@ ulint
 dict_index_calc_min_rec_len(
 /*========================*/
 	const dict_index_t*	index);	/*!< in: index */
+
+/** Calculate new statistics if 1 / 16 of table has been modified
+since the last time a statistics batch was run.
+We calculate statistics at most every 16th round, since we may have
+a counter table which is very small and updated very often.
+@param t table
+@return true if the table has changed too much and stats need to be
+recalculated
+*/
+#define DICT_TABLE_CHANGED_TOO_MUCH(t) \
+	((ib_int64_t) (t)->stat_modified_counter > 16 + (t)->stat_n_rows / 16)
+
 /*********************************************************************//**
 Calculates new estimates for table and index statistics. The statistics
 are used in query optimization. */
@@ -1126,10 +1142,14 @@ void
 dict_update_statistics(
 /*===================*/
 	dict_table_t*	table,		/*!< in/out: table */
-	ibool		only_calc_if_missing_stats);/*!< in: only
+	ibool		only_calc_if_missing_stats,/*!< in: only
 					update/recalc the stats if they have
 					not been initialized yet, otherwise
 					do nothing */
+	ibool		only_calc_if_changed_too_much);/*!< in: only
+					update/recalc the stats if the table
+					has been changed too much since the
+					last stats update/recalc */
 /********************************************************************//**
 Reserves the dictionary system mutex for MySQL. */
 UNIV_INTERN
@@ -1259,7 +1279,7 @@ UNIV_INTERN
 void
 dict_close(void);
 /*============*/
-
+#ifndef UNIV_HOTBACKUP
 /**********************************************************************//**
 Check whether the table is corrupted.
 @return	nonzero for corrupted table, zero for valid tables */
@@ -1280,6 +1300,7 @@ dict_index_is_corrupted(
 	const dict_index_t*	index)	/*!< in: index */
 	__attribute__((nonnull, pure, warn_unused_result));
 
+#endif /* !UNIV_HOTBACKUP */
 /**********************************************************************//**
 Flags an index and table corrupted both in the data dictionary cache
 and in the system table SYS_INDEXES. */
@@ -1310,6 +1331,50 @@ ibool
 dict_set_corrupted_by_space(
 /*========================*/
 	ulint		space_id);	/*!< in: space ID */
+
+/**********************************************************************//**
+Compares the given foreign key identifier (the key in rb-tree) and the
+foreign key identifier in the given fk object (value in rb-tree).
+@return	negative, 0, or positive if foreign_id is smaller, equal,
+or greater than foreign_obj->id, respectively. */
+UNIV_INLINE
+int
+dict_foreign_rbt_cmp(
+/*=================*/
+	const void*	foreign_id,	/*!< in: the foreign key identifier
+					which is used as a key in rb-tree.  */
+	const void*	foreign_obj);	/*!< in: the foreign object itself
+					which is used as value in rb-tree. */
+
+/**********************************************************************//**
+Allocate the table->foreign_rbt, which stores all the foreign objects
+that is available in table->foreign_list.
+@return the allocated rbt object */
+UNIV_INLINE
+ib_rbt_t*
+dict_table_init_foreign_rbt(
+/*========================*/
+	dict_table_t*	table);	/*!< in: the table object whose
+				table->foreign_rbt will be initialized */
+
+/**********************************************************************//**
+Allocate the table->referened_rbt, which stores all the foreign objects
+that is available in table->referenced_list.
+@return the allocated rbt object */
+UNIV_INLINE
+ib_rbt_t*
+dict_table_init_referenced_rbt(
+/*===========================*/
+	dict_table_t*	table);	/*!< in: the table object whose
+				table->referenced_rbt will be initialized */
+/********************************************************************//**
+Check if it is a temporary table.
+@return        true if temporary table flag is set. */
+UNIV_INLINE
+ibool
+dict_table_is_temporary(
+/*====================*/
+	const dict_table_t*     table);  /*!< in: table to check */
 
 #ifndef UNIV_NONINL
 #include "dict0dict.ic"

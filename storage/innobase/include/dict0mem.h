@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2010, Innobase Oy. All Rights Reserved.
+Copyright (c) 1996, 2014, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -11,8 +11,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Suite 500, Boston, MA 02110-1335 USA
 
 *****************************************************************************/
 
@@ -43,6 +43,7 @@ Created 1/8/1996 Heikki Tuuri
 #include "ut0byte.h"
 #include "hash0hash.h"
 #include "trx0types.h"
+#include "ut0rbt.h"
 
 /** Type flags of an index: OR'ing of the flags is allowed to define a
 combination of types */
@@ -127,7 +128,7 @@ This could result in rescursive calls and out of stack error eventually.
 DICT_FK_MAX_RECURSIVE_LOAD defines the maximum number of recursive loads,
 when exceeded, the child table will not be loaded. It will be loaded when
 the foreign constraint check needs to be run. */
-#define DICT_FK_MAX_RECURSIVE_LOAD	255
+#define DICT_FK_MAX_RECURSIVE_LOAD	20
 
 /** Similarly, when tables are chained together with foreign key constraints
 with on cascading delete/update clause, delete from parent table could
@@ -377,10 +378,15 @@ struct dict_index_struct{
 	unsigned	type:DICT_IT_BITS;
 				/*!< index type (DICT_CLUSTERED, DICT_UNIQUE,
 				DICT_UNIVERSAL, DICT_IBUF, DICT_CORRUPT) */
-	unsigned	trx_id_offset:10;/*!< position of the trx id column
+#define MAX_KEY_LENGTH_BITS 12
+	unsigned	trx_id_offset:MAX_KEY_LENGTH_BITS;
+				/*!< position of the trx id column
 				in a clustered index record, if the fields
 				before it are known to be of a fixed size,
 				0 otherwise */
+#if (1<<MAX_KEY_LENGTH_BITS) < MAX_KEY_LENGTH
+# error (1<<MAX_KEY_LENGTH_BITS) < MAX_KEY_LENGTH
+#endif
 	unsigned	n_user_defined_cols:10;
 				/*!< number of columns the user defined to
 				be in the index: in the internal
@@ -396,7 +402,9 @@ struct dict_index_struct{
 	unsigned	to_be_dropped:1;
 				/*!< TRUE if this index is marked to be
 				dropped in ha_innobase::prepare_drop_index(),
-				otherwise FALSE */
+				otherwise FALSE. Protected by
+				dict_sys->mutex, dict_operation_lock and
+				index->lock.*/
 	dict_field_t*	fields;	/*!< array of field descriptions */
 #ifndef UNIV_HOTBACKUP
 	UT_LIST_NODE_T(dict_index_t)
@@ -499,7 +507,6 @@ a foreign key constraint is enforced, therefore RESTRICT just means no flag */
 #define DICT_FOREIGN_ON_UPDATE_NO_ACTION 32	/*!< ON UPDATE NO ACTION */
 /* @} */
 
-
 /** Data structure for a database table.  Most fields will be
 initialized to 0, NULL or FALSE in dict_mem_table_create(). */
 struct dict_table_struct{
@@ -551,6 +558,14 @@ struct dict_table_struct{
 	UT_LIST_BASE_NODE_T(dict_foreign_t)
 			referenced_list;/*!< list of foreign key constraints
 				which refer to this table */
+
+	ib_rbt_t*	foreign_rbt;	/*!< a rb-tree of all foreign keys
+					listed in foreign_list, sorted by
+					foreign->id */
+	ib_rbt_t*	referenced_rbt;	/*!< a rb-tree of all foreign keys
+					listed in referenced_list, sorted by
+					foreign->id */
+
 	UT_LIST_NODE_T(dict_table_t)
 			table_LRU; /*!< node of the LRU list of tables */
 	ulint		n_mysql_handles_opened;
@@ -603,7 +618,14 @@ struct dict_table_struct{
 	ulint		initial_size;
 				/*!< when srv_file_per_table is on, the
 				initial size of the tablespace file in pages */
-				/** Statistics for query optimization */
+
+				/** Statistics for query optimization.
+				The following stat_* members are usually
+				protected by dict_table_stats_lock(). In
+				some exceptional cases (performance critical
+				code paths) we access or modify stat_n_rows
+				and stat_modified_counter without any
+				protection. */
 				/* @{ */
 	unsigned	stat_initialized:1; /*!< TRUE if statistics have
 				been calculated the first time

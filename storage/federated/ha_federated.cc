@@ -1,4 +1,4 @@
-/* Copyright (c) 2004, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2004, 2015, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -1397,7 +1397,7 @@ bool ha_federated::create_where_from_key(String *to,
           break;
         }
         DBUG_PRINT("info", ("federated HA_READ_AFTER_KEY %d", i));
-        if (store_length >= length) /* end key */
+        if ((store_length >= length) || (i > 0)) /* for all parts of end key*/
         {
           if (emit_key_part_name(&tmp, key_part))
             goto err;
@@ -1678,9 +1678,17 @@ int ha_federated::close(void)
   DBUG_ENTER("ha_federated::close");
 
   free_result();
-  
+
   delete_dynamic(&results);
-  
+
+  /*
+    Check to verify wheather the connection is still alive or not.
+    FLUSH TABLES will quit the connection and if connection is broken,
+    it will reconnect again and quit silently.
+  */
+  if (mysql && !vio_is_connected(mysql->net.vio))
+     mysql->net.error= 2;
+
   /* Disconnect from mysql */
   mysql_close(mysql);
   mysql= NULL;
@@ -1847,7 +1855,7 @@ int ha_federated::write_row(uchar *buf)
 
   values_string.length(0);
   insert_field_value_string.length(0);
-  ha_statistic_increment(&SSV::ha_write_count);
+  ha_macro_statistic_inc(ha_write_count);
   if (table->timestamp_field_type & TIMESTAMP_AUTO_SET_ON_INSERT)
     table->timestamp_field->set_time();
 
@@ -2349,6 +2357,22 @@ int ha_federated::delete_row(const uchar *buf)
   DBUG_RETURN(0);
 }
 
+int ha_federated::index_read_idx_map(uchar *buf, uint index, const uchar *key,
+                                key_part_map keypart_map,
+                                enum ha_rkey_function find_flag)
+{
+  int error= index_init(index, 0);
+  if (error)
+    return error;
+  error= index_read_map(buf, key, keypart_map, find_flag);
+  if(!error && stored_result)
+  {
+    uchar *dummy_arg=NULL;
+    position(dummy_arg);
+  }
+  int error1= index_end();
+  return error ?  error : error1;
+}
 
 /*
   Positions an index cursor to the index specified in the handle. Fetches the
@@ -2435,7 +2459,7 @@ int ha_federated::index_read_idx_with_result_set(uchar *buf, uint index,
   *result= 0;                                   // In case of errors
   index_string.length(0);
   sql_query.length(0);
-  ha_statistic_increment(&SSV::ha_read_key_count);
+  ha_macro_statistic_inc(ha_read_key_count);
 
   sql_query.append(share->select_query);
 
@@ -2570,7 +2594,7 @@ int ha_federated::index_next(uchar *buf)
   int retval;
   DBUG_ENTER("ha_federated::index_next");
   MYSQL_INDEX_READ_ROW_START(table_share->db.str, table_share->table_name.str);
-  ha_statistic_increment(&SSV::ha_read_next_count);
+  ha_macro_statistic_inc(ha_read_next_count);
   retval= read_next(buf, stored_result);
   MYSQL_INDEX_READ_ROW_DONE(retval);
   DBUG_RETURN(retval);
@@ -2787,7 +2811,7 @@ int ha_federated::rnd_pos(uchar *buf, uchar *pos)
 
   MYSQL_READ_ROW_START(table_share->db.str, table_share->table_name.str,
                        FALSE);
-  ha_statistic_increment(&SSV::ha_read_rnd_count);
+  ha_macro_statistic_inc(ha_read_rnd_count);
 
   /* Get stored result set. */
   memcpy(&result, pos, sizeof(MYSQL_RES *));
@@ -2920,7 +2944,7 @@ int ha_federated::info(uint flag)
 
   }
 
-  if (flag & HA_STATUS_AUTO)
+  if ((flag & HA_STATUS_AUTO) && mysql)
     stats.auto_increment_value= mysql->insert_id;
 
   mysql_free_result(result);

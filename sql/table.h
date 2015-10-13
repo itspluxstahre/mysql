@@ -1,7 +1,7 @@
 #ifndef TABLE_INCLUDED
 #define TABLE_INCLUDED
 
-/* Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -298,6 +298,7 @@ typedef struct st_filesort_info
 {
   IO_CACHE *io_cache;           /* If sorted through filesort */
   uchar     **sort_keys;        /* Buffer for sorting keys */
+  size_t    sort_keys_size;     /* Number of bytes allocated */
   uchar     *buffpek;           /* Buffer for buffpek structures */
   uint      buffpek_len;        /* Max number of buffpeks in the buffer */
   uchar     *addon_buf;         /* Pointer to a buffer if sorted with fields */
@@ -770,7 +771,6 @@ struct TABLE_SHARE
     return table_map_id;
   }
 
-
   /** Is this table share being expelled from the table definition cache?  */
   inline bool has_old_version() const
   {
@@ -892,6 +892,9 @@ enum index_hint_type
   INDEX_HINT_USE,
   INDEX_HINT_FORCE
 };
+
+/* Bitmap of table's fields */
+typedef Bitmap<MAX_FIELDS> Field_map;
 
 struct TABLE
 {
@@ -1645,7 +1648,8 @@ struct TABLE_LIST
       qualified name (<db_name>.<table_name>).
   */
   bool          is_fqtn;
-
+  /* TRUE if the table is to be locked in NO_WAIT mode. */
+  bool          lock_table_no_wait;
 
   /* View creation context. */
 

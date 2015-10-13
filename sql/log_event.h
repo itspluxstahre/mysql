@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -40,7 +40,6 @@
 #include "rpl_utility.h"
 #include "hash.h"
 #include "rpl_tblmap.h"
-#include "rpl_tblmap.cc"
 #endif
 
 #ifdef MYSQL_SERVER
@@ -257,6 +256,7 @@ struct sql_ex_info
 #define EXECUTE_LOAD_QUERY_HEADER_LEN  (QUERY_HEADER_LEN + EXECUTE_LOAD_QUERY_EXTRA_HEADER_LEN)
 #define INCIDENT_HEADER_LEN    2
 #define HEARTBEAT_HEADER_LEN   0
+#define TABLE_METADATA_HEADER_LEN Table_metadata_binary_format::DH_FIXED_LENGTH
 /* 
   Max number of possible extra bytes in a replication event compared to a
   packet (i.e. a query) sent from client to master;
@@ -279,6 +279,13 @@ struct sql_ex_info
   EXECUTE_LOAD_QUERY_EXTRA_HEADER_LEN + /*write_post_header_for_derived */ \
   MAX_SIZE_LOG_EVENT_STATUS + /* status */ \
   NAME_LEN + 1)
+
+/*
+  The new option is added to handle large packets that are sent from the master 
+  to the slave. It is used to increase the thd(max_allowed) for both the
+  DUMP thread on the master and the SQL/IO thread on the slave. 
+*/
+#define MAX_MAX_ALLOWED_PACKET 1024*1024*1024
 
 /* 
    Event header offsets; 
@@ -595,6 +602,8 @@ enum Log_event_type
   */
   HEARTBEAT_LOG_EVENT= 27,
   
+  TABLE_METADATA_EVENT= 50,
+
   /*
     Add new events here - right above this comment!
     Existing events (except ENUM_END_EVENT) should never change their numbers
@@ -624,6 +633,7 @@ class THD;
 
 class Format_description_log_event;
 class Relay_log_info;
+class Table_metadata_log_event;
 
 #ifdef MYSQL_CLIENT
 enum enum_base64_output_mode {
@@ -990,8 +1000,34 @@ public:
                                    mysql_mutex_t* log_lock,
                                    const Format_description_log_event
                                    *description_event);
+
+  /**
+    Reads an event from a binlog or relay log. Used by the dump thread
+    this method reads the event into a raw buffer without parsing it.
+
+    @Note If mutex is 0, the read will proceed without mutex.
+
+    @Note If a log name is given than the method will check if the
+    given binlog is still active.
+
+    @param[in]  file                log file to be read
+    @param[out] packet              packet to hold the event
+    @param[in]  lock                the lock to be used upon read
+    @param[in]  log_file_name_arg   the log's file name
+    @param[out] is_binlog_active    is the current log still active
+
+    @retval 0                   success
+    @retval LOG_READ_EOF        end of file, nothing was read
+    @retval LOG_READ_BOGUS      malformed event
+    @retval LOG_READ_IO         io error while reading
+    @retval LOG_READ_MEM        packet memory allocation failed
+    @retval LOG_READ_TRUNC      only a partial event could be read
+    @retval LOG_READ_TOO_LARGE  event too large
+   */
   static int read_log_event(IO_CACHE* file, String* packet,
-                            mysql_mutex_t* log_lock);
+                            mysql_mutex_t* log_lock,
+                            const char *log_file_name_arg= NULL,
+                            bool* is_binlog_active= NULL);
   /*
     init_show_field_list() prepares the column names and types for the
     output of SHOW BINLOG EVENTS; it is used only by SHOW BINLOG
@@ -1014,7 +1050,7 @@ public:
     return thd ? thd->db : 0;
   }
 #else
-  Log_event() : temp_buf(0) {}
+  Log_event() : temp_buf(0), flags(0) {}
     /* avoid having to link mysqlbinlog against libpthread */
   static Log_event* read_log_event(IO_CACHE* file,
                                    const Format_description_log_event
@@ -2244,14 +2280,14 @@ public:
   void print(FILE* file, PRINT_EVENT_INFO* print_event_info);
 #endif
 
-  Start_log_event_v3(const char* buf,
+  Start_log_event_v3(const char* buf, uint event_len,
                      const Format_description_log_event* description_event);
   ~Start_log_event_v3() {}
   Log_event_type get_type_code() { return START_EVENT_V3;}
 #ifdef MYSQL_SERVER
   bool write(IO_CACHE* file);
 #endif
-  bool is_valid() const { return 1; }
+  bool is_valid() const { return server_version[0] != 0; }
   int get_data_size()
   {
     return START_V3_HEADER_LEN; //no variable-sized part
@@ -2313,12 +2349,26 @@ public:
 #ifdef MYSQL_SERVER
   bool write(IO_CACHE* file);
 #endif
-  bool is_valid() const
+  bool header_is_valid() const
   {
     return ((common_header_len >= ((binlog_version==1) ? OLD_HEADER_LEN :
                                    LOG_EVENT_MINIMAL_HEADER_LEN)) &&
             (post_header_len != NULL));
   }
+
+  bool version_is_valid() const
+  {
+    /* It is invalid only when all version numbers are 0 */
+    return !(server_version_split[0] == 0 &&
+             server_version_split[1] == 0 &&
+             server_version_split[2] == 0);
+  }
+
+  bool is_valid() const
+  {
+    return header_is_valid() && version_is_valid();
+  }
+
   int get_data_size()
   {
     /*
@@ -2557,26 +2607,39 @@ public:
   bool is_null;
   uchar flags;
 #ifdef MYSQL_SERVER
+  bool deferred;
+  query_id_t query_id;
   User_var_log_event(THD* thd_arg, char *name_arg, uint name_len_arg,
                      char *val_arg, ulong val_len_arg, Item_result type_arg,
 		     uint charset_number_arg, uchar flags_arg)
-    :Log_event(), name(name_arg), name_len(name_len_arg), val(val_arg),
+    :Log_event(thd_arg,0,0), name(name_arg), name_len(name_len_arg), val(val_arg),
     val_len(val_len_arg), type(type_arg), charset_number(charset_number_arg),
-    flags(flags_arg)
+    flags(flags_arg), deferred(false)
     { is_null= !val; }
   void pack_info(Protocol* protocol);
 #else
   void print(FILE* file, PRINT_EVENT_INFO* print_event_info);
 #endif
 
-  User_var_log_event(const char* buf,
+  User_var_log_event(const char* buf, uint event_len,
                      const Format_description_log_event *description_event);
   ~User_var_log_event() {}
   Log_event_type get_type_code() { return USER_VAR_EVENT;}
 #ifdef MYSQL_SERVER
   bool write(IO_CACHE* file);
+  /* 
+     Getter and setter for deferred User-event. 
+     Returns true if the event is not applied directly 
+     and which case the applier adjusts execution path.
+  */
+  bool is_deferred() { return deferred; }
+  /*
+    In case of the deffered applying the variable instance is flagged
+    and the parsing time query id is stored to be used at applying time.
+  */
+  void set_deferred(query_id_t qid) { deferred= true; query_id= qid; }
 #endif
-  bool is_valid() const { return 1; }
+  bool is_valid() const { return name != 0; }
 
 private:
 #if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
@@ -3456,6 +3519,9 @@ public:
 
 #ifdef MYSQL_CLIENT
   virtual void print(FILE *file, PRINT_EVENT_INFO *print_event_info);
+  void set_table_metadata_event(Table_metadata_log_event *event)
+  { m_table_metadata= event; }
+  LEX_CSTRING get_column_name(uint column) const;
 #endif
 
 
@@ -3489,6 +3555,217 @@ private:
   ulong          m_field_metadata_size;   
   uchar         *m_null_bits;
   uchar         *m_meta_memory;
+#ifdef MYSQL_CLIENT
+  Table_metadata_log_event *m_table_metadata;
+#endif
+};
+
+
+/**
+  @struct Table_metadata_binary_format
+
+  A table metadata log event consists of a fixed-length data header and one
+  or more column descriptor sections of variable length.
+
+  +-------------+--------------+-----------------------+---------------------+
+  | Byte Offset | Width (bits) | Field Name            | Data Type           |
+  +-------------+--------------+-----------------------+---------------------+
+  |     0-5     |      48      | Table Map ID          | Unsigned Integer    |
+  |     6-7     |      16      | Number of Columns (N) | Unsigned Integer    |
+  |     8-9     |      16      | Flags                 | Bit Field           |
+  |     9 +     |   Variable   | Column Descriptor [1] | Column Descriptor   |
+  |     ...     |      ...     | Column Descriptor [2] | Column Descriptor   |
+  |     ...     |      ...     | ...                   | ...                 |
+  |     ...     |      ...     | Column Descriptor [N] | Column Descriptor   |
+  +-------------+--------------+-----------------------+---------------------+
+
+  Each column descriptor section represents the metadata (type and properties)
+  of a column in the table described by the event.
+
+  +-------------+--------------+-----------------------+---------------------+
+  | Byte Offset | Width (bits) | Field Name            | Data Type           |
+  +-------------+--------------+-----------------------+---------------------+
+  |     0-3     |      32      | Descriptor Length     | Unsigned integer    |
+  |     4-4     |       8      | Data Type             | Unsigned integer    |
+  |     5-8     |      32      | Display Length        | Unsigned integer    |
+  |     9-9     |       8      | Scale                 | Unsigned integer    |
+  |   10-11     |      16      | Character Set Number  | Unsigned integer    |
+  |   12-13     |      16      | Flags                 | Bit Field           |
+  |    14 +     |   Variable   | Column Name           | Length coded string |
+  |     ...     |   Variable   | SQL Type Name         | Length coded string |
+  |     ...     |   Variable   | Column Comment        | Length coded string |
+  +-------------+--------------+-----------------------+---------------------+
+
+  @remarks
+
+  In order to allow future backwards compatibility, the descriptor length must
+  be used as an offset to the next column descriptor.
+
+  If the column is a numeric data type, the display length is equivalent to the
+  maximum precision of the column (number of decimal digits).
+
+  The variable length strings are encoded in UTF8, which is the character set
+  used by the server for storing identifiers (see character_set_system).
+*/
+struct Table_metadata_binary_format
+{
+  /** Fixed-length data header. */
+  struct Data_header
+  {
+    /** Number that identifies the table, @see Table_map_log_event. */
+    ulonglong table_id;
+    /** Number of column descriptor sections. Hence, number of columns. */
+    uint16    columns;
+    /** A bit field reserved for future use. Must be zero. */
+    uint16    flags;
+  };
+
+  /** Offset of the data header fields. */
+  enum Data_header_offset
+  {
+    DH_TABLE_ID_OFFSET =  0,
+    DH_COLUMNS_OFFSET  =  6,
+    DH_FLAGS_OFFSET    =  8,
+    DH_FIXED_LENGTH    = 10
+  };
+
+  /** Column Descriptor. */
+  struct Column_descriptor
+  {
+    /** Size in bytes of the descriptor. */
+    uint32  length;
+    /** Code of the data type, @see enum_field_types. */
+    uint8   type;
+    /** The defined maximum display length of the column. */
+    uint32  display_length;
+    /** If a decimal type, the number of decimal digits in the fractional part. */
+    uint8   scale;
+    /** Number of the column character set. */
+    uint16  charset;
+    /** A bit field representing attributes of the column (e.g. is a key). */
+    uint16  flags;
+    /** Name of the column. */
+    LEX_CSTRING name;
+    /** Name of the SQL data type. */
+    LEX_CSTRING type_name;
+    /** The comment associated with the column. */
+    LEX_CSTRING comment;
+  };
+
+  /** Offset of the column descriptor fields. */
+  enum Column_descriptor_offset
+  {
+    CD_LENGTH_OFFSET         =  0,
+    CD_TYPE_OFFSET           =  4,
+    CD_DISPLAY_LENGTH_OFFSET =  5,
+    CD_SCALE_OFFSET          =  9,
+    CD_CHARSET_OFFSET        = 10,
+    CD_FLAGS_OFFSET          = 12,
+    CD_FIXED_LENGTH          = 14
+  };
+};
+
+
+/**
+  @class Table_metadata_log_event
+
+  The purpose of the Table_metadata_log_event event is to transmit
+  information about the types and properties of the columns in a table.
+*/
+class Table_metadata_log_event
+  : public Log_event,
+    protected Table_metadata_binary_format
+{
+public:
+#if defined(MYSQL_SERVER)
+  /**
+    Constructor, used to initialize an event for writing to the binary log.
+
+    @param thd    The current thread.
+    @param table  Table object whose (column) metadata is being described.
+    @param is_transactional   Whether the cache is transactional.
+  */
+  Table_metadata_log_event(THD *thd, TABLE *table, bool is_transactional)
+    : Log_event(thd, LOG_EVENT_SUPPRESS_USE_F, is_transactional),
+      m_is_valid(false), m_column_descriptor(NULL), m_table(table)
+  {}
+#endif
+
+  /**
+    Constructor, used to initialize an event for reading from the binary log.
+
+    @param event  The event data buffer.
+    @param event_len  Length of the event data buffer.
+    @param description_event Format description event that describes this event.
+  */
+  Table_metadata_log_event(const char *event, uint event_len,
+                           const Format_description_log_event *description_event)
+    : Log_event(event, description_event),
+      m_column_descriptor(NULL)
+  {
+    m_is_valid= !read(event, event_len, description_event);
+  }
+
+  virtual ~Table_metadata_log_event()
+  {
+    my_free(m_column_descriptor);
+  }
+
+  Log_event_type get_type_code() { return TABLE_METADATA_EVENT; }
+  bool is_valid() const          { return m_is_valid; }
+  ulong get_table_id() const     { return m_data_header.table_id; }
+
+#if defined(MYSQL_SERVER)
+  int get_data_size();
+#endif
+
+#if defined(MYSQL_SERVER) && defined(HAVE_REPLICATION)
+  enum_skip_reason do_shall_skip(Relay_log_info *rli);
+
+  int do_update_pos(Relay_log_info *rli);
+
+  void pack_info(Protocol *protocol);
+#endif
+
+#if defined(MYSQL_CLIENT)
+  Column_descriptor *get_column_descriptor(uint column) const
+  {
+    return (column < m_data_header.columns) ?
+           &m_column_descriptor[column] : NULL;
+  }
+
+  void print(FILE *stream, PRINT_EVENT_INFO *print_event_info)
+  {
+    if (!print_event_info->short_form)
+      print_helper(stream, print_event_info);
+  }
+
+  void print_helper(FILE *, PRINT_EVENT_INFO *);
+#endif
+
+private:
+  bool read(const char *, uint, const Format_description_log_event *);
+  bool read_data_header(const char *, uint);
+  void read_data_body(const char *, uint);
+  bool read_column_descriptor(Column_descriptor *, const char *, uint);
+  bool read_length_encoded_string(LEX_CSTRING *, const char *, uint);
+
+private:
+  bool m_is_valid;
+  Data_header m_data_header;
+  Column_descriptor *m_column_descriptor;
+
+#if defined(MYSQL_SERVER)
+private:
+  struct Data_size_functor;
+  struct Data_body_functor;
+
+  bool write_data_header(IO_CACHE *);
+  bool write_data_body(IO_CACHE *);
+
+private:
+  TABLE *m_table;
+#endif
 };
 
 
@@ -3573,6 +3850,7 @@ public:
                      PRINT_EVENT_INFO *print_event_info);
   size_t print_verbose_one_row(IO_CACHE *file, table_def *td,
                                PRINT_EVENT_INFO *print_event_info,
+                               Table_map_log_event *map,
                                MY_BITMAP *cols_bitmap,
                                const uchar *ptr, const uchar *prefix);
 #endif
@@ -3673,12 +3951,22 @@ protected:
     DBUG_ASSERT(m_table);
 
     ASSERT_OR_RETURN_ERROR(m_curr_row < m_rows_end, HA_ERR_CORRUPT_EVENT);
-    int const result= ::unpack_row(rli, m_table, m_width, m_curr_row, &m_cols,
-                                   &m_curr_row_end, &m_master_reclength);
-    if (m_curr_row_end > m_rows_end)
-      my_error(ER_SLAVE_CORRUPT_EVENT, MYF(0));
-    ASSERT_OR_RETURN_ERROR(m_curr_row_end <= m_rows_end, HA_ERR_CORRUPT_EVENT);
-    return result;
+    return ::unpack_row(rli, m_table, m_width, m_curr_row, &m_cols,
+                                   &m_curr_row_end, &m_master_reclength, m_rows_end);
+  }
+
+  /**
+    Helper function to check whether there is an auto increment
+    column on the table where the event is to be applied.
+
+    @return true if there is an autoincrement field on the extra
+            columns, false otherwise.
+   */
+  inline bool is_auto_inc_in_extra_columns()
+  {
+    DBUG_ASSERT(m_table);
+    return (m_table->next_number_field &&
+            m_table->next_number_field->field_index >= m_width);
   }
 #endif
 
@@ -4080,11 +4368,18 @@ private:
   const char* log_ident;
   uint ident_len;
 };
+
+/**
+   The function is called by slave applier in case there are
+   active table filtering rules to force gathering events associated
+   with Query-log-event into an array to execute
+   them once the fate of the Query is determined for execution.
+*/
+bool slave_execute_deferred_events(THD *thd);
 #endif
 
-int append_query_string(CHARSET_INFO *csinfo,
+int append_query_string(THD *thd, CHARSET_INFO *csinfo,
                         String const *from, String *to);
-
 /**
   @} (end of group Replication)
 */
